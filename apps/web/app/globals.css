@@ -1,0 +1,24 @@
+:root {
+  --bg: #0f172a;
+  --panel: #111827;
+  --text: #e5e7eb;
+  --muted: #94a3b8;
+  --accent: #22d3ee;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  background: radial-gradient(circle at 20% 10%, #1e293b, #0b1220 55%);
+  color: var(--text);
+}
+
+a {
+  color: inherit;
+}

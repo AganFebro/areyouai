@@ -1,0 +1,17 @@
+# Node
+node_modules/
+.next/
+dist/
+.cache/
+
+# Go
+bin/
+coverage.out
+
+# Env
+.env
+.env.local
+.tmp_api.log
+
+# OS
+.DS_Store

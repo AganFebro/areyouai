@@ -1,0 +1,241 @@
+package httpapi
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func doJSON(t *testing.T, ts *httptest.Server, method, path string, body any, bearer string) (*http.Response, map[string]any) {
+	t.Helper()
+
+	var payload []byte
+	var err error
+	if body != nil {
+		payload, err = json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+	}
+
+	req, err := http.NewRequest(method, ts.URL+path, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+
+	var decoded map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&decoded)
+	_ = resp.Body.Close()
+	return resp, decoded
+}
+
+func mustString(t *testing.T, m map[string]any, key string) string {
+	t.Helper()
+	v, ok := m[key]
+	if !ok {
+		t.Fatalf("missing key: %s", key)
+	}
+	s, ok := v.(string)
+	if !ok || s == "" {
+		t.Fatalf("key %s is not non-empty string", key)
+	}
+	return s
+}
+
+func TestListingConnectAndSequentialMessagingFlow(t *testing.T) {
+	t.Parallel()
+
+	ts := httptest.NewServer(NewRouter())
+	defer ts.Close()
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "agent-a"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register a status=%d body=%v", resp.StatusCode, body)
+	}
+	apiA := mustString(t, body, "api_key")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "agent-b"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register b status=%d body=%v", resp.StatusCode, body)
+	}
+	apiB := mustString(t, body, "api_key")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login a status=%d body=%v", resp.StatusCode, body)
+	}
+	tokenA := mustString(t, body, "session_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login b status=%d body=%v", resp.StatusCode, body)
+	}
+	tokenB := mustString(t, body, "session_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "go test room",
+		"tags":        []string{"go", "mvp"},
+		"max_turns":   4,
+		"ttl_seconds": 300,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	listingID := mustString(t, body, "id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
+	}
+	roomID := mustString(t, body, "room_id")
+	humanCode := mustString(t, body, "human_code")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/join", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("join a status=%d body=%v", resp.StatusCode, body)
+	}
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/join", nil, tokenB)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("join b status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 0,
+		"ciphertext":    "c1",
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("message a turn0 status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 1,
+		"ciphertext":    "bad-turn",
+	}, tokenA)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("message a wrong-turn status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 1,
+		"ciphertext":    "c2",
+	}, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("message b turn1 status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/close", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("close status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 2,
+		"ciphertext":    "after-close",
+	}, tokenA)
+	if resp.StatusCode != http.StatusGone {
+		t.Fatalf("message after close status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/transcript?human_code=wrong", nil, "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("transcript wrong code status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/transcript?human_code="+humanCode, nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("transcript good code status=%d body=%v", resp.StatusCode, body)
+	}
+	msgs, ok := body["messages"].([]any)
+	if !ok || len(msgs) != 2 {
+		t.Fatalf("unexpected transcript messages=%v", body["messages"])
+	}
+}
+
+func TestAuthRequiredForListingCreate(t *testing.T) {
+	t.Parallel()
+
+	ts := httptest.NewServer(NewRouter())
+	defer ts.Close()
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic": "needs-auth",
+	}, "")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%v", resp.StatusCode, body)
+	}
+}
+
+func TestViewerJoinHeartbeatLeave(t *testing.T) {
+	t.Parallel()
+
+	ts := httptest.NewServer(NewRouter())
+	defer ts.Close()
+
+	_, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "agent-a"}, "")
+	apiA := mustString(t, body, "api_key")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "agent-b"}, "")
+	apiB := mustString(t, body, "api_key")
+
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	tokenA := mustString(t, body, "session_token")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	tokenB := mustString(t, body, "session_token")
+
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "viewer-policy",
+		"max_turns":   4,
+		"ttl_seconds": 300,
+	}, tokenA)
+	listingID := mustString(t, body, "id")
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
+	}
+	roomID := mustString(t, body, "room_id")
+	humanCode := mustString(t, body, "human_code")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/viewers", map[string]any{
+		"op":         "join",
+		"human_code": "wrong",
+	}, "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("viewer join wrong code status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/viewers", map[string]any{
+		"op":         "join",
+		"human_code": humanCode,
+	}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("viewer join status=%d body=%v", resp.StatusCode, body)
+	}
+	viewerToken := mustString(t, body, "viewer_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/viewers", map[string]any{
+		"op":           "heartbeat",
+		"viewer_token": viewerToken,
+	}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("viewer heartbeat status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/viewers", map[string]any{
+		"op":           "leave",
+		"viewer_token": viewerToken,
+	}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("viewer leave status=%d body=%v", resp.StatusCode, body)
+	}
+}
