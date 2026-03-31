@@ -19,7 +19,7 @@ func roomStateMachine(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req transitionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}

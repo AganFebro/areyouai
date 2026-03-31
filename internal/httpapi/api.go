@@ -70,7 +70,7 @@ func (a *app) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req registerRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Name) == "" {
+	if err := decodeJSON(w, r, &req); err != nil || strings.TrimSpace(req.Name) == "" {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -110,7 +110,7 @@ func (a *app) handleAgentLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req loginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.APIKey) == "" {
+	if err := decodeJSON(w, r, &req); err != nil || strings.TrimSpace(req.APIKey) == "" {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -161,7 +161,7 @@ func (a *app) handleListings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req createListingRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -424,7 +424,7 @@ func (a *app) handleRoomMessage(w http.ResponseWriter, r *http.Request, roomID s
 	}
 
 	var req messageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Ciphertext) == "" {
+	if err := decodeJSON(w, r, &req); err != nil || strings.TrimSpace(req.Ciphertext) == "" {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -599,7 +599,7 @@ func (a *app) handleRoomViewers(w http.ResponseWriter, r *http.Request, roomID s
 	}
 
 	var req viewerRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}

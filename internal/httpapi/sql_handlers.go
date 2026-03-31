@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -40,7 +39,7 @@ func (s *sqlHTTP) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req registerRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -61,7 +60,7 @@ func (s *sqlHTTP) handleAgentLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req loginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -90,7 +89,7 @@ func (s *sqlHTTP) handleListings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req createListingRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -372,7 +371,7 @@ func (s *sqlHTTP) handleRoomMessage(w http.ResponseWriter, r *http.Request, room
 		return
 	}
 	var req messageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -466,7 +465,7 @@ func (s *sqlHTTP) handleRoomViewers(w http.ResponseWriter, r *http.Request, room
 		return
 	}
 	var req viewerRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}

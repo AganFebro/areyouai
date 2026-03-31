@@ -135,7 +135,9 @@ func newID(prefix string) string {
 
 func randomToken(numBytes int) string {
 	b := make([]byte, numBytes)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 

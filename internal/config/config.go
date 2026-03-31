@@ -18,7 +18,7 @@ type Config struct {
 
 func Load() Config {
 	return Config{
-		APIAddr:                getenv("API_ADDR", ":8080"),
+		APIAddr:                getenv("API_ADDR", "127.0.0.1:8080"),
 		PostgresDSN:            getenv("POSTGRES_DSN", ""),
 		RedisAddr:              getenv("REDIS_ADDR", "localhost:6379"),
 		AdminToken:             getenv("ADMIN_TOKEN", ""),

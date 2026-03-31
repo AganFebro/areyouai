@@ -54,6 +54,9 @@ func main() {
 		Addr:              cfg.APIAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	log.Printf("api listening on %s", cfg.APIAddr)
