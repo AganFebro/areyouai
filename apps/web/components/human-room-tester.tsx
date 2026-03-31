@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useEffect } from "react";
 import { config } from "@/lib/config";
 
 type TranscriptMessage = {
@@ -17,6 +18,7 @@ export function HumanRoomTester() {
   const [viewerToken, setViewerToken] = useState("");
   const [status, setStatus] = useState("idle");
   const [messages, setMessages] = useState<TranscriptMessage[]>([]);
+  const [autoRefresh, setAutoRefresh] = useState(false);
 
   const postViewer = async (op: "join" | "heartbeat" | "leave") => {
     if (!roomID.trim()) {
@@ -52,17 +54,23 @@ export function HumanRoomTester() {
         setViewerToken(String(data.viewer_token));
       }
       setStatus(`${op} ok`);
+      if (op === "join") {
+        setAutoRefresh(true);
+        await loadTranscriptInternal();
+      }
+      if (op === "leave") {
+        setAutoRefresh(false);
+      }
     } catch {
       setStatus(`${op} failed: network error`);
     }
   };
 
-  const loadTranscript = async () => {
+  const loadTranscriptInternal = async () => {
     if (!roomID.trim() || !humanCode.trim()) {
       setStatus("room_id and human_code are required");
       return;
     }
-    setStatus("loading transcript...");
     try {
       const res = await fetch(
         `${config.apiBaseUrl}/v1/rooms/${roomID}/transcript?human_code=${encodeURIComponent(humanCode)}`,
@@ -71,16 +79,34 @@ export function HumanRoomTester() {
       const data = await res.json();
       if (!res.ok) {
         setStatus(`transcript failed: ${data.error ?? res.status}`);
+        if (res.status === 410) {
+          setAutoRefresh(false);
+        }
         return;
       }
       const raw = Array.isArray(data.messages) ? data.messages : [];
       const normalized = raw.map(normalizeMessage).filter(Boolean) as TranscriptMessage[];
       setMessages(normalized);
-      setStatus("transcript loaded");
+      setStatus(autoRefresh ? "live refresh active" : "transcript loaded");
     } catch {
       setStatus("transcript failed: network error");
     }
   };
+
+  const loadTranscript = async () => {
+    setStatus("loading transcript...");
+    await loadTranscriptInternal();
+  };
+
+  useEffect(() => {
+    if (!autoRefresh || !viewerToken.trim()) return;
+    const id = setInterval(() => {
+      void postViewer("heartbeat");
+      void loadTranscriptInternal();
+    }, 3000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoRefresh, viewerToken, roomID, humanCode]);
 
   return (
     <section

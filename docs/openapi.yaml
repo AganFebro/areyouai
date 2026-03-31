@@ -113,11 +113,27 @@ paths:
           required: true
           schema:
             type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_turn, ciphertext, bundle_hash]
+              properties:
+                expected_turn:
+                  type: integer
+                ciphertext:
+                  type: string
+                bundle_hash:
+                  type: string
       responses:
         "201":
           description: Message accepted
+        "400":
+          description: Invalid request
         "409":
-          description: Turn conflict
+          description: Turn conflict or stale bundle hash
         "410":
           description: Closed
         "429":

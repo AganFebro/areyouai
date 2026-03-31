@@ -202,9 +202,10 @@ RETURNING id, room_id, sender_id, turn, ciphertext, created_at`
 
 func (s *Store) ListRoomMessages(ctx context.Context, roomID string) ([]repository.Message, error) {
 	const q = `
-SELECT id, room_id, sender_id, turn, ciphertext, created_at
-FROM messages
-WHERE room_id = $1
+SELECT m.id, m.room_id, m.sender_id, a.name, m.turn, m.ciphertext, m.created_at
+FROM messages m
+LEFT JOIN agents a ON a.id = m.sender_id
+WHERE m.room_id = $1
 ORDER BY turn ASC`
 	rows, err := s.db.QueryContext(ctx, q, roomID)
 	if err != nil {
@@ -221,6 +222,26 @@ ORDER BY turn ASC`
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) GetRoomContext(ctx context.Context, roomID string) (repository.RoomContextState, error) {
+	const q = `
+SELECT room_id, context, version, updated_at, created_at
+FROM room_context_state
+WHERE room_id = $1`
+	return scanRoomContext(s.db.QueryRowContext(ctx, q, roomID))
+}
+
+func (s *Store) UpsertRoomContext(ctx context.Context, in repository.UpsertRoomContextInput) (repository.RoomContextState, error) {
+	const q = `
+INSERT INTO room_context_state (room_id, context, version)
+VALUES ($1, $2::jsonb, $3)
+ON CONFLICT (room_id) DO UPDATE
+SET context = EXCLUDED.context,
+    version = EXCLUDED.version,
+    updated_at = NOW()
+RETURNING room_id, context, version, updated_at, created_at`
+	return scanRoomContext(s.db.QueryRowContext(ctx, q, in.RoomID, in.Context, in.Version))
 }
 
 func (s *Store) UpsertViewer(ctx context.Context, in repository.UpsertViewerInput) (repository.Viewer, error) {
@@ -267,6 +288,10 @@ func (s *Store) PurgeRoomContent(ctx context.Context, roomID string, purgedAt ti
 	if _, err := s.db.ExecContext(ctx, deleteMsgs, roomID); err != nil {
 		return err
 	}
+	const clearContext = `DELETE FROM room_context_state WHERE room_id = $1`
+	if _, err := s.db.ExecContext(ctx, clearContext, roomID); err != nil {
+		return err
+	}
 	const clearViewers = `DELETE FROM room_viewers WHERE room_id = $1`
 	if _, err := s.db.ExecContext(ctx, clearViewers, roomID); err != nil {
 		return err
@@ -274,6 +299,89 @@ func (s *Store) PurgeRoomContent(ctx context.Context, roomID string, purgedAt ti
 	const updateRoom = `UPDATE rooms SET state = $2, purged_at = $3 WHERE id = $1`
 	_, err := s.db.ExecContext(ctx, updateRoom, roomID, string(domain.RoomStatePurged), purgedAt)
 	return err
+}
+
+func (s *Store) GetAdminOverview(ctx context.Context, now time.Time) (repository.AdminOverview, error) {
+	var out repository.AdminOverview
+
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM agents`).Scan(&out.AgentsTotal); err != nil {
+		return repository.AdminOverview{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM agent_sessions WHERE expires_at IS NOT NULL AND expires_at > $1`, now).Scan(&out.SessionsActive); err != nil {
+		return repository.AdminOverview{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM rooms WHERE state = $1`, string(domain.RoomStateOpen)).Scan(&out.RoomsOpen); err != nil {
+		return repository.AdminOverview{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM rooms WHERE state = $1`, string(domain.RoomStateActive)).Scan(&out.RoomsActive); err != nil {
+		return repository.AdminOverview{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM rooms WHERE state = $1`, string(domain.RoomStateClosed)).Scan(&out.RoomsClosed); err != nil {
+		return repository.AdminOverview{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM rooms WHERE state = $1`, string(domain.RoomStatePurged)).Scan(&out.RoomsPurged); err != nil {
+		return repository.AdminOverview{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM messages`).Scan(&out.MessagesTotal); err != nil {
+		return repository.AdminOverview{}, err
+	}
+	return out, nil
+}
+
+func (s *Store) ListAdminRooms(ctx context.Context, limit int) ([]repository.AdminRoom, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	const q = `
+SELECT r.id, r.agent_a_id, COALESCE(a.name, ''), r.agent_b_id, COALESCE(b.name, ''), r.state, r.turn_index, r.max_turns, r.ttl_at, r.created_at, r.closed_at, r.purged_at
+FROM rooms r
+LEFT JOIN agents a ON a.id = r.agent_a_id
+LEFT JOIN agents b ON b.id = r.agent_b_id
+ORDER BY r.created_at DESC
+LIMIT $1`
+	rows, err := s.db.QueryContext(ctx, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []repository.AdminRoom
+	for rows.Next() {
+		item, scanErr := scanAdminRoom(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]repository.AuditEvent, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+
+	const q = `
+SELECT id, room_id, event, meta, message_count, created_at
+FROM audit_events
+ORDER BY id DESC
+LIMIT $1`
+	rows, err := s.db.QueryContext(ctx, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []repository.AuditEvent
+	for rows.Next() {
+		item, scanErr := scanAuditEvent(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 
 type txStore struct {
@@ -383,7 +491,16 @@ func scanMessage(row interface{ Scan(dest ...any) error }) (repository.Message, 
 }
 
 func scanMessageRows(rows *sql.Rows) (repository.Message, error) {
-	return scanMessage(rows)
+	var m repository.Message
+	var senderName sql.NullString
+	err := rows.Scan(&m.ID, &m.RoomID, &m.SenderID, &senderName, &m.Turn, &m.Ciphertext, &m.CreatedAt)
+	if err != nil {
+		return repository.Message{}, normalizeErr(err)
+	}
+	if senderName.Valid {
+		m.SenderName = senderName.String
+	}
+	return m, nil
 }
 
 func scanViewer(row interface{ Scan(dest ...any) error }) (repository.Viewer, error) {
@@ -393,6 +510,54 @@ func scanViewer(row interface{ Scan(dest ...any) error }) (repository.Viewer, er
 		return repository.Viewer{}, normalizeErr(err)
 	}
 	return v, nil
+}
+
+func scanRoomContext(row interface{ Scan(dest ...any) error }) (repository.RoomContextState, error) {
+	var out repository.RoomContextState
+	var raw []byte
+	err := row.Scan(&out.RoomID, &raw, &out.Version, &out.UpdatedAt, &out.CreatedAt)
+	if err != nil {
+		return repository.RoomContextState{}, normalizeErr(err)
+	}
+	if len(raw) == 0 {
+		out.Context = json.RawMessage(`{}`)
+	} else {
+		out.Context = json.RawMessage(raw)
+	}
+	return out, nil
+}
+
+func scanAdminRoom(row interface{ Scan(dest ...any) error }) (repository.AdminRoom, error) {
+	var out repository.AdminRoom
+	var state string
+	err := row.Scan(
+		&out.ID,
+		&out.AgentAID,
+		&out.AgentAName,
+		&out.AgentBID,
+		&out.AgentBName,
+		&state,
+		&out.TurnIndex,
+		&out.MaxTurns,
+		&out.TTLAt,
+		&out.CreatedAt,
+		&out.ClosedAt,
+		&out.PurgedAt,
+	)
+	if err != nil {
+		return repository.AdminRoom{}, normalizeErr(err)
+	}
+	out.State = domain.RoomState(state)
+	return out, nil
+}
+
+func scanAuditEvent(row interface{ Scan(dest ...any) error }) (repository.AuditEvent, error) {
+	var out repository.AuditEvent
+	err := row.Scan(&out.ID, &out.RoomID, &out.Event, &out.Meta, &out.MessageCount, &out.CreatedAt)
+	if err != nil {
+		return repository.AuditEvent{}, normalizeErr(err)
+	}
+	return out, nil
 }
 
 func normalizeErr(err error) error {

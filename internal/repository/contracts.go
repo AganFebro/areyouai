@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -36,12 +37,19 @@ type Store interface {
 	AppendMessage(ctx context.Context, in AppendMessageInput) (Message, error)
 	ListRoomMessages(ctx context.Context, roomID string) ([]Message, error)
 
+	GetRoomContext(ctx context.Context, roomID string) (RoomContextState, error)
+	UpsertRoomContext(ctx context.Context, in UpsertRoomContextInput) (RoomContextState, error)
+
 	UpsertViewer(ctx context.Context, in UpsertViewerInput) (Viewer, error)
 	GetViewer(ctx context.Context, viewerToken string) (Viewer, error)
 	CountActiveViewers(ctx context.Context, roomID string, activeSince time.Time) (int, error)
 
 	AppendAuditEvent(ctx context.Context, in AppendAuditEventInput) error
 	PurgeRoomContent(ctx context.Context, roomID string, purgedAt time.Time) error
+
+	GetAdminOverview(ctx context.Context, now time.Time) (AdminOverview, error)
+	ListAdminRooms(ctx context.Context, limit int) ([]AdminRoom, error)
+	ListAuditEvents(ctx context.Context, limit int) ([]AuditEvent, error)
 }
 
 type TxStore interface {
@@ -93,6 +101,7 @@ type Message struct {
 	ID         string    `json:"id"`
 	RoomID     string    `json:"room_id"`
 	SenderID   string    `json:"sender_id"`
+	SenderName string    `json:"sender_name,omitempty"`
 	Turn       int       `json:"turn"`
 	Ciphertext string    `json:"ciphertext"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -105,6 +114,48 @@ type Viewer struct {
 	JoinedAt        time.Time  `json:"joined_at"`
 	LastHeartbeatAt time.Time  `json:"last_heartbeat_at"`
 	LeftAt          *time.Time `json:"left_at,omitempty"`
+}
+
+type RoomContextState struct {
+	RoomID    string          `json:"room_id"`
+	Context   json.RawMessage `json:"context"`
+	Version   int             `json:"version"`
+	UpdatedAt time.Time       `json:"updated_at"`
+	CreatedAt time.Time       `json:"created_at"`
+}
+
+type AdminOverview struct {
+	AgentsTotal    int `json:"agents_total"`
+	SessionsActive int `json:"sessions_active"`
+	RoomsOpen      int `json:"rooms_open"`
+	RoomsActive    int `json:"rooms_active"`
+	RoomsClosed    int `json:"rooms_closed"`
+	RoomsPurged    int `json:"rooms_purged"`
+	MessagesTotal  int `json:"messages_total"`
+}
+
+type AdminRoom struct {
+	ID         string           `json:"id"`
+	AgentAID   string           `json:"agent_a_id"`
+	AgentAName string           `json:"agent_a_name"`
+	AgentBID   string           `json:"agent_b_id"`
+	AgentBName string           `json:"agent_b_name"`
+	State      domain.RoomState `json:"state"`
+	TurnIndex  int              `json:"turn_index"`
+	MaxTurns   int              `json:"max_turns"`
+	TTLAt      time.Time        `json:"ttl_at"`
+	CreatedAt  time.Time        `json:"created_at"`
+	ClosedAt   *time.Time       `json:"closed_at,omitempty"`
+	PurgedAt   *time.Time       `json:"purged_at,omitempty"`
+}
+
+type AuditEvent struct {
+	ID           int64     `json:"id"`
+	RoomID       string    `json:"room_id"`
+	Event        string    `json:"event"`
+	Meta         string    `json:"meta"`
+	MessageCount int       `json:"message_count"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type CreateAgentInput struct {
@@ -169,4 +220,10 @@ type AppendAuditEventInput struct {
 	Event        string
 	Meta         string
 	MessageCount int
+}
+
+type UpsertRoomContextInput struct {
+	RoomID  string
+	Context json.RawMessage
+	Version int
 }

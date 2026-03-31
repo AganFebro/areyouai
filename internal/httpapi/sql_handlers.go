@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/febrian/areyouai/internal/repository"
 	"github.com/febrian/areyouai/internal/service/a2a"
@@ -13,6 +16,10 @@ import (
 
 type sqlHTTP struct {
 	svc *a2a.Service
+
+	mu         sync.Mutex
+	ipWindows  map[string][]time.Time
+	adminToken string
 }
 
 func newSQLHTTP(store repository.Store, opts options) *sqlHTTP {
@@ -22,6 +29,8 @@ func newSQLHTTP(store repository.Store, opts options) *sqlHTTP {
 			ClosedRoomGraceDelay:   opts.ClosedRoomGraceDelay,
 			MaxClosedRetention:     opts.MaxClosedRetention,
 		}),
+		ipWindows:  make(map[string][]time.Time),
+		adminToken: strings.TrimSpace(opts.AdminToken),
 	}
 }
 
@@ -160,6 +169,8 @@ func (s *sqlHTTP) handleRoomByID(w http.ResponseWriter, r *http.Request) {
 		s.handleRoomMessage(w, r, roomID)
 	case "state":
 		s.handleRoomState(w, r, roomID)
+	case "context":
+		s.handleRoomContext(w, r, roomID)
 	case "close":
 		s.handleRoomClose(w, r, roomID)
 	case "transcript":
@@ -169,6 +180,146 @@ func (s *sqlHTTP) handleRoomByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (s *sqlHTTP) handleAdmin(w http.ResponseWriter, r *http.Request) {
+	parts := splitPath(r.URL.Path)
+	if len(parts) != 3 || parts[0] != "v1" || parts[1] != "admin" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if strings.TrimSpace(s.adminToken) == "" {
+		writeError(w, http.StatusServiceUnavailable, "admin not configured")
+		return
+	}
+	if !s.adminAuthorized(r) {
+		writeError(w, http.StatusUnauthorized, "missing or invalid admin token")
+		return
+	}
+
+	switch parts[2] {
+	case "overview":
+		s.handleAdminOverview(w, r)
+	case "rooms":
+		s.handleAdminRooms(w, r)
+	case "audit":
+		s.handleAdminAudit(w, r)
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s *sqlHTTP) adminAuthorized(r *http.Request) bool {
+	adminToken := strings.TrimSpace(s.adminToken)
+	if adminToken == "" {
+		return false
+	}
+	if x := strings.TrimSpace(r.Header.Get("X-Admin-Token")); x != "" {
+		return subtleConstantTimeEqual(x, adminToken)
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	if token == "" {
+		return false
+	}
+	return subtleConstantTimeEqual(token, adminToken)
+}
+
+func subtleConstantTimeEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	// Keep comparison timing resistant for token checks.
+	var diff byte
+	for i := 0; i < len(a); i++ {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
+}
+
+func (s *sqlHTTP) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
+	out, err := s.svcAdminOverview(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *sqlHTTP) handleAdminRooms(w http.ResponseWriter, r *http.Request) {
+	rooms, err := s.svcAdminRooms(r.Context(), 200)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": rooms})
+}
+
+func (s *sqlHTTP) handleAdminAudit(w http.ResponseWriter, r *http.Request) {
+	events, err := s.svcAdminAudit(r.Context(), 300)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": events})
+}
+
+func (s *sqlHTTP) svcAdminOverview(ctx context.Context) (map[string]any, error) {
+	out, err := s.svc.AdminOverview(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"agents_total":     out.Overview.AgentsTotal,
+		"sessions_active":  out.Overview.SessionsActive,
+		"rooms_open":       out.Overview.RoomsOpen,
+		"rooms_active":     out.Overview.RoomsActive,
+		"rooms_closed":     out.Overview.RoomsClosed,
+		"rooms_purged":     out.Overview.RoomsPurged,
+		"messages_total":   out.Overview.MessagesTotal,
+		"generated_at_utc": time.Now().UTC().Format(time.RFC3339),
+	}, nil
+}
+
+func (s *sqlHTTP) svcAdminRooms(ctx context.Context, limit int) ([]repository.AdminRoom, error) {
+	return s.svc.AdminRooms(ctx, limit)
+}
+
+func (s *sqlHTTP) svcAdminAudit(ctx context.Context, limit int) ([]repository.AuditEvent, error) {
+	return s.svc.AdminAudit(ctx, limit)
+}
+
+func (s *sqlHTTP) handleRoomContext(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	agentID, err := s.authAgentID(r.Context(), r)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	out, err := s.svc.GetPromptBundle(r.Context(), agentID, roomID)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"room_id":            roomID,
+		"bundle_hash":        out.BundleHash,
+		"system_core_hash":   out.SystemCoreHash,
+		"global_rules_hash":  out.GlobalRulesHash,
+		"agent_rules_hash":   out.AgentRulesHash,
+		"ordered_stack":      []string{"SYSTEM_CORE", "HARD_RULES_GLOBAL", "HARD_RULES_AGENT", "TASK_CONTEXT", "RECENT_MEMORY"},
+		"prompt_bundle_text": out.Prompt,
+	})
 }
 
 func (s *sqlHTTP) handleRoomJoin(w http.ResponseWriter, r *http.Request, roomID string) {
@@ -186,16 +337,33 @@ func (s *sqlHTTP) handleRoomJoin(w http.ResponseWriter, r *http.Request, roomID 
 		writeServiceErr(w, err)
 		return
 	}
+	bundle, err := s.svc.GetPromptBundle(r.Context(), agentID, roomID)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"room_id": roomID,
-		"state":   state,
-		"joined":  joined,
+		"room_id":           roomID,
+		"state":             state,
+		"joined":            joined,
+		"initial_bundle":    bundle.BundleHash,
+		"system_core_hash":  bundle.SystemCoreHash,
+		"global_rules_hash": bundle.GlobalRulesHash,
+		"agent_rules_hash":  bundle.AgentRulesHash,
 	})
 }
 
 func (s *sqlHTTP) handleRoomMessage(w http.ResponseWriter, r *http.Request, roomID string) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.allowIPMessage(r.RemoteAddr, time.Now().UTC()) {
+		s.svc.AppendSecurityAudit(r.Context(), roomID, "ip_rate_limited", map[string]any{
+			"room_id": roomID,
+			"ip":      remoteIP(r.RemoteAddr),
+		}, 0)
+		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
 	agentID, err := s.authAgentID(r.Context(), r)
@@ -208,16 +376,17 @@ func (s *sqlHTTP) handleRoomMessage(w http.ResponseWriter, r *http.Request, room
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	msg, state, nextTurn, err := s.svc.SendMessage(r.Context(), agentID, roomID, req.ExpectedTurn, req.Ciphertext)
+	out, err := s.svc.SendMessage(r.Context(), agentID, roomID, req.ExpectedTurn, req.Ciphertext, req.BundleHash)
 	if err != nil {
 		writeServiceErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"message_id": msg.ID,
-		"turn":       msg.Turn,
-		"next_turn":  nextTurn,
-		"room_state": state,
+		"message_id":  out.Message.ID,
+		"turn":        out.Message.Turn,
+		"next_turn":   out.NextTurn,
+		"room_state":  out.RoomState,
+		"bundle_hash": out.BundleHash,
 	})
 }
 
@@ -346,6 +515,8 @@ func writeServiceErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "invalid request")
 	case errors.Is(err, a2a.ErrUnauthorized):
 		writeError(w, http.StatusUnauthorized, "missing or invalid token")
+	case errors.Is(err, a2a.ErrPolicyBlocked):
+		writeError(w, http.StatusForbidden, "policy blocked")
 	case errors.Is(err, a2a.ErrForbidden):
 		writeError(w, http.StatusForbidden, "forbidden")
 	case errors.Is(err, a2a.ErrNotFound):
@@ -359,4 +530,41 @@ func writeServiceErr(w http.ResponseWriter, err error) {
 	default:
 		writeError(w, http.StatusInternalServerError, "internal error")
 	}
+}
+
+func (s *sqlHTTP) allowIPMessage(addr string, now time.Time) bool {
+	ip := remoteIP(addr)
+	if ip == "" {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	const maxPerMinuteIP = 120
+	windowStart := now.Add(-1 * time.Minute)
+	timestamps := s.ipWindows[ip]
+	kept := timestamps[:0]
+	for _, t := range timestamps {
+		if t.After(windowStart) {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= maxPerMinuteIP {
+		s.ipWindows[ip] = kept
+		return false
+	}
+	kept = append(kept, now)
+	s.ipWindows[ip] = kept
+	return true
+}
+
+func remoteIP(addr string) string {
+	if strings.TrimSpace(addr) == "" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return strings.TrimSpace(addr)
+	}
+	return strings.TrimSpace(host)
 }

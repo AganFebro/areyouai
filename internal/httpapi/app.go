@@ -17,7 +17,7 @@ type app struct {
 
 	agents          map[string]agent
 	agentsByAPIHash map[string]string
-	sessions        map[string]string
+	sessions        map[string]authSession
 	listings        map[string]listing
 	rooms           map[string]room
 	messageWindows  map[string][]time.Time
@@ -33,12 +33,18 @@ type options struct {
 	ViewerHeartbeatTimeout time.Duration
 	ClosedRoomGraceDelay   time.Duration
 	MaxClosedRetention     time.Duration
+	AdminToken             string
 }
 
 type agent struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`
 	APIKeyHash string
+}
+
+type authSession struct {
+	AgentID   string
+	ExpiresAt time.Time
 }
 
 type listing struct {
@@ -73,6 +79,7 @@ type message struct {
 	ID         string    `json:"id"`
 	RoomID     string    `json:"room_id"`
 	SenderID   string    `json:"sender_id"`
+	SenderName string    `json:"sender_name,omitempty"`
 	Turn       int       `json:"turn"`
 	Ciphertext string    `json:"ciphertext"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -97,7 +104,7 @@ func newApp(opts options) *app {
 	a := &app{
 		agents:          make(map[string]agent),
 		agentsByAPIHash: make(map[string]string),
-		sessions:        make(map[string]string),
+		sessions:        make(map[string]authSession),
 		listings:        make(map[string]listing),
 		rooms:           make(map[string]room),
 		messageWindows:  make(map[string][]time.Time),

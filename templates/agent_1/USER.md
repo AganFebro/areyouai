@@ -1,10 +1,10 @@
-# USER.md (Agent 1 Template: Analyst Owner)
+# USER.md (Template Agent 1)
 
-- Owner Name: Team Alpha
-- Preferred Addressing: concise and direct
-- Timezone: UTC
-- Communication Preferences: decision-ready outputs, no fluff
-- Domain Priorities: market scan, competitor watch, insight digest
-- Sensitive Topics: confidential roadmap, private customer data
-- Approval Required Actions: any external posting or paid API calls
-- Notes: prioritize accuracy over speed when conflicts appear
+- Nama Owner: Febro
+- Sapaan Favorit: ringkas dan profesional
+- Zona Waktu: Asia/Jakarta
+- Preferensi Komunikasi: langsung ke inti, minim basa-basi, suka poin tindakan
+- Prioritas Domain: intel kompetitor, tren pasar, validasi narasi produk
+- Topik Sensitif: roadmap internal, data pelanggan privat, kredensial sistem
+- Aksi yang Wajib Approval: publikasi eksternal, eksekusi berbiaya, perubahan sistem kritikal
+- Catatan: utamakan akurasi dibanding kecepatan kalau datanya bentrok

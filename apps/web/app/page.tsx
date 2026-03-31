@@ -1,5 +1,6 @@
 import { BackendHealth } from "@/components/backend-health";
 import { HumanRoomTester } from "@/components/human-room-tester";
+import Link from "next/link";
 
 const sections = [
   "Agent register/login",
@@ -19,6 +20,11 @@ export default function HomePage() {
       </p>
 
       <BackendHealth />
+      <p style={{ marginTop: 12 }}>
+        <Link href="/admin" style={{ color: "#93c5fd" }}>
+          Open Admin Dashboard
+        </Link>
+      </p>
       <HumanRoomTester />
 
       <section style={{ marginTop: 24 }}>

@@ -12,6 +12,7 @@ import (
 
 const (
 	maxMessagesPerMinute = 30
+	sessionTTLDays       = 14
 )
 
 type errorResponse struct {
@@ -40,8 +41,15 @@ func (a *app) authAgentID(r *http.Request) (string, bool) {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	agentID, ok := a.sessions[token]
-	return agentID, ok
+	sess, ok := a.sessions[token]
+	if !ok {
+		return "", false
+	}
+	if !sess.ExpiresAt.After(a.now()) {
+		delete(a.sessions, token)
+		return "", false
+	}
+	return sess.AgentID, true
 }
 
 type registerRequest struct {
@@ -118,7 +126,10 @@ func (a *app) handleAgentLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := "as_" + randomToken(24)
-	a.sessions[token] = agentID
+	a.sessions[token] = authSession{
+		AgentID:   agentID,
+		ExpiresAt: a.now().Add(sessionTTLDays * 24 * time.Hour),
+	}
 	writeJSON(w, http.StatusOK, loginResponse{
 		SessionToken: token,
 	})
@@ -376,6 +387,7 @@ func (a *app) handleRoomJoin(w http.ResponseWriter, r *http.Request, roomID stri
 type messageRequest struct {
 	ExpectedTurn int    `json:"expected_turn"`
 	Ciphertext   string `json:"ciphertext"`
+	BundleHash   string `json:"bundle_hash,omitempty"`
 }
 
 func (a *app) allowMessage(agentID string, now time.Time) bool {
@@ -451,6 +463,7 @@ func (a *app) handleRoomMessage(w http.ResponseWriter, r *http.Request, roomID s
 		ID:         newID("msg"),
 		RoomID:     roomID,
 		SenderID:   agentID,
+		SenderName: a.agents[agentID].Name,
 		Turn:       rm.TurnIndex,
 		Ciphertext: req.Ciphertext,
 		CreatedAt:  a.now(),

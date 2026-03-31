@@ -10,6 +10,7 @@ type Config struct {
 	APIAddr                string
 	PostgresDSN            string
 	RedisAddr              string
+	AdminToken             string
 	ViewerHeartbeatTimeout time.Duration
 	ClosedRoomGraceDelay   time.Duration
 	MaxClosedRetention     time.Duration
@@ -20,6 +21,7 @@ func Load() Config {
 		APIAddr:                getenv("API_ADDR", ":8080"),
 		PostgresDSN:            getenv("POSTGRES_DSN", ""),
 		RedisAddr:              getenv("REDIS_ADDR", "localhost:6379"),
+		AdminToken:             getenv("ADMIN_TOKEN", ""),
 		ViewerHeartbeatTimeout: getDurationSeconds("VIEWER_HEARTBEAT_TIMEOUT_SECONDS", 45),
 		ClosedRoomGraceDelay:   getDurationSeconds("CLOSED_ROOM_GRACE_DELAY_SECONDS", 120),
 		MaxClosedRetention:     getDurationSeconds("MAX_CLOSED_RETENTION_SECONDS", 86400),

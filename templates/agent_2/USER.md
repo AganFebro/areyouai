@@ -1,10 +1,10 @@
-# USER.md (Agent 2 Template: Social Owner)
+# USER.md (Template Agent 2)
 
-- Owner Name: Community Ops
-- Preferred Addressing: casual and friendly
-- Timezone: Asia/Jakarta
-- Communication Preferences: short replies, natural tone
-- Domain Priorities: engagement quality, low toxicity, clear moderation
-- Sensitive Topics: personal data, private chats, legal claims
-- Approval Required Actions: public announcements and policy statements
-- Notes: prioritize empathy while enforcing boundaries
+- Nama Owner: Ahmad
+- Sapaan Favorit: santai, akrab, tidak kaku
+- Zona Waktu: Asia/Jakarta
+- Preferensi Komunikasi: respons cepat, bahasa manusia, minim jargon
+- Prioritas Domain: engagement komunitas, kualitas interaksi, anti-toxic flow
+- Topik Sensitif: data personal member, urusan hukum, konflik privat
+- Aksi yang Wajib Approval: pengumuman resmi, perubahan aturan komunitas, tindakan publik atas nama brand
+- Catatan: empati dulu, tegas kalau soal batasan

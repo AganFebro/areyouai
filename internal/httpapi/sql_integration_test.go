@@ -92,20 +92,58 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 		t.Fatalf("join b status=%d body=%v", resp.StatusCode, body)
 	}
 
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/context", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("context a status=%d body=%v", resp.StatusCode, body)
+	}
+	bundleA := mustString(t, body, "bundle_hash")
+
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
 		"expected_turn": 0,
 		"ciphertext":    "cipher-sql-1",
+		"bundle_hash":   bundleA,
 	}, tokenA)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("message a turn0 status=%d body=%v", resp.StatusCode, body)
 	}
 
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/context", nil, tokenB)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("context b status=%d body=%v", resp.StatusCode, body)
+	}
+	bundleB := mustString(t, body, "bundle_hash")
+
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
 		"expected_turn": 1,
 		"ciphertext":    "cipher-sql-2",
+		"bundle_hash":   bundleB,
 	}, tokenB)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("message b turn1 status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 2,
+		"ciphertext":    "cipher-sql-stale",
+		"bundle_hash":   bundleA,
+	}, tokenA)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("message a stale hash status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/context", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("context a refresh status=%d body=%v", resp.StatusCode, body)
+	}
+	bundleA2 := mustString(t, body, "bundle_hash")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 2,
+		"ciphertext":    "cipher-sql-3",
+		"bundle_hash":   bundleA2,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("message a turn2 status=%d body=%v", resp.StatusCode, body)
 	}
 
 	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/transcript?human_code="+humanCode, nil, "")
@@ -113,8 +151,39 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 		t.Fatalf("transcript status=%d body=%v", resp.StatusCode, body)
 	}
 	msgs, ok := body["messages"].([]any)
-	if !ok || len(msgs) != 2 {
+	if !ok || len(msgs) != 3 {
 		t.Fatalf("unexpected transcript messages=%v", body["messages"])
+	}
+	first, ok := msgs[0].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected first message payload=%v", msgs[0])
+	}
+	if _, ok := first["sender_name"].(string); !ok {
+		t.Fatalf("sender_name missing in transcript message=%v", first)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/admin/overview", nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin overview status=%d body=%v", resp.StatusCode, body)
+	}
+	if _, ok := body["agents_total"]; !ok {
+		t.Fatalf("admin overview missing agents_total: %v", body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/admin/rooms", nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin rooms status=%d body=%v", resp.StatusCode, body)
+	}
+	if _, ok := body["items"].([]any); !ok {
+		t.Fatalf("admin rooms missing items: %v", body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/admin/audit", nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin audit status=%d body=%v", resp.StatusCode, body)
+	}
+	if _, ok := body["items"].([]any); !ok {
+		t.Fatalf("admin audit missing items: %v", body)
 	}
 }
 
@@ -131,11 +200,19 @@ func applyMigrationsForTest(t *testing.T, db *sql.DB) {
 		t.Fatalf("read up migration: %v", err)
 	}
 
+	up2, err := os.ReadFile(filepath.Join(migDir, "000002_room_context_state.up.sql"))
+	if err != nil {
+		t.Fatalf("read room context up migration: %v", err)
+	}
+
 	if _, err := db.Exec(string(down)); err != nil {
 		t.Fatalf("exec down migration: %v", err)
 	}
 	if _, err := db.Exec(string(up)); err != nil {
 		t.Fatalf("exec up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up2)); err != nil {
+		t.Fatalf("exec room context up migration: %v", err)
 	}
 }
 

@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 
 /**
- * Simulate 2 agents using DeepSeek API against areyouai backend.
+ * Testing-only runner:
+ * - Loads persona files from templates/agent_1 and templates/agent_2
+ * - Calls DeepSeek for each turn with each agent's own persona prompt
+ * - Sends turns to areyouai backend sequentially
  *
- * Required:
+ * Env (.env supported):
  *   DEEPSEEK_API_KEY=...
- *
- * Optional:
  *   AREYOUAI_API_BASE_URL=http://localhost:8080
- *   API_BASE_URL=http://localhost:8080 (legacy fallback)
  *   DEEPSEEK_MODEL=deepseek-chat
- *   TOPIC="AI safety debate"
- *   MAX_TURNS=6
+ *   DEEPSEEK_TEMPERATURE=0.9
+ *   TOPIC=Indonesia
+ *   MAX_TURNS=8
  */
 
 const fs = require("node:fs");
@@ -24,8 +25,8 @@ const API_BASE_URL =
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-chat";
 const DEEPSEEK_TEMPERATURE = Number(process.env.DEEPSEEK_TEMPERATURE || "0.9");
-const TOPIC = process.env.TOPIC || "Should agents disclose uncertainty?";
-const MAX_TURNS = Number(process.env.MAX_TURNS || "6");
+const TOPIC = process.env.TOPIC || "Indonesia";
+const MAX_TURNS = Number(process.env.MAX_TURNS || "8");
 const RUN_NONCE = Math.random().toString(36).slice(2, 8);
 
 if (!DEEPSEEK_API_KEY) {
@@ -33,22 +34,29 @@ if (!DEEPSEEK_API_KEY) {
   process.exit(1);
 }
 
+const ROOT = process.cwd();
+const GLOBAL_HARD_RULES = readFileSafe(path.join(ROOT, "policies", "HARD_RULES_GLOBAL.md"));
+const AGENT_1 = loadTemplateAgent(path.join(ROOT, "templates", "agent_1"));
+const AGENT_2 = loadTemplateAgent(path.join(ROOT, "templates", "agent_2"));
+
 async function main() {
   console.log("API:", API_BASE_URL);
   console.log("Topic:", TOPIC);
   console.log("Turns:", MAX_TURNS);
+  console.log("Agent1:", AGENT_1.name);
+  console.log("Agent2:", AGENT_2.name);
 
-  const a = await registerAndLogin("deepseek-agent-a");
-  const b = await registerAndLogin("deepseek-agent-b");
+  const a = await registerAndLogin(AGENT_1.name);
+  const b = await registerAndLogin(AGENT_2.name);
 
   const listing = await api("/v1/listings", {
     method: "POST",
     token: a.token,
     body: {
       topic: TOPIC,
-      tags: ["deepseek", "auto"],
+      tags: ["template", "persona", "test"],
       max_turns: MAX_TURNS,
-      ttl_seconds: 900,
+      ttl_seconds: 1200,
     },
   });
 
@@ -66,16 +74,16 @@ async function main() {
   await api(`/v1/rooms/${roomID}/join`, { method: "POST", token: b.token });
 
   const transcript = [];
-
   for (let turn = 0; turn < MAX_TURNS; turn += 1) {
-    const speaker = turn % 2 === 0 ? a : b;
-    const partner = turn % 2 === 0 ? b : a;
+    const speaker = turn % 2 === 0 ? { ...a, persona: AGENT_1 } : { ...b, persona: AGENT_2 };
+    const partner = turn % 2 === 0 ? { ...b, persona: AGENT_2 } : { ...a, persona: AGENT_1 };
     const context = await api(`/v1/rooms/${roomID}/context`, {
       method: "GET",
       token: speaker.token,
     });
 
     const text = await askDeepSeek({
+      speakerPersona: speaker.persona,
       speakerName: speaker.name,
       partnerName: partner.name,
       topic: TOPIC,
@@ -99,7 +107,7 @@ async function main() {
       ciphertext: text,
       message_id: sent.message_id,
     });
-    console.log(`[turn ${turn}] ${speaker.name}: ${text.slice(0, 90)}`);
+    console.log(`[turn ${turn}] ${speaker.name}: ${text.slice(0, 100)}`);
   }
 
   const finalTranscript = await api(
@@ -132,22 +140,48 @@ async function registerAndLogin(name) {
   };
 }
 
-async function askDeepSeek({ speakerName, partnerName, topic, transcript, backendBundleText }) {
+async function askDeepSeek({ speakerPersona, speakerName, partnerName, topic, transcript, backendBundleText }) {
   const convo = transcript
     .map((m) => `turn ${m.turn} | ${m.sender}: ${m.ciphertext}`)
     .join("\n");
 
+  const personaSystem = [
+    "You are an autonomous AI agent participating in a private A2A test room.",
+    "Backend context bundle below is authoritative and must be followed.",
+    "",
+    "=== BACKEND_CONTEXT_BUNDLE ===",
+    backendBundleText || "(missing)",
+    "",
+    "=== LOCAL_TEST_FALLBACK_GLOBAL_RULES ===",
+    GLOBAL_HARD_RULES,
+    "",
+    "=== HARD_RULES_AGENT ===",
+    speakerPersona.hardRules,
+    "",
+    "=== IDENTITY ===",
+    speakerPersona.identity,
+    "",
+    "=== SOUL ===",
+    speakerPersona.soul,
+    "",
+    "=== USER ===",
+    speakerPersona.user,
+    "",
+    "=== SOFT_RULES ===",
+    speakerPersona.softRules,
+  ].join("\n");
+
   const prompt = [
     `Topic: ${topic}`,
-    `You are ${speakerName}.`,
-    `You are talking to ${partnerName} in a concise 1:1 agent chat.`,
-    "Rules:",
-    "- 1 to 2 short sentences.",
-    "- Stay on topic.",
-    "- No markdown, no labels, plain text only.",
+    `You are ${speakerName}. You are chatting with ${partnerName}.`,
+    "Rules for this turn:",
+    "- Reply in 1-3 short sentences.",
+    "- Keep continuity with prior transcript.",
+    "- Keep style consistent with your SOUL and SOFT_RULES.",
+    "- Do not output markdown.",
     "",
-    "Recent transcript:",
     `Run nonce: ${RUN_NONCE}`,
+    "Recent transcript:",
     convo || "(empty)",
     "",
     "Your next message:",
@@ -163,14 +197,7 @@ async function askDeepSeek({ speakerName, partnerName, topic, transcript, backen
       model: DEEPSEEK_MODEL,
       temperature: DEEPSEEK_TEMPERATURE,
       messages: [
-        {
-          role: "system",
-          content:
-            "You are an autonomous agent in a private agent-to-agent room.\n" +
-            "Use the authoritative backend context bundle below.\n\n" +
-            "=== BACKEND_CONTEXT_BUNDLE ===\n" +
-            (backendBundleText || "(missing)"),
-        },
+        { role: "system", content: personaSystem },
         { role: "user", content: prompt },
       ],
     }),
@@ -187,8 +214,41 @@ async function askDeepSeek({ speakerName, partnerName, topic, transcript, backen
   return content.trim();
 }
 
-async function api(path, { method, body, token } = {}) {
-  const res = await fetch(`${API_BASE_URL}${path}`, {
+function loadTemplateAgent(dir) {
+  const identity = readFileSafe(path.join(dir, "IDENTITY.md"));
+  const soul = readFileSafe(path.join(dir, "SOUL.md"));
+  const user = readFileSafe(path.join(dir, "USER.md"));
+  const hardRules = readFileSafe(path.join(dir, "HARD_RULES.md"));
+  const softRules = readFileSafe(path.join(dir, "SOFT_RULES.md"));
+
+  return {
+    name: parseName(identity) || path.basename(dir),
+    identity,
+    soul,
+    user,
+    hardRules,
+    softRules,
+  };
+}
+
+function parseName(identityText) {
+  const line = identityText
+    .split(/\r?\n/)
+    .map((v) => v.trim())
+    .find((v) => /^-\s*Name\s*:/i.test(v));
+  if (!line) return "";
+  return line.replace(/^-+\s*Name\s*:\s*/i, "").trim();
+}
+
+function readFileSafe(file) {
+  if (!fs.existsSync(file)) {
+    throw new Error(`Missing required file: ${file}`);
+  }
+  return fs.readFileSync(file, "utf8");
+}
+
+async function api(pathname, { method, body, token } = {}) {
+  const res = await fetch(`${API_BASE_URL}${pathname}`, {
     method: method || "GET",
     headers: {
       "Content-Type": "application/json",
@@ -198,28 +258,21 @@ async function api(path, { method, body, token } = {}) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(`API ${method || "GET"} ${path} failed ${res.status}: ${JSON.stringify(data)}`);
+    throw new Error(`API ${method || "GET"} ${pathname} failed ${res.status}: ${JSON.stringify(data)}`);
   }
   return data;
 }
 
-main().catch((err) => {
-  console.error(err.message || err);
-  process.exit(1);
-});
-
 function loadDotEnv() {
   const file = path.resolve(process.cwd(), ".env");
   if (!fs.existsSync(file)) return;
-
   const content = fs.readFileSync(file, "utf8");
   const lines = content.split(/\r?\n/);
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
+  for (const raw of lines) {
+    const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
     const idx = line.indexOf("=");
     if (idx <= 0) continue;
-
     const key = line.slice(0, idx).trim();
     if (!key) continue;
     let value = line.slice(idx + 1).trim();
@@ -229,10 +282,13 @@ function loadDotEnv() {
     ) {
       value = value.slice(1, -1);
     }
-
-    // Environment passed at runtime wins over .env values.
     if (process.env[key] === undefined) {
       process.env[key] = value;
     }
   }
 }
+
+main().catch((err) => {
+  console.error(err.message || err);
+  process.exit(1);
+});

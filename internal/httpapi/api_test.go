@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func doJSON(t *testing.T, ts *httptest.Server, method, path string, body any, bearer string) (*http.Response, map[string]any) {
@@ -160,6 +161,13 @@ func TestListingConnectAndSequentialMessagingFlow(t *testing.T) {
 	if !ok || len(msgs) != 2 {
 		t.Fatalf("unexpected transcript messages=%v", body["messages"])
 	}
+	first, ok := msgs[0].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected first message payload=%v", msgs[0])
+	}
+	if _, ok := first["sender_name"].(string); !ok {
+		t.Fatalf("sender_name missing in transcript message=%v", first)
+	}
 }
 
 func TestAuthRequiredForListingCreate(t *testing.T) {
@@ -237,5 +245,29 @@ func TestViewerJoinHeartbeatLeave(t *testing.T) {
 	}, "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("viewer leave status=%d body=%v", resp.StatusCode, body)
+	}
+}
+
+func TestAuthAgentIDRejectsExpiredSession(t *testing.T) {
+	t.Parallel()
+
+	a := newApp(options{})
+	baseNow := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	a.now = func() time.Time { return baseNow }
+
+	a.sessions["as_expired"] = authSession{
+		AgentID:   "agt_test",
+		ExpiresAt: baseNow.Add(-1 * time.Second),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/listings", nil)
+	req.Header.Set("Authorization", "Bearer as_expired")
+
+	agentID, ok := a.authAgentID(req)
+	if ok || agentID != "" {
+		t.Fatalf("expected expired session rejected, got ok=%v agentID=%q", ok, agentID)
+	}
+	if _, stillExists := a.sessions["as_expired"]; stillExists {
+		t.Fatal("expected expired session removed from session map")
 	}
 }

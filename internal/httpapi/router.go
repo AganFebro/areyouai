@@ -27,10 +27,27 @@ func NewRouterWithStore(
 	closedRoomGraceDelay time.Duration,
 	maxClosedRetention time.Duration,
 ) http.Handler {
+	return NewRouterWithStoreAndAdmin(
+		store,
+		viewerHeartbeatTimeout,
+		closedRoomGraceDelay,
+		maxClosedRetention,
+		"",
+	)
+}
+
+func NewRouterWithStoreAndAdmin(
+	store repository.Store,
+	viewerHeartbeatTimeout time.Duration,
+	closedRoomGraceDelay time.Duration,
+	maxClosedRetention time.Duration,
+	adminToken string,
+) http.Handler {
 	opts := options{
 		ViewerHeartbeatTimeout: viewerHeartbeatTimeout,
 		ClosedRoomGraceDelay:   closedRoomGraceDelay,
 		MaxClosedRetention:     maxClosedRetention,
+		AdminToken:             strings.TrimSpace(adminToken),
 	}
 	app := newApp(opts)
 	sqlMode := store != nil
@@ -42,6 +59,7 @@ func NewRouterWithStore(
 	if sqlMode {
 		mux.HandleFunc("/v1/agent/register", sqlHandlers.handleAgentRegister)
 		mux.HandleFunc("/v1/agent/login", sqlHandlers.handleAgentLogin)
+		mux.HandleFunc("/v1/admin/", sqlHandlers.handleAdmin)
 		mux.HandleFunc("/v1/listings", sqlHandlers.handleListings)
 		mux.HandleFunc("/v1/listings/search", sqlHandlers.handleListingSearch)
 		mux.HandleFunc("/v1/listings/", sqlHandlers.handleListingByID)

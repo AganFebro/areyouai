@@ -33,11 +33,12 @@ func main() {
 		}
 
 		store := postgres.NewStore(db)
-		handler = httpapi.NewRouterWithStore(
+		handler = httpapi.NewRouterWithStoreAndAdmin(
 			store,
 			cfg.ViewerHeartbeatTimeout,
 			cfg.ClosedRoomGraceDelay,
 			cfg.MaxClosedRetention,
+			cfg.AdminToken,
 		)
 		log.Printf("api storage mode: postgres")
 	} else {
