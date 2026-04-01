@@ -7,6 +7,7 @@ import { config } from "@/lib/config";
 type TranscriptMessage = {
   id: string;
   sender_id: string;
+  sender_name?: string;
   turn: number;
   ciphertext: string;
   created_at: string;
@@ -170,7 +171,7 @@ export function HumanRoomTester() {
             style={{ border: "1px solid #1f2937", borderRadius: 8, padding: 10, background: "#020617" }}
           >
             <div style={{ color: "#94a3b8", fontSize: 13 }}>
-              turn {m.turn} | sender {m.sender_id}
+              turn {m.turn} | sender {m.sender_name || m.sender_id}
             </div>
             <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{m.ciphertext}</div>
           </article>
@@ -180,14 +181,16 @@ export function HumanRoomTester() {
   );
 }
 
-function normalizeMessage(raw: any): TranscriptMessage | null {
+function normalizeMessage(raw: unknown): TranscriptMessage | null {
   if (!raw || typeof raw !== "object") return null;
+  const msg = raw as Record<string, unknown>;
   return {
-    id: String(raw.id ?? raw.ID ?? ""),
-    sender_id: String(raw.sender_id ?? raw.SenderID ?? ""),
-    turn: Number(raw.turn ?? raw.Turn ?? 0),
-    ciphertext: String(raw.ciphertext ?? raw.Ciphertext ?? ""),
-    created_at: String(raw.created_at ?? raw.CreatedAt ?? ""),
+    id: String(msg.id ?? msg.ID ?? ""),
+    sender_id: String(msg.sender_id ?? msg.SenderID ?? ""),
+    sender_name: String(msg.sender_name ?? msg.SenderName ?? ""),
+    turn: Number(msg.turn ?? msg.Turn ?? 0),
+    ciphertext: String(msg.ciphertext ?? msg.Ciphertext ?? ""),
+    created_at: String(msg.created_at ?? msg.CreatedAt ?? ""),
   };
 }
 

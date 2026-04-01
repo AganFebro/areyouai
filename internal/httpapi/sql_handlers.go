@@ -2,9 +2,14 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,23 +18,39 @@ import (
 	"github.com/febrian/areyouai/internal/service/a2a"
 )
 
+const (
+	maxActiveStreamsPerAgentRoom      = 5
+	maxStreamConnectsPerMinuteRoomKey = 30
+	maxStreamConnectsPerMinuteIP      = 120
+)
+
 type sqlHTTP struct {
 	svc *a2a.Service
+	hub *roomEventHub
 
-	mu         sync.Mutex
-	ipWindows  map[string][]time.Time
-	adminToken string
+	mu                sync.Mutex
+	ipWindows         map[string][]time.Time
+	streamCounts      map[string]int
+	streamOpenWindows map[string][]time.Time
+	streamIPWindows   map[string][]time.Time
+	adminToken        string
 }
 
 func newSQLHTTP(store repository.Store, opts options) *sqlHTTP {
+	hub := newRoomEventHub(64)
 	return &sqlHTTP{
 		svc: a2a.New(store, a2a.Options{
 			ViewerHeartbeatTimeout: opts.ViewerHeartbeatTimeout,
 			ClosedRoomGraceDelay:   opts.ClosedRoomGraceDelay,
 			MaxClosedRetention:     opts.MaxClosedRetention,
+			RoomEventPublisher:     hub.Publish,
 		}),
-		ipWindows:  make(map[string][]time.Time),
-		adminToken: strings.TrimSpace(opts.AdminToken),
+		hub:               hub,
+		ipWindows:         make(map[string][]time.Time),
+		streamCounts:      make(map[string]int),
+		streamOpenWindows: make(map[string][]time.Time),
+		streamIPWindows:   make(map[string][]time.Time),
+		adminToken:        strings.TrimSpace(opts.AdminToken),
 	}
 }
 
@@ -156,29 +177,39 @@ func (s *sqlHTTP) handleListingByID(w http.ResponseWriter, r *http.Request) {
 
 func (s *sqlHTTP) handleRoomByID(w http.ResponseWriter, r *http.Request) {
 	parts := splitPath(r.URL.Path)
-	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "rooms" {
+	if len(parts) < 4 || parts[0] != "v1" || parts[1] != "rooms" {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
-	roomID, action := parts[2], parts[3]
-	switch action {
-	case "join":
-		s.handleRoomJoin(w, r, roomID)
-	case "messages":
-		s.handleRoomMessage(w, r, roomID)
-	case "state":
-		s.handleRoomState(w, r, roomID)
-	case "context":
-		s.handleRoomContext(w, r, roomID)
-	case "close":
-		s.handleRoomClose(w, r, roomID)
-	case "transcript":
-		s.handleTranscript(w, r, roomID)
-	case "viewers":
-		s.handleRoomViewers(w, r, roomID)
-	default:
-		writeError(w, http.StatusNotFound, "not found")
+	roomID := parts[2]
+	if len(parts) == 4 {
+		switch parts[3] {
+		case "join":
+			s.handleRoomJoin(w, r, roomID)
+		case "messages":
+			s.handleRoomMessage(w, r, roomID)
+		case "state":
+			s.handleRoomState(w, r, roomID)
+		case "context":
+			s.handleRoomContext(w, r, roomID)
+		case "events":
+			s.handleRoomEvents(w, r, roomID)
+		case "close":
+			s.handleRoomClose(w, r, roomID)
+		case "transcript":
+			s.handleTranscript(w, r, roomID)
+		case "viewers":
+			s.handleRoomViewers(w, r, roomID)
+		default:
+			writeError(w, http.StatusNotFound, "not found")
+		}
+		return
 	}
+	if len(parts) == 5 && parts[3] == "events" && parts[4] == "history" {
+		s.handleRoomEventsHistory(w, r, roomID)
+		return
+	}
+	writeError(w, http.StatusNotFound, "not found")
 }
 
 func (s *sqlHTTP) handleAdmin(w http.ResponseWriter, r *http.Request) {
@@ -499,6 +530,308 @@ func (s *sqlHTTP) handleRoomViewers(w http.ResponseWriter, r *http.Request, room
 	}
 }
 
+func (s *sqlHTTP) handleRoomEvents(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	agentID, err := s.authAgentID(r.Context(), r)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	sinceID, limit, err := parseEventStreamQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	releaseStreamSlot, deniedReason, err := s.acquireStreamSlot(agentID, roomID, r.RemoteAddr, time.Now().UTC())
+	if err != nil {
+		subscriberCount := s.hub.SubscriberCount(roomID)
+		meta := map[string]any{
+			"room_id":          roomID,
+			"agent_id":         agentID,
+			"event_id":         sinceID,
+			"subscriber_count": subscriberCount,
+			"drop_reason":      deniedReason,
+			"remote_ip":        remoteIP(r.RemoteAddr),
+		}
+		s.svc.AppendSecurityAudit(r.Context(), roomID, "stream_dropped", meta, 0)
+		log.Printf(
+			"stream_dropped room_id=%s agent_id=%s event_id=%d subscriber_count=%d drop_reason=%s remote_ip=%s",
+			roomID,
+			agentID,
+			sinceID,
+			subscriberCount,
+			deniedReason,
+			remoteIP(r.RemoteAddr),
+		)
+		writeServiceErr(w, err)
+		return
+	}
+	defer releaseStreamSlot()
+
+	initialReplay, err := s.svc.ListRoomEventHistory(r.Context(), agentID, roomID, sinceID, limit)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	sub := s.hub.Subscribe(roomID)
+	defer sub.Close()
+
+	// Bridge the query->subscribe race window while preserving deterministic replay.
+	catchUpReplay, err := s.svc.ListRoomEventHistory(r.Context(), agentID, roomID, initialReplay.NextSince, limit)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	sinceID = catchUpReplay.NextSince
+	if sinceID < initialReplay.NextSince {
+		sinceID = initialReplay.NextSince
+	}
+	lastEventID := sinceID
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "stream unsupported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.WriteString(w, "retry: 3000\n\n"); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	subscriberCount := s.hub.SubscriberCount(roomID)
+	openMeta := map[string]any{
+		"room_id":          roomID,
+		"agent_id":         agentID,
+		"event_id":         sinceID,
+		"since_id":         sinceID,
+		"subscriber_count": subscriberCount,
+		"remote_ip":        remoteIP(r.RemoteAddr),
+	}
+	s.svc.AppendSecurityAudit(r.Context(), roomID, "stream_opened", openMeta, 0)
+	log.Printf(
+		"stream_opened room_id=%s agent_id=%s event_id=%d subscriber_count=%d remote_ip=%s",
+		roomID,
+		agentID,
+		sinceID,
+		subscriberCount,
+		remoteIP(r.RemoteAddr),
+	)
+
+	closeReason := "client_disconnected"
+	defer func() {
+		eventName := "stream_closed"
+		if closeReason == "dropped_slow_subscriber" {
+			eventName = "stream_dropped"
+		}
+		meta := map[string]any{
+			"room_id":          roomID,
+			"agent_id":         agentID,
+			"event_id":         lastEventID,
+			"subscriber_count": s.hub.SubscriberCount(roomID),
+			"drop_reason":      closeReason,
+			"remote_ip":        remoteIP(r.RemoteAddr),
+		}
+		s.svc.AppendSecurityAudit(r.Context(), roomID, eventName, meta, 0)
+		log.Printf(
+			"%s room_id=%s agent_id=%s event_id=%d subscriber_count=%d drop_reason=%s remote_ip=%s",
+			eventName,
+			roomID,
+			agentID,
+			lastEventID,
+			s.hub.SubscriberCount(roomID),
+			closeReason,
+			remoteIP(r.RemoteAddr),
+		)
+	}()
+
+	for _, item := range initialReplay.Items {
+		if err := writeSSEEvent(w, flusher, item); err != nil {
+			closeReason = "write_failed"
+			return
+		}
+		lastEventID = item.ID
+	}
+	for _, item := range catchUpReplay.Items {
+		if err := writeSSEEvent(w, flusher, item); err != nil {
+			closeReason = "write_failed"
+			return
+		}
+		lastEventID = item.ID
+	}
+	keepAliveTicker := time.NewTicker(20 * time.Second)
+	reauthTicker := time.NewTicker(30 * time.Second)
+	defer keepAliveTicker.Stop()
+	defer reauthTicker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			closeReason = "client_disconnected"
+			return
+		case item, ok := <-sub.Events():
+			if !ok {
+				// Dropped from hub (slow consumer), client should reconnect.
+				if sub.Dropped() {
+					closeReason = "dropped_slow_subscriber"
+				} else {
+					closeReason = "subscription_closed"
+				}
+				return
+			}
+			if item.ID <= sinceID || item.RoomID != roomID {
+				continue
+			}
+			if err := writeSSEEvent(w, flusher, item); err != nil {
+				closeReason = "write_failed"
+				return
+			}
+			sinceID = item.ID
+			lastEventID = item.ID
+		case <-reauthTicker.C:
+			if _, authErr := s.authAgentID(r.Context(), r); authErr != nil {
+				closeReason = "auth_revalidation_failed"
+				return
+			}
+		case <-keepAliveTicker.C:
+			if _, writeErr := io.WriteString(w, ": keepalive\n\n"); writeErr != nil {
+				closeReason = "keepalive_write_failed"
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *sqlHTTP) handleRoomEventsHistory(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	agentID, err := s.authAgentID(r.Context(), r)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+
+	sinceID, limit, err := parseEventHistoryQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+
+	out, err := s.svc.ListRoomEventHistory(r.Context(), agentID, roomID, sinceID, limit)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+
+	items := make([]map[string]any, 0, len(out.Items))
+	for _, item := range out.Items {
+		items = append(items, roomEventPayload(item))
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"room_id":    roomID,
+		"items":      items,
+		"next_since": out.NextSince,
+	})
+}
+
+func parseEventStreamQuery(r *http.Request) (int64, int, error) {
+	sinceID, limit, err := parseEventHistoryQuery(r)
+	if err != nil {
+		return 0, 0, err
+	}
+	if strings.TrimSpace(r.URL.Query().Get("since")) != "" {
+		return sinceID, limit, nil
+	}
+	lastEventID := strings.TrimSpace(r.Header.Get("Last-Event-ID"))
+	if lastEventID == "" {
+		return sinceID, limit, nil
+	}
+	v, err := strconv.ParseInt(lastEventID, 10, 64)
+	if err != nil || v < 0 {
+		return 0, 0, errors.New("invalid last-event-id")
+	}
+	return v, limit, nil
+}
+
+func parseEventHistoryQuery(r *http.Request) (int64, int, error) {
+	since := int64(0)
+	if raw := strings.TrimSpace(r.URL.Query().Get("since")); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 {
+			return 0, 0, errors.New("invalid since")
+		}
+		since = v
+	}
+
+	limit := 200
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v <= 0 {
+			return 0, 0, errors.New("invalid limit")
+		}
+		limit = v
+	}
+	return since, limit, nil
+}
+
+func roomEventPayload(item repository.RoomEvent) map[string]any {
+	payload := map[string]any{
+		"event_id":   item.ID,
+		"type":       item.EventType,
+		"room_id":    item.RoomID,
+		"created_at": item.CreatedAt,
+	}
+	if item.MessageID != nil {
+		payload["message_id"] = *item.MessageID
+	}
+	if item.Turn != nil {
+		payload["turn"] = *item.Turn
+	}
+	if item.SenderID != nil {
+		payload["sender_id"] = *item.SenderID
+	}
+	if item.Ciphertext != nil {
+		payload["ciphertext"] = *item.Ciphertext
+	}
+	return payload
+}
+
+func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, item repository.RoomEvent) error {
+	payload, err := json.Marshal(roomEventPayload(item))
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("id: %d\n", item.ID)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("event: %s\n", item.EventType)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "data: "); err != nil {
+		return err
+	}
+	if _, err := w.Write(payload); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "\n\n"); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
 func (s *sqlHTTP) authAgentID(ctx context.Context, r *http.Request) (string, error) {
 	auth := r.Header.Get("Authorization")
 	if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
@@ -529,6 +862,80 @@ func writeServiceErr(w http.ResponseWriter, err error) {
 	default:
 		writeError(w, http.StatusInternalServerError, "internal error")
 	}
+}
+
+func (s *sqlHTTP) acquireStreamSlot(agentID, roomID, remoteAddr string, now time.Time) (func(), string, error) {
+	key := streamKey(agentID, roomID)
+	ip := remoteIP(remoteAddr)
+	if ip == "" {
+		ip = "unknown"
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.streamCounts == nil {
+		s.streamCounts = make(map[string]int)
+	}
+	if s.streamOpenWindows == nil {
+		s.streamOpenWindows = make(map[string][]time.Time)
+	}
+	if s.streamIPWindows == nil {
+		s.streamIPWindows = make(map[string][]time.Time)
+	}
+
+	windowStart := now.Add(-1 * time.Minute)
+	perRoomAgent := pruneTimeWindow(s.streamOpenWindows[key], windowStart)
+	perIP := pruneTimeWindow(s.streamIPWindows[ip], windowStart)
+
+	if s.streamCounts[key] >= maxActiveStreamsPerAgentRoom {
+		return nil, "max_active_streams_per_agent_room", a2a.ErrRateLimit
+	}
+	if len(perRoomAgent) >= maxStreamConnectsPerMinuteRoomKey {
+		s.streamOpenWindows[key] = perRoomAgent
+		return nil, "reconnect_rate_limited_room_agent", a2a.ErrRateLimit
+	}
+	if len(perIP) >= maxStreamConnectsPerMinuteIP {
+		s.streamIPWindows[ip] = perIP
+		return nil, "reconnect_rate_limited_ip", a2a.ErrRateLimit
+	}
+
+	s.streamCounts[key]++
+	s.streamOpenWindows[key] = append(perRoomAgent, now)
+	s.streamIPWindows[ip] = append(perIP, now)
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			curr := s.streamCounts[key]
+			switch {
+			case curr <= 1:
+				delete(s.streamCounts, key)
+			default:
+				s.streamCounts[key] = curr - 1
+			}
+		})
+	}
+	return release, "", nil
+}
+
+func streamKey(agentID, roomID string) string {
+	return strings.TrimSpace(roomID) + "|" + strings.TrimSpace(agentID)
+}
+
+func pruneTimeWindow(times []time.Time, keepAfter time.Time) []time.Time {
+	if len(times) == 0 {
+		return nil
+	}
+	kept := times[:0]
+	for _, at := range times {
+		if at.After(keepAfter) {
+			kept = append(kept, at)
+		}
+	}
+	return kept
 }
 
 func (s *sqlHTTP) allowIPMessage(addr string, now time.Time) bool {

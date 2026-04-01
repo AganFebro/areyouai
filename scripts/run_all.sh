@@ -5,9 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 POSTGRES_DSN="${POSTGRES_DSN:-postgres://areyouai:areyouai@localhost:5432/areyouai?sslmode=disable}"
-API_ADDR="${API_ADDR:-:8080}"
+API_ADDR="${API_ADDR:-127.0.0.1:8080}"
 WEB_PORT="${WEB_PORT:-3000}"
-API_BASE_URL="${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080}"
+API_BASE_URL="${NEXT_PUBLIC_API_BASE_URL:-http://127.0.0.1:8080}"
 CLOSED_ROOM_GRACE_DELAY_SECONDS="${CLOSED_ROOM_GRACE_DELAY_SECONDS:-900}"
 
 cleanup() {
@@ -66,6 +66,6 @@ if ! curl -fsS "http://localhost:8080/healthz" >/dev/null 2>&1; then
 fi
 
 echo "backend healthy"
-(cd "$ROOT_DIR/apps/web" && NEXT_PUBLIC_API_BASE_URL="$API_BASE_URL" npm run dev -- -p "$WEB_PORT") &
+(cd "$ROOT_DIR/apps/web" && NEXT_PUBLIC_API_BASE_URL="$API_BASE_URL" npm run dev -- -H 127.0.0.1 -p "$WEB_PORT") &
 
 wait

@@ -27,6 +27,7 @@ const (
 	policyBlockDuration       = 15 * time.Minute
 	maxPolicyViolationsWindow = 3
 	maxRecentMemoryEntries    = 6
+	maxRoomEventHistoryLimit  = 200
 	sessionTTL                = 14 * 24 * time.Hour
 )
 
@@ -44,6 +45,7 @@ var (
 type Service struct {
 	store repository.Store
 	pb    *promptbuilder.Builder
+	emit  func(repository.RoomEvent)
 
 	mu             sync.Mutex
 	joined         map[string]map[string]bool
@@ -62,6 +64,7 @@ type Options struct {
 	ViewerHeartbeatTimeout time.Duration
 	ClosedRoomGraceDelay   time.Duration
 	MaxClosedRetention     time.Duration
+	RoomEventPublisher     func(repository.RoomEvent)
 }
 
 type RegisterResult struct {
@@ -92,6 +95,7 @@ func New(store repository.Store, opts Options) *Service {
 	s := &Service{
 		store:                  store,
 		pb:                     pb,
+		emit:                   func(repository.RoomEvent) {},
 		joined:                 make(map[string]map[string]bool),
 		messageWindows:         make(map[string][]time.Time),
 		roomWindows:            make(map[string][]time.Time),
@@ -110,6 +114,9 @@ func New(store repository.Store, opts Options) *Service {
 	}
 	if opts.MaxClosedRetention > 0 {
 		s.maxClosedRetention = opts.MaxClosedRetention
+	}
+	if opts.RoomEventPublisher != nil {
+		s.emit = opts.RoomEventPublisher
 	}
 	return s
 }
@@ -299,13 +306,32 @@ func (s *Service) JoinRoom(ctx context.Context, agentID, roomID string) (domain.
 	}
 	if joined[rm.AgentAID] && joined[rm.AgentBID] && rm.State == domain.RoomStateOpen {
 		next := domain.RoomStateActive
-		updatedRoom, err := s.store.UpdateRoom(ctx, repository.UpdateRoomInput{
-			ID:    rm.ID,
-			State: &next,
+		var updatedRoom repository.Room
+		var emitted []repository.RoomEvent
+		err := s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+			room, txErr := tx.UpdateRoom(ctx, repository.UpdateRoomInput{
+				ID:    rm.ID,
+				State: &next,
+			})
+			if txErr != nil {
+				return txErr
+			}
+			ev, txErr := tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+				RoomID:    rm.ID,
+				EventType: "room.state_changed",
+				SenderID:  &agentID,
+			})
+			if txErr != nil {
+				return txErr
+			}
+			emitted = append(emitted, ev)
+			updatedRoom = room
+			return nil
 		})
 		if err != nil {
 			return "", nil, err
 		}
+		s.publishRoomEvents(emitted)
 		if err := s.upsertRoomContext(ctx, updatedRoom, ""); err != nil {
 			return "", nil, err
 		}
@@ -451,37 +477,85 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 		return SendMessageResult{}, ErrConflict
 	}
 
-	msg, err := s.store.AppendMessage(ctx, repository.AppendMessageInput{
-		ID:         newID("msg"),
-		RoomID:     roomID,
-		SenderID:   agentID,
-		Turn:       rm.TurnIndex,
-		Ciphertext: ciphertext,
+	var msg repository.Message
+	nextTurn := rm.TurnIndex + 1
+	nextState := rm.State
+	var updatedRoom repository.Room
+	var emitted []repository.RoomEvent
+	err = s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+		var txErr error
+		msg, txErr = tx.AppendMessage(ctx, repository.AppendMessageInput{
+			ID:         newID("msg"),
+			RoomID:     roomID,
+			SenderID:   agentID,
+			Turn:       rm.TurnIndex,
+			Ciphertext: ciphertext,
+		})
+		if txErr != nil {
+			if errors.Is(txErr, repository.ErrConflict) {
+				return ErrConflict
+			}
+			return txErr
+		}
+
+		update := repository.UpdateRoomInput{
+			ID:        rm.ID,
+			TurnIndex: &nextTurn,
+		}
+		if nextTurn >= rm.MaxTurns {
+			now := s.now()
+			closed := domain.RoomStateClosed
+			update.State = &closed
+			update.ClosedAt = &now
+			nextState = closed
+		}
+		updatedRoom, txErr = tx.UpdateRoom(ctx, update)
+		if txErr != nil {
+			return txErr
+		}
+
+		ev, txErr := tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+			RoomID:     rm.ID,
+			EventType:  "message.created",
+			MessageID:  &msg.ID,
+			Turn:       &msg.Turn,
+			SenderID:   &agentID,
+			Ciphertext: &msg.Ciphertext,
+		})
+		if txErr != nil {
+			return txErr
+		}
+		emitted = append(emitted, ev)
+
+		if nextState == domain.RoomStateClosed {
+			ev, txErr = tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+				RoomID:    rm.ID,
+				EventType: "room.state_changed",
+				SenderID:  &agentID,
+			})
+			if txErr != nil {
+				return txErr
+			}
+			emitted = append(emitted, ev)
+			ev, txErr = tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+				RoomID:    rm.ID,
+				EventType: "room.closed",
+				SenderID:  &agentID,
+			})
+			if txErr != nil {
+				return txErr
+			}
+			emitted = append(emitted, ev)
+		}
+		return nil
 	})
 	if err != nil {
-		if errors.Is(err, repository.ErrConflict) {
+		if errors.Is(err, ErrConflict) {
 			return SendMessageResult{}, ErrConflict
 		}
 		return SendMessageResult{}, err
 	}
-
-	nextTurn := rm.TurnIndex + 1
-	update := repository.UpdateRoomInput{
-		ID:        rm.ID,
-		TurnIndex: &nextTurn,
-	}
-	nextState := rm.State
-	if nextTurn >= rm.MaxTurns {
-		now := s.now()
-		closed := domain.RoomStateClosed
-		update.State = &closed
-		update.ClosedAt = &now
-		nextState = closed
-	}
-	updatedRoom, err := s.store.UpdateRoom(ctx, update)
-	if err != nil {
-		return SendMessageResult{}, err
-	}
+	s.publishRoomEvents(emitted)
 	if err := s.upsertRoomContext(ctx, updatedRoom, agentID); err != nil {
 		s.appendAuditEventBestEffort(ctx, roomID, "room_context_sync_failed", map[string]any{
 			"room_id":    roomID,
@@ -595,6 +669,11 @@ type RoomStateResult struct {
 	ActiveViewers int
 }
 
+type RoomEventHistoryResult struct {
+	Items     []repository.RoomEvent
+	NextSince int64
+}
+
 type AdminOverviewResult struct {
 	Overview repository.AdminOverview
 }
@@ -613,6 +692,71 @@ func (s *Service) AdminRooms(ctx context.Context, limit int) ([]repository.Admin
 
 func (s *Service) AdminAudit(ctx context.Context, limit int) ([]repository.AuditEvent, error) {
 	return s.store.ListAuditEvents(ctx, limit)
+}
+
+func (s *Service) ListRoomEventHistory(ctx context.Context, agentID, roomID string, sinceID int64, limit int) (RoomEventHistoryResult, error) {
+	if sinceID < 0 {
+		return RoomEventHistoryResult{}, ErrBadRequest
+	}
+	if limit <= 0 || limit > maxRoomEventHistoryLimit {
+		limit = maxRoomEventHistoryLimit
+	}
+
+	rm, err := s.store.GetRoom(ctx, roomID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return RoomEventHistoryResult{}, ErrNotFound
+		}
+		return RoomEventHistoryResult{}, err
+	}
+	rm, err = s.reconcileRoom(ctx, rm)
+	if err != nil {
+		return RoomEventHistoryResult{}, err
+	}
+	if rm.State == domain.RoomStatePurged {
+		return RoomEventHistoryResult{}, ErrGone
+	}
+	if rm.AgentAID != agentID && rm.AgentBID != agentID {
+		return RoomEventHistoryResult{}, ErrForbidden
+	}
+
+	s.mu.Lock()
+	joined := s.joined[roomID] != nil && s.joined[roomID][agentID]
+	s.mu.Unlock()
+	if !joined {
+		return RoomEventHistoryResult{}, ErrForbidden
+	}
+
+	if sinceID > 0 {
+		sinceEvent, getErr := s.store.GetRoomEvent(ctx, sinceID)
+		if getErr != nil {
+			if errors.Is(getErr, repository.ErrNotFound) {
+				return RoomEventHistoryResult{}, ErrBadRequest
+			}
+			return RoomEventHistoryResult{}, getErr
+		}
+		if sinceEvent.RoomID != roomID {
+			return RoomEventHistoryResult{}, ErrBadRequest
+		}
+	}
+
+	items, err := s.store.ListRoomEvents(ctx, repository.ListRoomEventsInput{
+		RoomID:  roomID,
+		SinceID: sinceID,
+		Limit:   limit,
+	})
+	if err != nil {
+		return RoomEventHistoryResult{}, err
+	}
+
+	nextSince := sinceID
+	if len(items) > 0 {
+		nextSince = items[len(items)-1].ID
+	}
+	return RoomEventHistoryResult{
+		Items:     items,
+		NextSince: nextSince,
+	}, nil
 }
 
 func (s *Service) GetRoomState(ctx context.Context, agentID, roomID string) (RoomStateResult, error) {
@@ -656,17 +800,49 @@ func (s *Service) CloseRoom(ctx context.Context, agentID, roomID string) (reposi
 	if rm.State == domain.RoomStatePurged {
 		return repository.Room{}, ErrGone
 	}
+	if rm.State == domain.RoomStateClosed {
+		// Idempotent close: already terminal, no new events.
+		return rm, nil
+	}
 
 	now := s.now()
 	closed := domain.RoomStateClosed
-	updatedRoom, err := s.store.UpdateRoom(ctx, repository.UpdateRoomInput{
-		ID:       roomID,
-		State:    &closed,
-		ClosedAt: &now,
+	var updatedRoom repository.Room
+	var emitted []repository.RoomEvent
+	err = s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+		room, txErr := tx.UpdateRoom(ctx, repository.UpdateRoomInput{
+			ID:       roomID,
+			State:    &closed,
+			ClosedAt: &now,
+		})
+		if txErr != nil {
+			return txErr
+		}
+		ev, txErr := tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+			RoomID:    roomID,
+			EventType: "room.state_changed",
+			SenderID:  &agentID,
+		})
+		if txErr != nil {
+			return txErr
+		}
+		emitted = append(emitted, ev)
+		ev, txErr = tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+			RoomID:    roomID,
+			EventType: "room.closed",
+			SenderID:  &agentID,
+		})
+		if txErr != nil {
+			return txErr
+		}
+		emitted = append(emitted, ev)
+		updatedRoom = room
+		return nil
 	})
 	if err != nil {
 		return repository.Room{}, err
 	}
+	s.publishRoomEvents(emitted)
 	if err := s.upsertRoomContext(ctx, updatedRoom, agentID); err != nil {
 		return repository.Room{}, err
 	}
@@ -831,14 +1007,40 @@ func (s *Service) reconcileRoomLocked(ctx context.Context, rm repository.Room) (
 	case domain.RoomStateOpen, domain.RoomStateActive:
 		if now.After(rm.TTLAt) {
 			closed := domain.RoomStateClosed
-			updated, err := s.store.UpdateRoom(ctx, repository.UpdateRoomInput{
-				ID:       rm.ID,
-				State:    &closed,
-				ClosedAt: &now,
+			var updated repository.Room
+			var emitted []repository.RoomEvent
+			err := s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+				var txErr error
+				updated, txErr = tx.UpdateRoom(ctx, repository.UpdateRoomInput{
+					ID:       rm.ID,
+					State:    &closed,
+					ClosedAt: &now,
+				})
+				if txErr != nil {
+					return txErr
+				}
+				ev, txErr := tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+					RoomID:    rm.ID,
+					EventType: "room.state_changed",
+				})
+				if txErr != nil {
+					return txErr
+				}
+				emitted = append(emitted, ev)
+				ev, txErr = tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+					RoomID:    rm.ID,
+					EventType: "room.closed",
+				})
+				if txErr != nil {
+					return txErr
+				}
+				emitted = append(emitted, ev)
+				return nil
 			})
 			if err != nil {
 				return repository.Room{}, err
 			}
+			s.publishRoomEvents(emitted)
 			if err := s.upsertRoomContext(ctx, updated, ""); err != nil {
 				s.appendAuditEventBestEffort(ctx, rm.ID, "room_context_sync_failed", map[string]any{
 					"room_id": rm.ID,
@@ -879,9 +1081,36 @@ func (s *Service) reconcileRoomLocked(ctx context.Context, rm repository.Room) (
 			if err != nil {
 				return repository.Room{}, err
 			}
-			if err := s.store.PurgeRoomContent(ctx, rm.ID, now); err != nil {
+			var purgedRoom repository.Room
+			var emitted []repository.RoomEvent
+			err = s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+				if txErr := tx.PurgeRoomContent(ctx, rm.ID, now); txErr != nil {
+					return txErr
+				}
+				ev, txErr := tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+					RoomID:    rm.ID,
+					EventType: "room.state_changed",
+				})
+				if txErr != nil {
+					return txErr
+				}
+				emitted = append(emitted, ev)
+				ev, txErr = tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+					RoomID:    rm.ID,
+					EventType: "room.purged",
+				})
+				if txErr != nil {
+					return txErr
+				}
+				emitted = append(emitted, ev)
+				var getErr error
+				purgedRoom, getErr = tx.GetRoom(ctx, rm.ID)
+				return getErr
+			})
+			if err != nil {
 				return repository.Room{}, err
 			}
+			s.publishRoomEvents(emitted)
 			if err := s.store.AppendAuditEvent(ctx, repository.AppendAuditEventInput{
 				RoomID:       rm.ID,
 				Event:        "room_purged",
@@ -890,7 +1119,7 @@ func (s *Service) reconcileRoomLocked(ctx context.Context, rm repository.Room) (
 			}); err != nil {
 				return repository.Room{}, err
 			}
-			return s.store.GetRoom(ctx, rm.ID)
+			return purgedRoom, nil
 		}
 	}
 	return rm, nil
@@ -1058,6 +1287,15 @@ func selectRecentMemory(messages []repository.Message) []recentMemoryEntry {
 		})
 	}
 	return out
+}
+
+func (s *Service) publishRoomEvents(events []repository.RoomEvent) {
+	for _, ev := range events {
+		if ev.ID == 0 || strings.TrimSpace(ev.RoomID) == "" {
+			continue
+		}
+		s.emit(ev)
+	}
 }
 
 func (s *Service) AppendSecurityAudit(ctx context.Context, roomID, event string, meta map[string]any, messageCount int) {

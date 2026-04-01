@@ -39,26 +39,43 @@ type AuditEvent = {
 };
 
 type Status = "idle" | "loading" | "ok" | "error";
+const ADMIN_TOKEN_STORAGE_KEY = "areyouai.admin.token";
 
 export function AdminDashboard() {
   const [status, setStatus] = useState<Status>("idle");
+  const [statusMessage, setStatusMessage] = useState("idle");
+  const [adminToken, setAdminToken] = useState(() => {
+    if (typeof window === "undefined") return "";
+    return window.localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) ?? "";
+  });
   const [overview, setOverview] = useState<Overview | null>(null);
   const [rooms, setRooms] = useState<AdminRoom[]>([]);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
 
   useEffect(() => {
+    const token = adminToken.trim();
+    if (!token) return;
+
     let mounted = true;
     const load = async () => {
       setStatus("loading");
+      setStatusMessage("loading...");
       try {
+        const headers = { Authorization: `Bearer ${token}` };
         const [ovRes, roomsRes, auditRes] = await Promise.all([
-          fetch(`${config.apiBaseUrl}/v1/admin/overview`, { cache: "no-store" }),
-          fetch(`${config.apiBaseUrl}/v1/admin/rooms`, { cache: "no-store" }),
-          fetch(`${config.apiBaseUrl}/v1/admin/audit`, { cache: "no-store" }),
+          fetch(`${config.apiBaseUrl}/v1/admin/overview`, { cache: "no-store", headers }),
+          fetch(`${config.apiBaseUrl}/v1/admin/rooms`, { cache: "no-store", headers }),
+          fetch(`${config.apiBaseUrl}/v1/admin/audit`, { cache: "no-store", headers }),
         ]);
         if (!mounted) return;
+        if (ovRes.status === 401 || roomsRes.status === 401 || auditRes.status === 401) {
+          setStatus("error");
+          setStatusMessage("unauthorized: invalid admin token");
+          return;
+        }
         if (!ovRes.ok || !roomsRes.ok || !auditRes.ok) {
           setStatus("error");
+          setStatusMessage("admin API error");
           return;
         }
         const ov = (await ovRes.json()) as Overview;
@@ -68,9 +85,11 @@ export function AdminDashboard() {
         setRooms(r.items ?? []);
         setAudit(a.items ?? []);
         setStatus("ok");
+        setStatusMessage("ok");
       } catch {
         if (!mounted) return;
         setStatus("error");
+        setStatusMessage("network error");
       }
     };
 
@@ -80,7 +99,7 @@ export function AdminDashboard() {
       mounted = false;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [adminToken]);
 
   const roomSummary = useMemo(() => {
     const byState = new Map<string, number>();
@@ -89,6 +108,29 @@ export function AdminDashboard() {
     }
     return Array.from(byState.entries());
   }, [rooms]);
+
+  const saveToken = () => {
+    const token = adminToken.trim();
+    if (!token) {
+      setStatusMessage("admin token is required");
+      return;
+    }
+    window.localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+    setStatusMessage("admin token saved");
+  };
+
+  const clearToken = () => {
+    window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+    setAdminToken("");
+    setStatus("idle");
+    setStatusMessage("admin token cleared");
+    setOverview(null);
+    setRooms([]);
+    setAudit([]);
+  };
+
+  const tokenMissing = adminToken.trim() === "";
+  const effectiveStatusMessage = tokenMissing ? "missing admin token" : statusMessage;
 
   return (
     <section>
@@ -101,8 +143,37 @@ export function AdminDashboard() {
           marginBottom: 16,
         }}
       >
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+          <input
+            type="password"
+            value={adminToken}
+            onChange={(e) => setAdminToken(e.target.value)}
+            placeholder="ADMIN_TOKEN"
+            style={{
+              minWidth: 300,
+              borderRadius: 8,
+              border: "1px solid #334155",
+              background: "#020617",
+              color: "#e5e7eb",
+              padding: "8px 10px",
+            }}
+          />
+          <button
+            onClick={saveToken}
+            style={{ borderRadius: 8, border: "1px solid #334155", background: "#0f172a", color: "#e5e7eb", padding: "8px 12px", cursor: "pointer" }}
+          >
+            Save Token
+          </button>
+          <button
+            onClick={clearToken}
+            style={{ borderRadius: 8, border: "1px solid #334155", background: "#0f172a", color: "#e5e7eb", padding: "8px 12px", cursor: "pointer" }}
+          >
+            Clear
+          </button>
+        </div>
         <strong>API status: </strong>
-        {status === "loading" ? "loading..." : status === "ok" ? "ok" : status}
+        {status === "loading" ? "loading..." : status === "ok" ? "ok" : status} (
+        {effectiveStatusMessage})
       </div>
 
       <div

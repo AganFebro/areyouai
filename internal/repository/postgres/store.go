@@ -283,21 +283,86 @@ VALUES ($1, $2, $3, $4)`
 	return err
 }
 
+func (s *Store) AppendRoomEvent(ctx context.Context, in repository.AppendRoomEventInput) (repository.RoomEvent, error) {
+	const q = `
+INSERT INTO room_events (room_id, event_type, message_id, turn, sender_id, ciphertext)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, room_id, event_type, message_id, turn, sender_id, ciphertext, created_at`
+	return scanRoomEvent(s.db.QueryRowContext(
+		ctx,
+		q,
+		in.RoomID,
+		in.EventType,
+		in.MessageID,
+		in.Turn,
+		in.SenderID,
+		in.Ciphertext,
+	))
+}
+
+func (s *Store) GetRoomEvent(ctx context.Context, eventID int64) (repository.RoomEvent, error) {
+	const q = `
+SELECT id, room_id, event_type, message_id, turn, sender_id, ciphertext, created_at
+FROM room_events
+WHERE id = $1`
+	return scanRoomEvent(s.db.QueryRowContext(ctx, q, eventID))
+}
+
+func (s *Store) ListRoomEvents(ctx context.Context, in repository.ListRoomEventsInput) ([]repository.RoomEvent, error) {
+	limit := in.Limit
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+
+	const q = `
+SELECT id, room_id, event_type, message_id, turn, sender_id, ciphertext, created_at
+FROM room_events
+WHERE room_id = $1
+  AND id > $2
+ORDER BY id ASC
+LIMIT $3`
+	rows, err := s.db.QueryContext(ctx, q, in.RoomID, in.SinceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []repository.RoomEvent
+	for rows.Next() {
+		item, scanErr := scanRoomEvent(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) PurgeRoomContent(ctx context.Context, roomID string, purgedAt time.Time) error {
+	return purgeRoomContentExec(ctx, s.db, roomID, purgedAt)
+}
+
+func purgeRoomContentExec(ctx context.Context, exec interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, roomID string, purgedAt time.Time) error {
 	const deleteMsgs = `DELETE FROM messages WHERE room_id = $1`
-	if _, err := s.db.ExecContext(ctx, deleteMsgs, roomID); err != nil {
+	if _, err := exec.ExecContext(ctx, deleteMsgs, roomID); err != nil {
 		return err
 	}
 	const clearContext = `DELETE FROM room_context_state WHERE room_id = $1`
-	if _, err := s.db.ExecContext(ctx, clearContext, roomID); err != nil {
+	if _, err := exec.ExecContext(ctx, clearContext, roomID); err != nil {
 		return err
 	}
 	const clearViewers = `DELETE FROM room_viewers WHERE room_id = $1`
-	if _, err := s.db.ExecContext(ctx, clearViewers, roomID); err != nil {
+	if _, err := exec.ExecContext(ctx, clearViewers, roomID); err != nil {
+		return err
+	}
+	const clearEvents = `DELETE FROM room_events WHERE room_id = $1`
+	if _, err := exec.ExecContext(ctx, clearEvents, roomID); err != nil {
 		return err
 	}
 	const updateRoom = `UPDATE rooms SET state = $2, purged_at = $3 WHERE id = $1`
-	_, err := s.db.ExecContext(ctx, updateRoom, roomID, string(domain.RoomStatePurged), purgedAt)
+	_, err := exec.ExecContext(ctx, updateRoom, roomID, string(domain.RoomStatePurged), purgedAt)
 	return err
 }
 
@@ -417,6 +482,80 @@ RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, crea
 	return scanRoom(
 		s.tx.QueryRowContext(ctx, q, in.ID, in.AgentAID, in.AgentBID, string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash),
 	)
+}
+
+func (s *txStore) GetRoom(ctx context.Context, roomID string) (repository.Room, error) {
+	const q = `
+SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash
+FROM rooms
+WHERE id = $1`
+	return scanRoom(s.tx.QueryRowContext(ctx, q, roomID))
+}
+
+func (s *txStore) UpdateRoom(ctx context.Context, in repository.UpdateRoomInput) (repository.Room, error) {
+	current, err := s.GetRoom(ctx, in.ID)
+	if err != nil {
+		return repository.Room{}, err
+	}
+	if in.State != nil {
+		current.State = *in.State
+	}
+	if in.TurnIndex != nil {
+		current.TurnIndex = *in.TurnIndex
+	}
+	if in.ClosedAt != nil {
+		current.ClosedAt = in.ClosedAt
+	}
+	if in.PurgedAt != nil {
+		current.PurgedAt = in.PurgedAt
+	}
+
+	const q = `
+UPDATE rooms
+SET state = $2,
+    turn_index = $3,
+    closed_at = $4,
+    purged_at = $5
+WHERE id = $1
+RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash`
+	return scanRoom(s.tx.QueryRowContext(
+		ctx,
+		q,
+		current.ID,
+		string(current.State),
+		current.TurnIndex,
+		current.ClosedAt,
+		current.PurgedAt,
+	))
+}
+
+func (s *txStore) AppendMessage(ctx context.Context, in repository.AppendMessageInput) (repository.Message, error) {
+	const q = `
+INSERT INTO messages (id, room_id, sender_id, turn, ciphertext)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, room_id, sender_id, turn, ciphertext, created_at`
+	return scanMessage(s.tx.QueryRowContext(ctx, q, in.ID, in.RoomID, in.SenderID, in.Turn, in.Ciphertext))
+}
+
+func (s *txStore) PurgeRoomContent(ctx context.Context, roomID string, purgedAt time.Time) error {
+	return purgeRoomContentExec(ctx, s.tx, roomID, purgedAt)
+}
+
+func (s *txStore) AppendRoomEvent(ctx context.Context, in repository.AppendRoomEventInput) (repository.RoomEvent, error) {
+	const q = `
+INSERT INTO room_events (room_id, event_type, message_id, turn, sender_id, ciphertext)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, room_id, event_type, message_id, turn, sender_id, ciphertext, created_at`
+	return scanRoomEvent(s.tx.QueryRowContext(
+		ctx,
+		q,
+		in.RoomID,
+		in.EventType,
+		in.MessageID,
+		in.Turn,
+		in.SenderID,
+		in.Ciphertext,
+	))
 }
 
 func scanAgent(row interface{ Scan(dest ...any) error }) (repository.Agent, error) {
@@ -556,6 +695,39 @@ func scanAuditEvent(row interface{ Scan(dest ...any) error }) (repository.AuditE
 	err := row.Scan(&out.ID, &out.RoomID, &out.Event, &out.Meta, &out.MessageCount, &out.CreatedAt)
 	if err != nil {
 		return repository.AuditEvent{}, normalizeErr(err)
+	}
+	return out, nil
+}
+
+func scanRoomEvent(row interface{ Scan(dest ...any) error }) (repository.RoomEvent, error) {
+	var out repository.RoomEvent
+	var messageID, senderID, ciphertext sql.NullString
+	var turn sql.NullInt64
+	err := row.Scan(
+		&out.ID,
+		&out.RoomID,
+		&out.EventType,
+		&messageID,
+		&turn,
+		&senderID,
+		&ciphertext,
+		&out.CreatedAt,
+	)
+	if err != nil {
+		return repository.RoomEvent{}, normalizeErr(err)
+	}
+	if messageID.Valid {
+		out.MessageID = &messageID.String
+	}
+	if turn.Valid {
+		v := int(turn.Int64)
+		out.Turn = &v
+	}
+	if senderID.Valid {
+		out.SenderID = &senderID.String
+	}
+	if ciphertext.Valid {
+		out.Ciphertext = &ciphertext.String
 	}
 	return out, nil
 }

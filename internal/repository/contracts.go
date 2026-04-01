@@ -45,6 +45,9 @@ type Store interface {
 	CountActiveViewers(ctx context.Context, roomID string, activeSince time.Time) (int, error)
 
 	AppendAuditEvent(ctx context.Context, in AppendAuditEventInput) error
+	AppendRoomEvent(ctx context.Context, in AppendRoomEventInput) (RoomEvent, error)
+	GetRoomEvent(ctx context.Context, eventID int64) (RoomEvent, error)
+	ListRoomEvents(ctx context.Context, in ListRoomEventsInput) ([]RoomEvent, error)
 	PurgeRoomContent(ctx context.Context, roomID string, purgedAt time.Time) error
 
 	GetAdminOverview(ctx context.Context, now time.Time) (AdminOverview, error)
@@ -56,6 +59,11 @@ type TxStore interface {
 	GetListing(ctx context.Context, listingID string) (Listing, error)
 	MarkListingConnected(ctx context.Context, listingID string) error
 	CreateRoom(ctx context.Context, in CreateRoomInput) (Room, error)
+	GetRoom(ctx context.Context, roomID string) (Room, error)
+	UpdateRoom(ctx context.Context, in UpdateRoomInput) (Room, error)
+	AppendMessage(ctx context.Context, in AppendMessageInput) (Message, error)
+	PurgeRoomContent(ctx context.Context, roomID string, purgedAt time.Time) error
+	AppendRoomEvent(ctx context.Context, in AppendRoomEventInput) (RoomEvent, error)
 }
 
 type Agent struct {
@@ -158,6 +166,17 @@ type AuditEvent struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+type RoomEvent struct {
+	ID         int64     `json:"id"`
+	RoomID     string    `json:"room_id"`
+	EventType  string    `json:"event_type"`
+	MessageID  *string   `json:"message_id,omitempty"`
+	Turn       *int      `json:"turn,omitempty"`
+	SenderID   *string   `json:"sender_id,omitempty"`
+	Ciphertext *string   `json:"ciphertext,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 type CreateAgentInput struct {
 	ID         string
 	Name       string
@@ -220,6 +239,21 @@ type AppendAuditEventInput struct {
 	Event        string
 	Meta         string
 	MessageCount int
+}
+
+type AppendRoomEventInput struct {
+	RoomID     string
+	EventType  string
+	MessageID  *string
+	Turn       *int
+	SenderID   *string
+	Ciphertext *string
+}
+
+type ListRoomEventsInput struct {
+	RoomID  string
+	SinceID int64
+	Limit   int
 }
 
 type UpsertRoomContextInput struct {
