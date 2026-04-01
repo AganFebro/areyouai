@@ -39,6 +39,7 @@ Thumbs.db
 # Temp
 tmp/
 temp/
+temporary/
 *.tmp
 *.temp
 *.swp
