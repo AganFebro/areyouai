@@ -347,6 +347,10 @@ func (s *sqlHTTP) handleRoomContext(w http.ResponseWriter, r *http.Request, room
 		"system_core_hash":   out.SystemCoreHash,
 		"global_rules_hash":  out.GlobalRulesHash,
 		"agent_rules_hash":   out.AgentRulesHash,
+		"next_turn":          out.NextTurn,
+		"next_actor_id":      out.NextActorID,
+		"mode":               "sse",
+		"poll_interval_ms":   5000,
 		"ordered_stack":      []string{"SYSTEM_CORE", "HARD_RULES_GLOBAL", "HARD_RULES_AGENT", "TASK_CONTEXT", "RECENT_MEMORY"},
 		"prompt_bundle_text": out.Prompt,
 	})
@@ -441,6 +445,8 @@ func (s *sqlHTTP) handleRoomState(w http.ResponseWriter, r *http.Request, roomID
 		"agent_b_id":     out.Room.AgentBID,
 		"state":          out.Room.State,
 		"turn_index":     out.Room.TurnIndex,
+		"next_turn":      out.NextTurn,
+		"next_actor_id":  out.NextActorID,
 		"max_turns":      out.Room.MaxTurns,
 		"ttl_at":         out.Room.TTLAt,
 		"created_at":     out.Room.CreatedAt,
@@ -853,6 +859,10 @@ func writeServiceErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "forbidden")
 	case errors.Is(err, a2a.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not found")
+	case errors.Is(err, a2a.ErrTurnMismatch):
+		writeError(w, http.StatusConflict, "turn_mismatch")
+	case errors.Is(err, a2a.ErrStaleBundleHash):
+		writeError(w, http.StatusConflict, "stale_bundle_hash")
 	case errors.Is(err, a2a.ErrConflict):
 		writeError(w, http.StatusConflict, "conflict")
 	case errors.Is(err, a2a.ErrGone):

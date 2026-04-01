@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +46,32 @@ func TestWriteServiceErrPolicyBlocked(t *testing.T) {
 	writeServiceErr(w, a2a.ErrPolicyBlocked)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status=%d want=%d", w.Code, http.StatusForbidden)
+	}
+}
+
+func TestWriteServiceErrTurnMismatch(t *testing.T) {
+	t.Parallel()
+
+	w := httptest.NewRecorder()
+	writeServiceErr(w, a2a.ErrTurnMismatch)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status=%d want=%d", w.Code, http.StatusConflict)
+	}
+	if !strings.Contains(w.Body.String(), `"error":"turn_mismatch"`) {
+		t.Fatalf("body=%s", w.Body.String())
+	}
+}
+
+func TestWriteServiceErrStaleBundleHash(t *testing.T) {
+	t.Parallel()
+
+	w := httptest.NewRecorder()
+	writeServiceErr(w, a2a.ErrStaleBundleHash)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status=%d want=%d", w.Code, http.StatusConflict)
+	}
+	if !strings.Contains(w.Body.String(), `"error":"stale_bundle_hash"`) {
+		t.Fatalf("body=%s", w.Body.String())
 	}
 }
 

@@ -111,6 +111,17 @@ func TestListingConnectAndSequentialMessagingFlow(t *testing.T) {
 		t.Fatalf("join b status=%d body=%v", resp.StatusCode, body)
 	}
 
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/state", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("state status=%d body=%v", resp.StatusCode, body)
+	}
+	if _, ok := body["next_turn"]; !ok {
+		t.Fatalf("state missing next_turn: %v", body)
+	}
+	if _, ok := body["next_actor_id"]; !ok {
+		t.Fatalf("state missing next_actor_id: %v", body)
+	}
+
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
 		"expected_turn": 0,
 		"ciphertext":    "c1",
@@ -167,6 +178,24 @@ func TestListingConnectAndSequentialMessagingFlow(t *testing.T) {
 	}
 	if _, ok := first["sender_name"].(string); !ok {
 		t.Fatalf("sender_name missing in transcript message=%v", first)
+	}
+}
+
+func TestModeEndpointInMemory(t *testing.T) {
+	t.Parallel()
+
+	ts := httptest.NewServer(NewRouter())
+	defer ts.Close()
+
+	resp, body := doJSON(t, ts, http.MethodGet, "/v1/mode", nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mode status=%d body=%v", resp.StatusCode, body)
+	}
+	if got, _ := body["mode"].(string); got != "polling" {
+		t.Fatalf("mode=%v want=polling body=%v", body["mode"], body)
+	}
+	if _, ok := body["poll_interval_ms"]; !ok {
+		t.Fatalf("mode missing poll_interval_ms: %v", body)
 	}
 }
 

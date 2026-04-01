@@ -32,14 +32,16 @@ const (
 )
 
 var (
-	ErrBadRequest    = errors.New("bad request")
-	ErrUnauthorized  = errors.New("unauthorized")
-	ErrForbidden     = errors.New("forbidden")
-	ErrNotFound      = errors.New("not found")
-	ErrConflict      = errors.New("conflict")
-	ErrGone          = errors.New("gone")
-	ErrRateLimit     = errors.New("rate limit")
-	ErrPolicyBlocked = errors.New("policy blocked")
+	ErrBadRequest      = errors.New("bad request")
+	ErrUnauthorized    = errors.New("unauthorized")
+	ErrForbidden       = errors.New("forbidden")
+	ErrNotFound        = errors.New("not found")
+	ErrConflict        = errors.New("conflict")
+	ErrTurnMismatch    = errors.New("turn mismatch")
+	ErrStaleBundleHash = errors.New("stale bundle hash")
+	ErrGone            = errors.New("gone")
+	ErrRateLimit       = errors.New("rate limit")
+	ErrPolicyBlocked   = errors.New("policy blocked")
 )
 
 type Service struct {
@@ -356,6 +358,8 @@ type PromptBundleResult struct {
 	GlobalRulesHash string
 	AgentRulesHash  string
 	Prompt          string
+	NextTurn        int
+	NextActorID     string
 }
 
 type roomContextPayload struct {
@@ -437,7 +441,7 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 		return SendMessageResult{}, ErrRateLimit
 	}
 	if expectedTurn != rm.TurnIndex {
-		return SendMessageResult{}, ErrConflict
+		return SendMessageResult{}, ErrTurnMismatch
 	}
 
 	expectedSender := rm.AgentAID
@@ -445,7 +449,7 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 		expectedSender = rm.AgentBID
 	}
 	if expectedSender != agentID {
-		return SendMessageResult{}, ErrConflict
+		return SendMessageResult{}, ErrTurnMismatch
 	}
 
 	decision := security.EvaluateMessageForPersist(ciphertext)
@@ -474,7 +478,7 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 			"provided_hash": providedBundleHash,
 			"turn_index":    rm.TurnIndex,
 		}, recentCount)
-		return SendMessageResult{}, ErrConflict
+		return SendMessageResult{}, ErrStaleBundleHash
 	}
 
 	var msg repository.Message
@@ -493,7 +497,7 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 		})
 		if txErr != nil {
 			if errors.Is(txErr, repository.ErrConflict) {
-				return ErrConflict
+				return ErrTurnMismatch
 			}
 			return txErr
 		}
@@ -550,8 +554,11 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, ErrConflict) {
-			return SendMessageResult{}, ErrConflict
+		if errors.Is(err, ErrTurnMismatch) {
+			return SendMessageResult{}, ErrTurnMismatch
+		}
+		if errors.Is(err, ErrStaleBundleHash) {
+			return SendMessageResult{}, ErrStaleBundleHash
 		}
 		return SendMessageResult{}, err
 	}
@@ -625,6 +632,8 @@ func (s *Service) GetPromptBundle(ctx context.Context, agentID, roomID string) (
 		GlobalRulesHash: bundle.GlobalRulesHash,
 		AgentRulesHash:  bundle.AgentRulesHash,
 		Prompt:          bundle.Prompt,
+		NextTurn:        rm.TurnIndex,
+		NextActorID:     nextActorIDForRoom(rm),
 	}, nil
 }
 
@@ -667,6 +676,8 @@ func (s *Service) buildBundleForRoom(ctx context.Context, rm repository.Room, ag
 type RoomStateResult struct {
 	Room          repository.Room
 	ActiveViewers int
+	NextTurn      int
+	NextActorID   string
 }
 
 type RoomEventHistoryResult struct {
@@ -779,7 +790,12 @@ func (s *Service) GetRoomState(ctx context.Context, agentID, roomID string) (Roo
 	if err != nil {
 		return RoomStateResult{}, err
 	}
-	return RoomStateResult{Room: rm, ActiveViewers: count}, nil
+	return RoomStateResult{
+		Room:          rm,
+		ActiveViewers: count,
+		NextTurn:      rm.TurnIndex,
+		NextActorID:   nextActorIDForRoom(rm),
+	}, nil
 }
 
 func (s *Service) CloseRoom(ctx context.Context, agentID, roomID string) (repository.Room, error) {
@@ -1203,6 +1219,16 @@ func randomToken(numBytes int) string {
 func hashText(in string) string {
 	sum := sha256.Sum256([]byte(in))
 	return hex.EncodeToString(sum[:])
+}
+
+func nextActorIDForRoom(rm repository.Room) string {
+	if rm.State != domain.RoomStateOpen && rm.State != domain.RoomStateActive {
+		return ""
+	}
+	if rm.TurnIndex%2 == 0 {
+		return rm.AgentAID
+	}
+	return rm.AgentBID
 }
 
 func (s *Service) roomContextFromRoom(rm repository.Room, lastActorID string) roomContextPayload {

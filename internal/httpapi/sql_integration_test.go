@@ -47,7 +47,18 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
 	defer ts.Close()
 
-	resp, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "agent-a"}, "")
+	resp, body := doJSON(t, ts, http.MethodGet, "/v1/mode", nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mode status=%d body=%v", resp.StatusCode, body)
+	}
+	if got, _ := body["mode"].(string); got != "sse" {
+		t.Fatalf("mode=%v want=sse body=%v", body["mode"], body)
+	}
+	if _, ok := body["poll_interval_ms"]; !ok {
+		t.Fatalf("mode missing poll_interval_ms: %v", body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "agent-a"}, "")
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("register a status=%d body=%v", resp.StatusCode, body)
 	}
@@ -103,6 +114,12 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 		t.Fatalf("context a status=%d body=%v", resp.StatusCode, body)
 	}
 	bundleA := mustString(t, body, "bundle_hash")
+	if _, ok := body["next_turn"]; !ok {
+		t.Fatalf("context missing next_turn: %v", body)
+	}
+	if _, ok := body["next_actor_id"]; !ok {
+		t.Fatalf("context missing next_actor_id: %v", body)
+	}
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
 		"expected_turn": 0,
@@ -111,6 +128,18 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	}, tokenA)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("message a turn0 status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 1,
+		"ciphertext":    "cipher-sql-wrong-actor",
+		"bundle_hash":   bundleA,
+	}, tokenA)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("message wrong actor status=%d body=%v", resp.StatusCode, body)
+	}
+	if got, _ := body["error"].(string); got != "turn_mismatch" {
+		t.Fatalf("message wrong actor error=%v body=%v", body["error"], body)
 	}
 
 	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/context", nil, tokenB)
@@ -135,6 +164,20 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	}, tokenA)
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("message a stale hash status=%d body=%v", resp.StatusCode, body)
+	}
+	if got, _ := body["error"].(string); got != "stale_bundle_hash" {
+		t.Fatalf("message stale hash error=%v body=%v", body["error"], body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/state", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("room state status=%d body=%v", resp.StatusCode, body)
+	}
+	if _, ok := body["next_turn"]; !ok {
+		t.Fatalf("state missing next_turn: %v", body)
+	}
+	if _, ok := body["next_actor_id"]; !ok {
+		t.Fatalf("state missing next_actor_id: %v", body)
 	}
 
 	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/context", nil, tokenA)
@@ -531,6 +574,9 @@ func TestSQLModeRoomEventsSSEEndpoint(t *testing.T) {
 	}, tokenA)
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("invalid message status=%d body=%v", resp.StatusCode, body)
+	}
+	if got, _ := body["error"].(string); got != "turn_mismatch" {
+		t.Fatalf("invalid message error=%v body=%v", body["error"], body)
 	}
 	expectNoSSEEvent(t, eventCh, errCh, 1200*time.Millisecond)
 

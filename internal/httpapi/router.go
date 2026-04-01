@@ -57,7 +57,10 @@ func NewRouterWithStoreAndAdmin(
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", healthz)
+	mux.HandleFunc("/v1/mode", modeInfo(sqlMode))
 	mux.HandleFunc("/skill.md", serveSkillMD)
+	mux.HandleFunc("/nodejs_loop.md", serveNodeJSLoopMD)
+	mux.HandleFunc("/python_loop.md", servePythonLoopMD)
 	mux.HandleFunc("/v1/rooms/state-machine", roomStateMachine)
 	if sqlMode {
 		mux.HandleFunc("/v1/agent/register", sqlHandlers.handleAgentRegister)
@@ -86,20 +89,56 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func modeInfo(sqlMode bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		mode := "polling"
+		pollInterval := 3000
+		if sqlMode {
+			mode = "sse"
+			// Polling fallback interval if SSE client is unavailable.
+			pollInterval = 5000
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"mode":             mode,
+			"poll_interval_ms": pollInterval,
+		})
+	}
+}
+
 func serveSkillMD(w http.ResponseWriter, r *http.Request) {
+	serveMarkdownFile(w, r, strings.TrimSpace(os.Getenv("SKILL_MD_PATH")), "skill.md")
+}
+
+func serveNodeJSLoopMD(w http.ResponseWriter, r *http.Request) {
+	serveMarkdownFile(w, r, strings.TrimSpace(os.Getenv("NODEJS_LOOP_MD_PATH")), "nodejs_loop.md")
+}
+
+func servePythonLoopMD(w http.ResponseWriter, r *http.Request) {
+	serveMarkdownFile(w, r, strings.TrimSpace(os.Getenv("PYTHON_LOOP_MD_PATH")), "python_loop.md")
+}
+
+func serveMarkdownFile(w http.ResponseWriter, r *http.Request, primaryPath, fallbackName string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	skillPath := strings.TrimSpace(os.Getenv("SKILL_MD_PATH"))
-	if skillPath == "" {
-		skillPath = "skill.md"
+	if strings.TrimSpace(fallbackName) == "" {
+		http.Error(w, "markdown not found", http.StatusNotFound)
+		return
 	}
 
-	body, err := readSkillMD(skillPath)
+	if strings.TrimSpace(primaryPath) == "" {
+		primaryPath = fallbackName
+	}
+
+	body, err := readMarkdownFile(primaryPath, fallbackName)
 	if err != nil {
-		http.Error(w, "skill.md not found", http.StatusNotFound)
+		http.Error(w, fallbackName+" not found", http.StatusNotFound)
 		return
 	}
 
@@ -112,8 +151,8 @@ func serveSkillMD(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
-func readSkillMD(primaryPath string) ([]byte, error) {
-	paths := []string{primaryPath, "../skill.md", "../../skill.md"}
+func readMarkdownFile(primaryPath, fallbackName string) ([]byte, error) {
+	paths := []string{primaryPath, "../" + fallbackName, "../../" + fallbackName}
 	for _, path := range paths {
 		if strings.TrimSpace(path) == "" {
 			continue
@@ -127,6 +166,10 @@ func readSkillMD(primaryPath string) ([]byte, error) {
 		}
 	}
 	return nil, os.ErrNotExist
+}
+
+func readSkillMD(primaryPath string) ([]byte, error) {
+	return readMarkdownFile(primaryPath, "skill.md")
 }
 
 func withCORS(next http.Handler) http.Handler {

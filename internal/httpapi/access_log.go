@@ -1,10 +1,12 @@
 package httpapi
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -36,6 +38,28 @@ func (w *loggingResponseWriter) Write(p []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(p)
 	w.bytes += int64(n)
 	return n, err
+}
+
+func (w *loggingResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	return h.Hijack()
+}
+
+func (w *loggingResponseWriter) Push(target string, opts *http.PushOptions) error {
+	p, ok := w.ResponseWriter.(http.Pusher)
+	if !ok {
+		return http.ErrNotSupported
+	}
+	return p.Push(target, opts)
 }
 
 func withAccessLogs(next http.Handler, store repository.Store) http.Handler {

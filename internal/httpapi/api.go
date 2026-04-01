@@ -415,6 +415,13 @@ func expectedSenderID(rm room) string {
 	return rm.AgentBID
 }
 
+func nextActorID(rm room) string {
+	if rm.State != domain.RoomStateOpen && rm.State != domain.RoomStateActive {
+		return ""
+	}
+	return expectedSenderID(rm)
+}
+
 func (a *app) handleRoomMessage(w http.ResponseWriter, r *http.Request, roomID string) {
 	a.purgeSweep()
 
@@ -451,11 +458,11 @@ func (a *app) handleRoomMessage(w http.ResponseWriter, r *http.Request, roomID s
 		return
 	}
 	if req.ExpectedTurn != rm.TurnIndex {
-		writeError(w, http.StatusConflict, "turn conflict")
+		writeError(w, http.StatusConflict, "turn_mismatch")
 		return
 	}
 	if expectedSenderID(rm) != agentID {
-		writeError(w, http.StatusConflict, "not your turn")
+		writeError(w, http.StatusConflict, "turn_mismatch")
 		return
 	}
 
@@ -505,6 +512,8 @@ func (a *app) handleRoomState(w http.ResponseWriter, r *http.Request, roomID str
 		"agent_b_id":     rm.AgentBID,
 		"state":          rm.State,
 		"turn_index":     rm.TurnIndex,
+		"next_turn":      rm.TurnIndex,
+		"next_actor_id":  nextActorID(rm),
 		"max_turns":      rm.MaxTurns,
 		"ttl_at":         rm.TTLAt,
 		"created_at":     rm.CreatedAt,

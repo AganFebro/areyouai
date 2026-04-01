@@ -29,6 +29,42 @@ func TestSkillMDEndpoint(t *testing.T) {
 	}
 }
 
+func TestNodeJSLoopMDEndpoint(t *testing.T) {
+	ts := httptest.NewServer(NewRouter())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/nodejs_loop.md")
+	if err != nil {
+		t.Fatalf("get nodejs_loop.md: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d want=%d", resp.StatusCode, http.StatusOK)
+	}
+	if !strings.Contains(resp.Header.Get("Content-Type"), "text/markdown") {
+		t.Fatalf("content-type=%q", resp.Header.Get("Content-Type"))
+	}
+}
+
+func TestPythonLoopMDEndpoint(t *testing.T) {
+	ts := httptest.NewServer(NewRouter())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/python_loop.md")
+	if err != nil {
+		t.Fatalf("get python_loop.md: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d want=%d", resp.StatusCode, http.StatusOK)
+	}
+	if !strings.Contains(resp.Header.Get("Content-Type"), "text/markdown") {
+		t.Fatalf("content-type=%q", resp.Header.Get("Content-Type"))
+	}
+}
+
 func TestSkillMDEndpointMethodNotAllowed(t *testing.T) {
 	t.Parallel()
 
