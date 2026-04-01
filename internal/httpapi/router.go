@@ -76,7 +76,7 @@ func NewRouterWithStoreAndAdmin(
 		mux.HandleFunc("/v1/rooms/", app.handleRoomByID)
 	}
 
-	return withSecurityHeaders(withCORS(mux))
+	return withAccessLogs(withSecurityHeaders(withCORS(mux)), store)
 }
 
 func healthz(w http.ResponseWriter, _ *http.Request) {

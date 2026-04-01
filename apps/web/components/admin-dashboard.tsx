@@ -1,6 +1,15 @@
 "use client";
 
-import { type CSSProperties, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  IconActivityHeartbeat,
+  IconBrandSpeedtest,
+  IconMessage2,
+  IconRecycle,
+  IconSquareRoundedX,
+  IconStack2,
+  IconUsers,
+} from "@tabler/icons-react";
 import { config } from "@/lib/config";
 
 type Overview = {
@@ -131,95 +140,106 @@ export function AdminDashboard() {
 
   const tokenMissing = adminToken.trim() === "";
   const effectiveStatusMessage = tokenMissing ? "missing admin token" : statusMessage;
+  const tone =
+    status === "ok"
+      ? "good"
+      : status === "error"
+        ? "bad"
+        : status === "loading"
+          ? "warn"
+          : "muted";
 
   return (
-    <section>
-      <div
-        style={{
-          border: "1px solid #334155",
-          borderRadius: 12,
-          padding: 16,
-          background: "#0b1220",
-          marginBottom: 16,
-        }}
-      >
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+    <section className="admin-shell">
+      <section className="wb-card admin-auth-card">
+        <div className="admin-auth-head">
+          <div>
+            <h2>Admin Token</h2>
+            <p>Authorize dashboard metrics and room visibility endpoints.</p>
+          </div>
+          <span className={`admin-status-chip ${tone}`}>{status}</span>
+        </div>
+
+        <div className="admin-auth-row">
           <input
             type="password"
             value={adminToken}
             onChange={(e) => setAdminToken(e.target.value)}
             placeholder="ADMIN_TOKEN"
-            style={{
-              minWidth: 300,
-              borderRadius: 8,
-              border: "1px solid #334155",
-              background: "#020617",
-              color: "#e5e7eb",
-              padding: "8px 10px",
-            }}
+            className="admin-token-input"
           />
-          <button
-            onClick={saveToken}
-            style={{ borderRadius: 8, border: "1px solid #334155", background: "#0f172a", color: "#e5e7eb", padding: "8px 12px", cursor: "pointer" }}
-          >
+          <button onClick={saveToken} className="admin-btn primary">
             Save Token
           </button>
-          <button
-            onClick={clearToken}
-            style={{ borderRadius: 8, border: "1px solid #334155", background: "#0f172a", color: "#e5e7eb", padding: "8px 12px", cursor: "pointer" }}
-          >
+          <button onClick={clearToken} className="admin-btn ghost">
             Clear
           </button>
         </div>
-        <strong>API status: </strong>
-        {status === "loading" ? "loading..." : status === "ok" ? "ok" : status} (
-        {effectiveStatusMessage})
+
+        <div className="admin-auth-status">
+          API status: <strong className={`tone-${tone}`}>{effectiveStatusMessage}</strong>
+        </div>
+      </section>
+
+      <div className="admin-stats-grid">
+        <StatCard label="Agents" value={overview?.agents_total ?? 0} icon={<IconUsers size={16} />} />
+        <StatCard
+          label="Sessions"
+          value={overview?.sessions_active ?? 0}
+          icon={<IconBrandSpeedtest size={16} />}
+        />
+        <StatCard
+          label="Messages"
+          value={overview?.messages_total ?? 0}
+          icon={<IconMessage2 size={16} />}
+        />
+        <StatCard
+          label="Rooms Open"
+          value={overview?.rooms_open ?? 0}
+          icon={<IconStack2 size={16} />}
+        />
+        <StatCard
+          label="Rooms Active"
+          value={overview?.rooms_active ?? 0}
+          icon={<IconActivityHeartbeat size={16} />}
+        />
+        <StatCard
+          label="Rooms Closed"
+          value={overview?.rooms_closed ?? 0}
+          icon={<IconSquareRoundedX size={16} />}
+        />
+        <StatCard
+          label="Rooms Purged"
+          value={overview?.rooms_purged ?? 0}
+          icon={<IconRecycle size={16} />}
+        />
       </div>
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-          gap: 12,
-          marginBottom: 20,
-        }}
-      >
-        <StatCard label="Agents" value={overview?.agents_total ?? 0} />
-        <StatCard label="Active Sessions" value={overview?.sessions_active ?? 0} />
-        <StatCard label="Messages" value={overview?.messages_total ?? 0} />
-        <StatCard label="Rooms Open" value={overview?.rooms_open ?? 0} />
-        <StatCard label="Rooms Active" value={overview?.rooms_active ?? 0} />
-        <StatCard label="Rooms Closed" value={overview?.rooms_closed ?? 0} />
-        <StatCard label="Rooms Purged" value={overview?.rooms_purged ?? 0} />
-      </div>
-
-      <section style={{ marginBottom: 24 }}>
-        <h2 style={{ marginBottom: 8 }}>Rooms</h2>
-        <p style={{ marginTop: 0, color: "#94a3b8" }}>
-          {roomSummary.map(([state, count]) => `${state}: ${count}`).join(" | ") || "No rooms"}
-        </p>
-        <div style={{ overflowX: "auto", border: "1px solid #334155", borderRadius: 12 }}>
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+      <section className="wb-card admin-table-card">
+        <div className="admin-table-head">
+          <h3>Rooms</h3>
+          <p>{roomSummary.map(([state, count]) => `${state}: ${count}`).join(" | ") || "No rooms"}</p>
+        </div>
+        <div className="admin-table-scroll">
+          <table className="admin-table">
             <thead>
               <tr>
                 {["room_id", "state", "turn", "agent_a", "agent_b", "created_at"].map((h) => (
-                  <th key={h} style={thStyle}>
-                    {h}
-                  </th>
+                  <th key={h}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
               {rooms.map((room) => (
                 <tr key={room.id}>
-                  <td style={tdStyle}>{room.id}</td>
-                  <td style={tdStyle}>{room.state}</td>
-                  <td style={tdStyle}>
+                  <td>{room.id}</td>
+                  <td>{room.state}</td>
+                  <td>
                     {room.turn_index}/{room.max_turns}
                   </td>
-                  <td style={tdStyle}>{room.agent_a_name || room.agent_a_id}</td>
-                  <td style={tdStyle}>{room.agent_b_name || room.agent_b_id}</td>
-                  <td style={tdStyle}>{new Date(room.created_at).toLocaleString()}</td>
+                  <td>{room.agent_a_name || room.agent_a_id}</td>
+                  <td>{room.agent_b_name || room.agent_b_id}</td>
+                  <td>{new Date(room.created_at).toLocaleString()}</td>
                 </tr>
               ))}
             </tbody>
@@ -227,27 +247,28 @@ export function AdminDashboard() {
         </div>
       </section>
 
-      <section>
-        <h2 style={{ marginBottom: 8 }}>Audit</h2>
-        <div style={{ overflowX: "auto", border: "1px solid #334155", borderRadius: 12 }}>
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+      <section className="wb-card admin-table-card">
+        <div className="admin-table-head">
+          <h3>Audit</h3>
+          <p>Most recent timeline records.</p>
+        </div>
+        <div className="admin-table-scroll">
+          <table className="admin-table">
             <thead>
               <tr>
                 {["id", "event", "room_id", "message_count", "created_at"].map((h) => (
-                  <th key={h} style={thStyle}>
-                    {h}
-                  </th>
+                  <th key={h}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
               {audit.map((ev) => (
                 <tr key={ev.id}>
-                  <td style={tdStyle}>{ev.id}</td>
-                  <td style={tdStyle}>{ev.event}</td>
-                  <td style={tdStyle}>{ev.room_id}</td>
-                  <td style={tdStyle}>{ev.message_count}</td>
-                  <td style={tdStyle}>{new Date(ev.created_at).toLocaleString()}</td>
+                  <td>{ev.id}</td>
+                  <td>{ev.event}</td>
+                  <td>{ev.room_id}</td>
+                  <td>{ev.message_count}</td>
+                  <td>{new Date(ev.created_at).toLocaleString()}</td>
                 </tr>
               ))}
             </tbody>
@@ -258,32 +279,14 @@ export function AdminDashboard() {
   );
 }
 
-function StatCard({ label, value }: { label: string; value: number }) {
+function StatCard({ label, value, icon }: { label: string; value: number; icon: ReactNode }) {
   return (
-    <div
-      style={{
-        border: "1px solid #334155",
-        borderRadius: 12,
-        padding: 12,
-        background: "#0b1220",
-      }}
-    >
-      <div style={{ color: "#94a3b8", fontSize: 13 }}>{label}</div>
-      <div style={{ fontSize: 24, fontWeight: 700 }}>{value}</div>
-    </div>
+    <article className="wb-card admin-stat-card">
+      <div className="admin-stat-head">
+        <span>{label}</span>
+        <span className="admin-stat-icon">{icon}</span>
+      </div>
+      <div className="admin-stat-value">{value}</div>
+    </article>
   );
 }
-
-const thStyle: CSSProperties = {
-  textAlign: "left",
-  padding: "10px 12px",
-  borderBottom: "1px solid #334155",
-  color: "#94a3b8",
-  fontSize: 13,
-};
-
-const tdStyle: CSSProperties = {
-  padding: "10px 12px",
-  borderBottom: "1px solid #1e293b",
-  fontSize: 14,
-};

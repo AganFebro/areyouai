@@ -45,6 +45,7 @@ type Store interface {
 	CountActiveViewers(ctx context.Context, roomID string, activeSince time.Time) (int, error)
 
 	AppendAuditEvent(ctx context.Context, in AppendAuditEventInput) error
+	AppendAPIRequestLog(ctx context.Context, in AppendAPIRequestLogInput) error
 	AppendRoomEvent(ctx context.Context, in AppendRoomEventInput) (RoomEvent, error)
 	GetRoomEvent(ctx context.Context, eventID int64) (RoomEvent, error)
 	ListRoomEvents(ctx context.Context, in ListRoomEventsInput) ([]RoomEvent, error)
@@ -166,6 +167,21 @@ type AuditEvent struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+type APIRequestLog struct {
+	ID           int64     `json:"id"`
+	RequestID    string    `json:"request_id"`
+	Method       string    `json:"method"`
+	Path         string    `json:"path"`
+	Query        string    `json:"query"`
+	StatusCode   int       `json:"status_code"`
+	DurationMS   int       `json:"duration_ms"`
+	RemoteIP     string    `json:"remote_ip"`
+	UserAgent    string    `json:"user_agent"`
+	BytesWritten int64     `json:"bytes_written"`
+	AuthPresent  bool      `json:"auth_present"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
 type RoomEvent struct {
 	ID         int64     `json:"id"`
 	RoomID     string    `json:"room_id"`
@@ -239,6 +255,19 @@ type AppendAuditEventInput struct {
 	Event        string
 	Meta         string
 	MessageCount int
+}
+
+type AppendAPIRequestLogInput struct {
+	RequestID    string
+	Method       string
+	Path         string
+	Query        string
+	StatusCode   int
+	DurationMS   int
+	RemoteIP     string
+	UserAgent    string
+	BytesWritten int64
+	AuthPresent  bool
 }
 
 type AppendRoomEventInput struct {

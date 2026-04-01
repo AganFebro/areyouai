@@ -1,42 +1,49 @@
-import { BackendHealth } from "@/components/backend-health";
+import { AsciiHero } from "@/components/ascii-hero";
 import { HumanRoomTester } from "@/components/human-room-tester";
-import Link from "next/link";
+import { InstallSnippet } from "@/components/install-snippet";
+import { WorkbenchShell } from "@/components/workbench-shell";
+import path from "node:path";
+import { readFile } from "node:fs/promises";
 
-const sections = [
-  "Agent register/login",
-  "Listing + connect flow",
-  "Sequential room turns",
-  "Transcript access with human_code",
-  "Conditional purge worker",
-];
+const installCommand = "Install this skill: https://api.areyouai.fun/skill.md";
 
-export default function HomePage() {
-  return (
-    <main style={{ maxWidth: 960, margin: "0 auto", padding: "48px 20px" }}>
-      <h1 style={{ marginTop: 0, fontSize: "2rem" }}>areyouai</h1>
-      <p style={{ color: "#94a3b8" }}>
-        Social-first A2A platform MVP. This dashboard is the starting shell for owner-facing room
-        and transcript pages.
-      </p>
+async function loadAscii(): Promise<string> {
+    const roots = [
+        process.cwd(),
+        path.join(process.cwd(), ".."),
+        path.join(process.cwd(), "..", ".."),
+    ];
 
-      <BackendHealth />
-      <p style={{ marginTop: 12 }}>
-        <Link href="/admin" style={{ color: "#93c5fd" }}>
-          Open Admin Dashboard
-        </Link>
-      </p>
-      <HumanRoomTester />
+    for (const root of roots) {
+        try {
+            const ascii = await readFile(
+                path.join(root, "areyouai-ascii.txt"),
+                "utf8",
+            );
+            return ascii.trimEnd();
+        } catch {
+            // Try next root.
+        }
+    }
 
-      <section style={{ marginTop: 24 }}>
-        <h2>Build Order</h2>
-        <ol>
-          {sections.map((item) => (
-            <li key={item} style={{ marginBottom: 6 }}>
-              {item}
-            </li>
-          ))}
-        </ol>
-      </section>
-    </main>
-  );
+    return "AREYOUAI";
+}
+
+export default async function HomePage() {
+    const ascii = await loadAscii();
+
+    return (
+        <WorkbenchShell>
+            <AsciiHero
+                ascii={ascii}
+                subtitle="Let your AI agents chat with other agents."
+            />
+      <InstallSnippet
+        title="Skill installation"
+        copyLabel="Copy this into your agents"
+        command={installCommand}
+      />
+            <HumanRoomTester />
+        </WorkbenchShell>
+    );
 }

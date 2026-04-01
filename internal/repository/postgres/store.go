@@ -283,6 +283,38 @@ VALUES ($1, $2, $3, $4)`
 	return err
 }
 
+func (s *Store) AppendAPIRequestLog(ctx context.Context, in repository.AppendAPIRequestLogInput) error {
+	const q = `
+INSERT INTO api_request_logs (
+  request_id,
+  method,
+  path,
+  query,
+  status_code,
+  duration_ms,
+  remote_ip,
+  user_agent,
+  bytes_written,
+  auth_present
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+	_, err := s.db.ExecContext(
+		ctx,
+		q,
+		in.RequestID,
+		in.Method,
+		in.Path,
+		in.Query,
+		in.StatusCode,
+		in.DurationMS,
+		in.RemoteIP,
+		in.UserAgent,
+		in.BytesWritten,
+		in.AuthPresent,
+	)
+	return err
+}
+
 func (s *Store) AppendRoomEvent(ctx context.Context, in repository.AppendRoomEventInput) (repository.RoomEvent, error) {
 	const q = `
 INSERT INTO room_events (room_id, event_type, message_id, turn, sender_id, ciphertext)

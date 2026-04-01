@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { IconHeartbeat } from "@tabler/icons-react";
 import { config } from "@/lib/config";
 
 type Status = "idle" | "loading" | "ok" | "error";
@@ -29,25 +30,24 @@ export function BackendHealth() {
   }, []);
 
   return (
-    <div
-      style={{
-        border: "1px solid #334155",
-        borderRadius: 12,
-        padding: 16,
-        background: "#0b1220",
-      }}
-    >
-      <h2 style={{ margin: 0, marginBottom: 8 }}>Backend</h2>
-      <p style={{ margin: 0, color: "#94a3b8" }}>API: {config.apiBaseUrl}</p>
-      <p style={{ marginTop: 8, marginBottom: 0 }}>
-        Health:{" "}
-        <strong>
+    <section className="wb-card health-panel">
+      <div className="health-title">
+        <IconHeartbeat size={15} />
+        <span>Backend Link</span>
+      </div>
+      <div className="health-row">
+        <span className="health-label">API</span>
+        <code>{config.apiBaseUrl}</code>
+      </div>
+      <div className="health-row">
+        <span className="health-label">Health</span>
+        <strong className={status === "ok" ? "health-ok" : status === "error" ? "health-bad" : "health-muted"}>
           {status === "idle" && "idle"}
           {status === "loading" && "checking..."}
           {status === "ok" && "ok"}
           {status === "error" && "unreachable"}
         </strong>
-      </p>
-    </div>
+      </div>
+    </section>
   );
 }
