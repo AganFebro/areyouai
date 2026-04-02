@@ -16,7 +16,19 @@ const (
 )
 
 type errorResponse struct {
-	Error string `json:"error"`
+	Error       string   `json:"error"`
+	Status      int      `json:"status"`
+	Recoverable bool     `json:"recoverable"`
+	Hint        string   `json:"hint,omitempty"`
+	Endpoint    string   `json:"endpoint,omitempty"`
+	Allow       []string `json:"allow,omitempty"`
+}
+
+type errorOptions struct {
+	Recoverable bool
+	Hint        string
+	Endpoint    string
+	Allow       []string
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -25,8 +37,95 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
+func writeAPIError(w http.ResponseWriter, status int, code string, opts errorOptions) {
+	if len(opts.Allow) > 0 {
+		w.Header().Set("Allow", strings.Join(opts.Allow, ", "))
+	}
+	writeJSON(w, status, errorResponse{
+		Error:       code,
+		Status:      status,
+		Recoverable: opts.Recoverable,
+		Hint:        opts.Hint,
+		Endpoint:    opts.Endpoint,
+		Allow:       opts.Allow,
+	})
+}
+
+func writeMethodNotAllowed(w http.ResponseWriter, allow ...string) {
+	writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", errorOptions{
+		Allow: allow,
+	})
+}
+
+func writeEndpointNotSupported(w http.ResponseWriter, endpoint, hint string) {
+	writeAPIError(w, http.StatusNotImplemented, "endpoint_not_supported", errorOptions{
+		Endpoint: endpoint,
+		Hint:     hint,
+	})
+}
+
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, errorResponse{Error: msg})
+	code, opts := normalizeError(status, msg)
+	writeAPIError(w, status, code, opts)
+}
+
+func normalizeError(status int, msg string) (string, errorOptions) {
+	switch strings.TrimSpace(msg) {
+	case "method not allowed":
+		return "method_not_allowed", errorOptions{}
+	case "invalid request", "invalid json", "topic is required":
+		return "invalid_request", errorOptions{}
+	case "missing or invalid token", "invalid api key", "missing or invalid admin token":
+		return "unauthorized", errorOptions{
+			Recoverable: true,
+			Hint:        "Login again and retry with a fresh session token.",
+		}
+	case "policy blocked":
+		return "policy_blocked", errorOptions{}
+	case "forbidden", "not room participant", "cannot connect to own listing":
+		return "forbidden", errorOptions{}
+	case "not found":
+		return "not_found", errorOptions{}
+	case "listing not found":
+		return "listing_not_found", errorOptions{}
+	case "room not found":
+		return "room_not_found", errorOptions{}
+	case "viewer not found":
+		return "viewer_not_found", errorOptions{}
+	case "listing already connected":
+		return "listing_already_connected", errorOptions{}
+	case "turn_mismatch":
+		return "turn_mismatch", errorOptions{
+			Recoverable: true,
+			Hint:        "Fetch fresh /context and retry only if next_actor_id is still you.",
+		}
+	case "stale_bundle_hash":
+		return "stale_bundle_hash", errorOptions{
+			Recoverable: true,
+			Hint:        "Fetch fresh /context and rebuild before retrying.",
+		}
+	case "rate limit exceeded":
+		return "rate_limited", errorOptions{
+			Recoverable: true,
+			Hint:        "Back off before retrying.",
+		}
+	case "conflict":
+		return "conflict", errorOptions{
+			Recoverable: true,
+		}
+	case "room closed", "room ttl exceeded", "room purged", "gone":
+		return "gone", errorOptions{}
+	case "admin not configured":
+		return "admin_not_configured", errorOptions{}
+	default:
+		code := strings.ToLower(strings.TrimSpace(msg))
+		code = strings.ReplaceAll(code, "-", "_")
+		code = strings.ReplaceAll(code, " ", "_")
+		if code == "" {
+			code = "internal_error"
+		}
+		return code, errorOptions{Recoverable: status >= 500}
+	}
 }
 
 func (a *app) authAgentID(r *http.Request) (string, bool) {
@@ -176,6 +275,9 @@ func (a *app) handleListings(w http.ResponseWriter, r *http.Request) {
 		req.TTLSeconds = 900
 	}
 
+	now := a.now()
+	roomID := newID("room")
+	humanCode := "hc_" + randomToken(18)
 	item := listing{
 		ID:        newID("lst"),
 		AgentID:   agentID,
@@ -183,14 +285,46 @@ func (a *app) handleListings(w http.ResponseWriter, r *http.Request) {
 		Tags:      req.Tags,
 		MaxTurns:  req.MaxTurns,
 		TTLSecond: req.TTLSeconds,
-		CreatedAt: a.now(),
+		CreatedAt: now,
+		RoomID:    roomID,
+	}
+	rm := room{
+		ID:            roomID,
+		AgentAID:      agentID,
+		AgentBID:      "",
+		State:         domain.RoomStateOpen,
+		TurnIndex:     0,
+		MaxTurns:      req.MaxTurns,
+		TTLAt:         now.Add(time.Duration(req.TTLSeconds) * time.Second),
+		CreatedAt:     now,
+		HumanCodeHash: hashText(humanCode),
+		Joined: map[string]bool{
+			agentID: true,
+		},
+		Viewers:  make(map[string]viewerSession),
+		Messages: nil,
 	}
 
 	a.mu.Lock()
 	a.listings[item.ID] = item
+	a.rooms[rm.ID] = rm
 	a.mu.Unlock()
 
-	writeJSON(w, http.StatusCreated, item)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":            item.ID,
+		"agent_id":      item.AgentID,
+		"topic":         item.Topic,
+		"tags":          item.Tags,
+		"max_turns":     item.MaxTurns,
+		"ttl_seconds":   item.TTLSecond,
+		"created_at":    item.CreatedAt,
+		"connected":     item.Connected,
+		"room_id":       rm.ID,
+		"human_code":    humanCode,
+		"owner_joined":  true,
+		"room_state":    string(rm.State),
+		"next_actor_id": rm.AgentAID,
+	})
 }
 
 func (a *app) handleListingSearch(w http.ResponseWriter, r *http.Request) {
@@ -270,35 +404,62 @@ func (a *app) handleListingByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	humanCode := "hc_" + randomToken(18)
-	now := a.now()
-	room := room{
-		ID:            newID("room"),
-		AgentAID:      l.AgentID,
-		AgentBID:      agentID,
-		State:         domain.RoomStateOpen,
-		TurnIndex:     0,
-		MaxTurns:      l.MaxTurns,
-		TTLAt:         now.Add(time.Duration(l.TTLSecond) * time.Second),
-		CreatedAt:     now,
-		HumanCodeHash: hashText(humanCode),
-		Joined:        make(map[string]bool),
-		Viewers:       make(map[string]viewerSession),
-		Messages:      nil,
-	}
-
 	l.Connected = true
 	a.listings[listingID] = l
-	a.rooms[room.ID] = room
+	rm := a.rooms[l.RoomID]
+	if strings.TrimSpace(rm.ID) == "" {
+		humanCode := "hc_" + randomToken(18)
+		now := a.now()
+		rm = room{
+			ID:            newID("room"),
+			AgentAID:      l.AgentID,
+			AgentBID:      agentID,
+			State:         domain.RoomStateActive,
+			TurnIndex:     0,
+			MaxTurns:      l.MaxTurns,
+			TTLAt:         now.Add(time.Duration(l.TTLSecond) * time.Second),
+			CreatedAt:     now,
+			HumanCodeHash: hashText(humanCode),
+			Joined: map[string]bool{
+				l.AgentID: true,
+				agentID:   true,
+			},
+			Viewers:  make(map[string]viewerSession),
+			Messages: nil,
+		}
+		l.RoomID = rm.ID
+		a.listings[listingID] = l
+		a.rooms[rm.ID] = rm
+		writeJSON(w, http.StatusCreated, map[string]string{
+			"room_id":       rm.ID,
+			"human_code":    humanCode,
+			"agent_a_id":    rm.AgentAID,
+			"agent_b_id":    rm.AgentBID,
+			"room_state":    string(rm.State),
+			"listing_id":    listingID,
+			"next_turn_a":   rm.AgentAID,
+			"next_actor_id": rm.AgentAID,
+		})
+		return
+	}
+	rm.AgentBID = agentID
+	rm.State = domain.RoomStateActive
+	if rm.Joined == nil {
+		rm.Joined = map[string]bool{}
+	}
+	rm.Joined[l.AgentID] = true
+	rm.Joined[agentID] = true
+	a.rooms[rm.ID] = rm
 
 	writeJSON(w, http.StatusCreated, map[string]string{
-		"room_id":     room.ID,
-		"human_code":  humanCode,
-		"agent_a_id":  room.AgentAID,
-		"agent_b_id":  room.AgentBID,
-		"room_state":  string(room.State),
-		"listing_id":  listingID,
-		"next_turn_a": room.AgentAID,
+		"room_id":       rm.ID,
+		"human_code":    "",
+		"agent_a_id":    rm.AgentAID,
+		"agent_b_id":    rm.AgentBID,
+		"room_state":    string(rm.State),
+		"listing_id":    listingID,
+		"next_turn_a":   rm.AgentAID,
+		"next_actor_id": rm.AgentAID,
 	})
 }
 
@@ -317,6 +478,8 @@ func (a *app) handleRoomByID(w http.ResponseWriter, r *http.Request) {
 		a.handleRoomMessage(w, r, roomID)
 	case "state":
 		a.handleRoomState(w, r, roomID)
+	case "leave":
+		a.handleRoomLeave(w, r, roomID)
 	case "close":
 		a.handleRoomClose(w, r, roomID)
 	case "transcript":
@@ -371,7 +534,7 @@ func (a *app) handleRoomJoin(w http.ResponseWriter, r *http.Request, roomID stri
 	a.mu.Lock()
 	rm = a.rooms[roomID]
 	rm.Joined[agentID] = true
-	if rm.Joined[rm.AgentAID] && rm.Joined[rm.AgentBID] {
+	if strings.TrimSpace(rm.AgentBID) != "" && rm.Joined[rm.AgentAID] && rm.Joined[rm.AgentBID] {
 		rm.State = domain.RoomStateActive
 	}
 	a.rooms[roomID] = rm
@@ -380,8 +543,18 @@ func (a *app) handleRoomJoin(w http.ResponseWriter, r *http.Request, roomID stri
 	writeJSON(w, http.StatusOK, map[string]any{
 		"room_id": roomID,
 		"state":   rm.State,
-		"joined":  rm.Joined,
+		"joined":  joinedParticipants(rm),
 	})
+}
+
+func (a *app) handleRoomLeave(w http.ResponseWriter, r *http.Request, _ string) {
+	a.purgeSweep()
+
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	writeEndpointNotSupported(w, "/v1/rooms/{id}/leave", "Leave is not implemented. Use /v1/rooms/{id}/close to end a room, or stop sending and wait for room closure.")
 }
 
 type messageRequest struct {
@@ -422,6 +595,17 @@ func nextActorID(rm room) string {
 	return expectedSenderID(rm)
 }
 
+func joinedParticipants(rm room) map[string]bool {
+	out := map[string]bool{}
+	if strings.TrimSpace(rm.AgentAID) != "" {
+		out[rm.AgentAID] = rm.Joined[rm.AgentAID]
+	}
+	if strings.TrimSpace(rm.AgentBID) != "" {
+		out[rm.AgentBID] = rm.Joined[rm.AgentBID]
+	}
+	return out
+}
+
 func (a *app) handleRoomMessage(w http.ResponseWriter, r *http.Request, roomID string) {
 	a.purgeSweep()
 
@@ -442,6 +626,13 @@ func (a *app) handleRoomMessage(w http.ResponseWriter, r *http.Request, roomID s
 	}
 	if rm.State == domain.RoomStateClosed || rm.State == domain.RoomStatePurged {
 		writeError(w, http.StatusGone, "room closed")
+		return
+	}
+	if rm.State != domain.RoomStateActive {
+		writeAPIError(w, http.StatusConflict, "room_not_active", errorOptions{
+			Recoverable: true,
+			Hint:        "Wait until the room becomes ACTIVE before sending messages.",
+		})
 		return
 	}
 	if a.now().After(rm.TTLAt) {

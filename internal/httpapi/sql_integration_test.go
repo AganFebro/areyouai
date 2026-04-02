@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -16,9 +17,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/febrian/areyouai/internal/repository"
 	"github.com/febrian/areyouai/internal/repository/postgres"
 	_ "github.com/lib/pq"
 )
+
+type failingRoomContextStore struct {
+	repository.Store
+}
+
+func (s failingRoomContextStore) UpsertRoomContext(ctx context.Context, in repository.UpsertRoomContextInput) (repository.RoomContextState, error) {
+	return repository.RoomContextState{}, fmt.Errorf("forced room context failure for test")
+}
 
 func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	t.Parallel()
@@ -92,13 +102,31 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
 	}
 	listingID := mustString(t, body, "id")
+	roomID := mustString(t, body, "room_id")
+	humanCode := mustString(t, body, "human_code")
+	if got, _ := body["owner_joined"].(bool); !got {
+		t.Fatalf("owner_joined=%v body=%v", body["owner_joined"], body)
+	}
+	if got, _ := body["room_state"].(string); got != "OPEN" {
+		t.Fatalf("create listing room_state=%v body=%v", body["room_state"], body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 0,
+		"ciphertext":    "before-connect",
+		"bundle_hash":   "preconnect",
+	}, tokenA)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("message before connect status=%d body=%v", resp.StatusCode, body)
+	}
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
 	}
-	roomID := mustString(t, body, "room_id")
-	humanCode := mustString(t, body, "human_code")
+	if got, _ := body["room_state"].(string); got != "ACTIVE" {
+		t.Fatalf("connect room_state=%v body=%v", body["room_state"], body)
+	}
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/join", nil, tokenA)
 	if resp.StatusCode != http.StatusOK {
@@ -326,8 +354,8 @@ func TestSQLModeRoomEventsHistoryEndpoint(t *testing.T) {
 	roomID := mustString(t, body, "room_id")
 
 	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/events/history", nil, tokenA)
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("history before join status=%d body=%v", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("history after auto-join status=%d body=%v", resp.StatusCode, body)
 	}
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/join", nil, tokenA)
@@ -472,6 +500,668 @@ func TestSQLModeRoomEventsHistoryEndpoint(t *testing.T) {
 	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/events/history", nil, tokenA)
 	if resp.StatusCode != http.StatusGone {
 		t.Fatalf("history purged room status=%d body=%v", resp.StatusCode, body)
+	}
+}
+
+func TestSQLModeCreateAndConnectSucceedWhenRoomContextSyncFails(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+
+	store := failingRoomContextStore{Store: postgres.NewStore(db)}
+	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	_, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "failing-a"}, "")
+	apiA := mustString(t, body, "api_key")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "failing-b"}, "")
+	apiB := mustString(t, body, "api_key")
+
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	tokenA := mustString(t, body, "session_token")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	tokenB := mustString(t, body, "session_token")
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "forced-context-failure",
+		"max_turns":   6,
+		"ttl_seconds": 300,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	listingID := mustString(t, body, "id")
+	roomID := mustString(t, body, "room_id")
+	if humanCode := mustString(t, body, "human_code"); humanCode == "" {
+		t.Fatalf("create listing returned empty human_code")
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
+	}
+	if got := mustString(t, body, "room_id"); got != roomID {
+		t.Fatalf("connect room_id=%s want=%s", got, roomID)
+	}
+
+	var (
+		storedRoomID string
+		connected    bool
+	)
+	if err := db.QueryRow(`SELECT COALESCE(room_id, ''), connected FROM chat_listings WHERE id = $1`, listingID).Scan(&storedRoomID, &connected); err != nil {
+		t.Fatalf("query listing: %v", err)
+	}
+	if storedRoomID != roomID {
+		t.Fatalf("stored room_id=%s want=%s", storedRoomID, roomID)
+	}
+	if !connected {
+		t.Fatalf("listing %s should be connected after successful /connect", listingID)
+	}
+}
+
+func TestSQLModeRoomEventsHistoryAutoJoinSurvivesNewInstance(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+
+	store := postgres.NewStore(db)
+	tsA := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer tsA.Close()
+	tsB := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer tsB.Close()
+
+	_, body := doJSON(t, tsA, http.MethodPost, "/v1/agent/register", map[string]any{"name": "restart-a"}, "")
+	apiA := mustString(t, body, "api_key")
+	_, body = doJSON(t, tsA, http.MethodPost, "/v1/agent/register", map[string]any{"name": "restart-b"}, "")
+	apiB := mustString(t, body, "api_key")
+
+	_, body = doJSON(t, tsA, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	tokenA := mustString(t, body, "session_token")
+	_, body = doJSON(t, tsA, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	tokenB := mustString(t, body, "session_token")
+
+	resp, body := doJSON(t, tsA, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "cross-instance-history",
+		"max_turns":   8,
+		"ttl_seconds": 600,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	listingID := mustString(t, body, "id")
+	roomID := mustString(t, body, "room_id")
+
+	resp, body = doJSON(t, tsA, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, tsB, http.MethodGet, "/v1/rooms/"+roomID+"/events/history", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("history owner on new instance status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, tsB, http.MethodGet, "/v1/rooms/"+roomID+"/events/history", nil, tokenB)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("history connected peer on new instance status=%d body=%v", resp.StatusCode, body)
+	}
+}
+
+func TestSQLModeWebhookOutboxEmission(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+
+	store := postgres.NewStore(db)
+	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "outbox-a"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register a status=%d body=%v", resp.StatusCode, body)
+	}
+	apiA := mustString(t, body, "api_key")
+	agentAID := mustString(t, body, "agent_id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "outbox-b"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register b status=%d body=%v", resp.StatusCode, body)
+	}
+	apiB := mustString(t, body, "api_key")
+	agentBID := mustString(t, body, "agent_id")
+
+	if _, err := store.CreateAgentWebhookEndpoint(context.Background(), repository.CreateAgentWebhookEndpointInput{
+		ID:               "wh_ep_outbox_a",
+		AgentID:          agentAID,
+		URL:              "https://example.com/hooks/a",
+		SecretCiphertext: "enc-a",
+		KeyID:            "key-a",
+		Enabled:          true,
+	}); err != nil {
+		t.Fatalf("create webhook endpoint a: %v", err)
+	}
+	if _, err := store.CreateAgentWebhookEndpoint(context.Background(), repository.CreateAgentWebhookEndpointInput{
+		ID:               "wh_ep_outbox_b",
+		AgentID:          agentBID,
+		URL:              "https://example.com/hooks/b",
+		SecretCiphertext: "enc-b",
+		KeyID:            "key-b",
+		Enabled:          true,
+	}); err != nil {
+		t.Fatalf("create webhook endpoint b: %v", err)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login a status=%d body=%v", resp.StatusCode, body)
+	}
+	tokenA := mustString(t, body, "session_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login b status=%d body=%v", resp.StatusCode, body)
+	}
+	tokenB := mustString(t, body, "session_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "webhook-outbox",
+		"max_turns":   6,
+		"ttl_seconds": 300,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	listingID := mustString(t, body, "id")
+	roomID := mustString(t, body, "room_id")
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM webhook_outbox`).Scan(&count); err != nil {
+		t.Fatalf("count webhook outbox after create: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("webhook outbox count after create=%d want=0", count)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/context", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("context a status=%d body=%v", resp.StatusCode, body)
+	}
+	bundleA := mustString(t, body, "bundle_hash")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 0,
+		"ciphertext":    "outbox-message",
+		"bundle_hash":   bundleA,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("message a status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/close", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("close room status=%d body=%v", resp.StatusCode, body)
+	}
+
+	rows, err := db.Query(`
+SELECT target_agent_id, event_type, payload
+FROM webhook_outbox
+WHERE room_id = $1
+ORDER BY id ASC`, roomID)
+	if err != nil {
+		t.Fatalf("query webhook outbox: %v", err)
+	}
+	defer rows.Close()
+
+	type outboxRow struct {
+		targetAgentID string
+		eventType     string
+		payload       map[string]any
+	}
+	var items []outboxRow
+	for rows.Next() {
+		var targetAgentID, eventType string
+		var raw []byte
+		if err := rows.Scan(&targetAgentID, &eventType, &raw); err != nil {
+			t.Fatalf("scan webhook outbox row: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatalf("decode webhook payload: %v", err)
+		}
+		items = append(items, outboxRow{
+			targetAgentID: targetAgentID,
+			eventType:     eventType,
+			payload:       payload,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate webhook outbox rows: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("webhook outbox len=%d want=3 items=%v", len(items), items)
+	}
+
+	if items[0].eventType != "room.joined" || items[0].targetAgentID != agentAID {
+		t.Fatalf("first outbox row=%+v want room.joined target=%s", items[0], agentAID)
+	}
+	if got := mustPayloadString(t, items[0].payload, "next_actor_id"); got != agentAID {
+		t.Fatalf("room.joined next_actor_id=%s want=%s payload=%v", got, agentAID, items[0].payload)
+	}
+
+	if items[1].eventType != "message.created" || items[1].targetAgentID != agentBID {
+		t.Fatalf("second outbox row=%+v want message.created target=%s", items[1], agentBID)
+	}
+	if got := mustPayloadString(t, items[1].payload, "next_actor_id"); got != agentBID {
+		t.Fatalf("message.created next_actor_id=%s want=%s payload=%v", got, agentBID, items[1].payload)
+	}
+
+	if items[2].eventType != "room.closed" || items[2].targetAgentID != agentBID {
+		t.Fatalf("third outbox row=%+v want room.closed target=%s", items[2], agentBID)
+	}
+	if got, ok := items[2].payload["next_actor_id"]; ok && got != "" {
+		t.Fatalf("room.closed next_actor_id=%v want empty/absent payload=%v", got, items[2].payload)
+	}
+}
+
+func TestSQLModeAgentWebhookEndpointsAPI(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+
+	store := postgres.NewStore(db)
+	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	resp, body := doJSON(t, ts, http.MethodGet, "/v1/agent/webhooks", nil, "")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("list webhook endpoints unauth status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "webhook-api-agent"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register status=%d body=%v", resp.StatusCode, body)
+	}
+	apiKey := mustString(t, body, "api_key")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiKey}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login status=%d body=%v", resp.StatusCode, body)
+	}
+	token := mustString(t, body, "session_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/webhooks", map[string]any{
+		"url":    "http://example.com/hooks/agent",
+		"secret": "super-secret",
+	}, token)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("create invalid webhook status=%d body=%v", resp.StatusCode, body)
+	}
+	if got, _ := body["error"].(string); got != "invalid_request" {
+		t.Fatalf("create invalid webhook error=%v body=%v", body["error"], body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/webhooks", map[string]any{
+		"url":     "https://example.com/hooks/agent",
+		"secret":  "super-secret",
+		"key_id":  "kid-api",
+		"enabled": true,
+	}, token)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create webhook status=%d body=%v", resp.StatusCode, body)
+	}
+	endpointID := mustString(t, body, "id")
+	if got := mustString(t, body, "url"); got != "https://example.com/hooks/agent" {
+		t.Fatalf("created url=%s want=https://example.com/hooks/agent", got)
+	}
+	if _, ok := body["secret"]; ok {
+		t.Fatalf("webhook create response leaked secret: %v", body)
+	}
+	var storedSecret string
+	if err := db.QueryRow(`SELECT secret_ciphertext FROM agent_webhook_endpoints WHERE id = $1`, endpointID).Scan(&storedSecret); err != nil {
+		t.Fatalf("query stored webhook secret: %v", err)
+	}
+	if storedSecret == "super-secret" {
+		t.Fatalf("stored webhook secret remained plaintext: %q", storedSecret)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/agent/webhooks", nil, token)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list webhook endpoints status=%d body=%v", resp.StatusCode, body)
+	}
+	items, ok := body["items"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("list webhook endpoints items=%v", body["items"])
+	}
+	item, ok := items[0].(map[string]any)
+	if !ok {
+		t.Fatalf("list webhook endpoints first item=%v", items[0])
+	}
+	if got := mustString(t, item, "id"); got != endpointID {
+		t.Fatalf("listed endpoint id=%s want=%s", got, endpointID)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodDelete, "/v1/agent/webhooks/"+endpointID, nil, token)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete webhook endpoint status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/agent/webhooks", nil, token)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list webhook endpoints after delete status=%d body=%v", resp.StatusCode, body)
+	}
+	items, ok = body["items"].([]any)
+	if !ok || len(items) != 0 {
+		t.Fatalf("list webhook endpoints after delete items=%v", body["items"])
+	}
+
+	resp, body = doJSON(t, ts, http.MethodDelete, "/v1/agent/webhooks/"+endpointID, nil, token)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("delete missing webhook endpoint status=%d body=%v", resp.StatusCode, body)
+	}
+}
+
+func TestSQLModeLegacyListingConnectEmitsLifecycleEvents(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+
+	store := postgres.NewStore(db)
+	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "legacy-owner"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register owner status=%d body=%v", resp.StatusCode, body)
+	}
+	ownerAPIKey := mustString(t, body, "api_key")
+	ownerAgentID := mustString(t, body, "agent_id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "legacy-joiner"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register joiner status=%d body=%v", resp.StatusCode, body)
+	}
+	joinerAPIKey := mustString(t, body, "api_key")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": ownerAPIKey}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login owner status=%d body=%v", resp.StatusCode, body)
+	}
+	ownerToken := mustString(t, body, "session_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": joinerAPIKey}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login joiner status=%d body=%v", resp.StatusCode, body)
+	}
+	joinerToken := mustString(t, body, "session_token")
+
+	if _, err := store.CreateAgentWebhookEndpoint(context.Background(), repository.CreateAgentWebhookEndpointInput{
+		ID:               "wh_ep_legacy_owner",
+		AgentID:          ownerAgentID,
+		URL:              "https://example.com/hooks/legacy-owner",
+		SecretCiphertext: "enc-legacy-owner",
+		KeyID:            "key-legacy-owner",
+		Enabled:          true,
+	}); err != nil {
+		t.Fatalf("create owner webhook endpoint: %v", err)
+	}
+
+	legacyListing, err := store.CreateListing(context.Background(), repository.CreateListingInput{
+		ID:         "lst_legacy_connect",
+		AgentID:    ownerAgentID,
+		Topic:      "legacy listing without room",
+		Tags:       []string{"legacy"},
+		MaxTurns:   8,
+		TTLSeconds: 600,
+		RoomID:     "",
+	})
+	if err != nil {
+		t.Fatalf("create legacy listing: %v", err)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+legacyListing.ID+"/connect", nil, joinerToken)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect legacy listing status=%d body=%v", resp.StatusCode, body)
+	}
+	roomID := mustString(t, body, "room_id")
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/events/history?since=0&limit=20", nil, ownerToken)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("legacy room history status=%d body=%v", resp.StatusCode, body)
+	}
+	items, ok := body["items"].([]any)
+	if !ok {
+		t.Fatalf("legacy room history items=%v", body["items"])
+	}
+	if len(items) != 2 {
+		t.Fatalf("legacy room history len=%d want=2 items=%v", len(items), items)
+	}
+	first := items[0].(map[string]any)
+	second := items[1].(map[string]any)
+	if got := mustString(t, first, "type"); got != "room.joined" {
+		t.Fatalf("legacy first event type=%s want=room.joined", got)
+	}
+	if got := mustString(t, second, "type"); got != "room.state_changed" {
+		t.Fatalf("legacy second event type=%s want=room.state_changed", got)
+	}
+
+	var outboxCount int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM webhook_outbox WHERE room_id = $1 AND target_agent_id = $2 AND event_type = 'room.joined'`, roomID, ownerAgentID).Scan(&outboxCount); err != nil {
+		t.Fatalf("count owner legacy outbox rows: %v", err)
+	}
+	if outboxCount != 1 {
+		t.Fatalf("owner legacy outbox count=%d want=1", outboxCount)
+	}
+}
+
+func TestSQLModeRoomAccessTokenFlow(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+
+	store := postgres.NewStore(db)
+	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "rat-a"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register a status=%d body=%v", resp.StatusCode, body)
+	}
+	apiA := mustString(t, body, "api_key")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "rat-b"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register b status=%d body=%v", resp.StatusCode, body)
+	}
+	apiB := mustString(t, body, "api_key")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login a status=%d body=%v", resp.StatusCode, body)
+	}
+	tokenA := mustString(t, body, "session_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login b status=%d body=%v", resp.StatusCode, body)
+	}
+	tokenB := mustString(t, body, "session_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "room access token flow",
+		"max_turns":   6,
+		"ttl_seconds": 600,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	listingID := mustString(t, body, "id")
+	roomID := mustString(t, body, "room_id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/access-token", nil, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create room access token status=%d body=%v", resp.StatusCode, body)
+	}
+	roomToken := mustString(t, body, "token")
+	if got := mustString(t, body, "scope"); got != "room:automation" {
+		t.Fatalf("room access token scope=%s want=room:automation", got)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/state", nil, roomToken)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("room state with room token status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/context", nil, roomToken)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("room context with room token status=%d body=%v", resp.StatusCode, body)
+	}
+	bundleHash := mustString(t, body, "bundle_hash")
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/events/history", nil, roomToken)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("room events history with room token status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 0,
+		"ciphertext":    "message via room token",
+		"bundle_hash":   bundleHash,
+	}, roomToken)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("room message with room token status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/close", nil, roomToken)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("room close with room token status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/state", nil, roomToken)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("room state with revoked room token status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/access-token", nil, tokenA)
+	if resp.StatusCode != http.StatusGone {
+		t.Fatalf("create room access token after close status=%d body=%v", resp.StatusCode, body)
 	}
 }
 
@@ -759,9 +1449,40 @@ func applyMigrationsForTest(t *testing.T, db *sql.DB) {
 	if err != nil {
 		t.Fatalf("read room events up migration: %v", err)
 	}
+	up4, err := os.ReadFile(filepath.Join(migDir, "000004_api_request_logs.up.sql"))
+	if err != nil {
+		t.Fatalf("read api request logs up migration: %v", err)
+	}
+	up5, err := os.ReadFile(filepath.Join(migDir, "000005_owner_first_listing_flow.up.sql"))
+	if err != nil {
+		t.Fatalf("read owner-first listing flow up migration: %v", err)
+	}
+	up6, err := os.ReadFile(filepath.Join(migDir, "000006_webhook_foundation.up.sql"))
+	if err != nil {
+		t.Fatalf("read webhook foundation up migration: %v", err)
+	}
+	up7, err := os.ReadFile(filepath.Join(migDir, "000007_webhook_endpoint_delete_cascade.up.sql"))
+	if err != nil {
+		t.Fatalf("read webhook endpoint delete cascade up migration: %v", err)
+	}
 
 	if _, err := db.Exec(string(down)); err != nil {
 		t.Fatalf("exec down migration: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS room_scoped_tokens`); err != nil {
+		t.Fatalf("cleanup room scoped tokens: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS webhook_outbox`); err != nil {
+		t.Fatalf("cleanup webhook outbox: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS agent_webhook_endpoints`); err != nil {
+		t.Fatalf("cleanup agent webhook endpoints: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS api_request_logs`); err != nil {
+		t.Fatalf("cleanup api request logs: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS room_context_state`); err != nil {
+		t.Fatalf("cleanup room context state: %v", err)
 	}
 	if _, err := db.Exec(`DROP TABLE IF EXISTS room_events`); err != nil {
 		t.Fatalf("cleanup room events: %v", err)
@@ -774,6 +1495,18 @@ func applyMigrationsForTest(t *testing.T, db *sql.DB) {
 	}
 	if _, err := db.Exec(string(up3)); err != nil {
 		t.Fatalf("exec room events up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up4)); err != nil {
+		t.Fatalf("exec api request logs up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up5)); err != nil {
+		t.Fatalf("exec owner-first listing flow up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up6)); err != nil {
+		t.Fatalf("exec webhook foundation up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up7)); err != nil {
+		t.Fatalf("exec webhook endpoint delete cascade up migration: %v", err)
 	}
 }
 

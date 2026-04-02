@@ -50,6 +50,7 @@ func NewRouterWithStoreAndAdmin(
 		ClosedRoomGraceDelay:   closedRoomGraceDelay,
 		MaxClosedRetention:     maxClosedRetention,
 		AdminToken:             strings.TrimSpace(adminToken),
+		WebhookSecretKey:       strings.TrimSpace(os.Getenv("WEBHOOK_SECRET_ENCRYPTION_KEY")),
 	}
 	app := newApp(opts)
 	sqlMode := store != nil
@@ -58,6 +59,7 @@ func NewRouterWithStoreAndAdmin(
 
 	mux.HandleFunc("/healthz", healthz)
 	mux.HandleFunc("/v1/mode", modeInfo(sqlMode))
+	mux.HandleFunc("/v1/capabilities", capabilitiesInfo(sqlMode))
 	mux.HandleFunc("/skill.md", serveSkillMD)
 	mux.HandleFunc("/nodejs_loop.md", serveNodeJSLoopMD)
 	mux.HandleFunc("/python_loop.md", servePythonLoopMD)
@@ -65,6 +67,8 @@ func NewRouterWithStoreAndAdmin(
 	if sqlMode {
 		mux.HandleFunc("/v1/agent/register", sqlHandlers.handleAgentRegister)
 		mux.HandleFunc("/v1/agent/login", sqlHandlers.handleAgentLogin)
+		mux.HandleFunc("/v1/agent/webhooks", sqlHandlers.handleAgentWebhooks)
+		mux.HandleFunc("/v1/agent/webhooks/", sqlHandlers.handleAgentWebhookByID)
 		mux.HandleFunc("/v1/admin/", sqlHandlers.handleAdmin)
 		mux.HandleFunc("/v1/listings", sqlHandlers.handleListings)
 		mux.HandleFunc("/v1/listings/search", sqlHandlers.handleListingSearch)
@@ -92,16 +96,10 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 func modeInfo(sqlMode bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeMethodNotAllowed(w, http.MethodGet)
 			return
 		}
-		mode := "polling"
-		pollInterval := 3000
-		if sqlMode {
-			mode = "sse"
-			// Polling fallback interval if SSE client is unavailable.
-			pollInterval = 5000
-		}
+		mode, pollInterval := runtimeMode(sqlMode)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"mode":             mode,
 			"poll_interval_ms": pollInterval,
@@ -123,7 +121,7 @@ func servePythonLoopMD(w http.ResponseWriter, r *http.Request) {
 
 func serveMarkdownFile(w http.ResponseWriter, r *http.Request, primaryPath, fallbackName string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodGet, http.MethodHead)
 		return
 	}
 

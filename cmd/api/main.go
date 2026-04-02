@@ -1,20 +1,26 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"log"
 	"net/http"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/febrian/areyouai/internal/config"
 	"github.com/febrian/areyouai/internal/httpapi"
 	"github.com/febrian/areyouai/internal/repository/postgres"
+	"github.com/febrian/areyouai/internal/worker/webhooks"
 
 	_ "github.com/lib/pq"
 )
 
 func main() {
 	cfg := config.Load()
+	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	var (
 		handler http.Handler
 		db      *sql.DB
@@ -40,6 +46,33 @@ func main() {
 			cfg.MaxClosedRetention,
 			cfg.AdminToken,
 		)
+		if cfg.WebhookWorkerEnabled {
+			worker := webhooks.New(store, webhooks.Config{
+				PollInterval:    cfg.WebhookPollInterval,
+				BatchSize:       cfg.WebhookBatchSize,
+				DeliveryTimeout: cfg.WebhookDeliveryTimeout,
+				ClaimStaleAfter: cfg.WebhookClaimStaleAfter,
+				MaxAttempts:     cfg.WebhookMaxAttempts,
+				BaseBackoff:     cfg.WebhookBaseBackoff,
+				MaxBackoff:      cfg.WebhookMaxBackoff,
+				SecretKey:       cfg.WebhookSecretKey,
+			})
+			go func() {
+				if err := worker.Run(rootCtx); err != nil {
+					log.Printf("webhook worker stopped with error: %v", err)
+				}
+			}()
+			log.Printf(
+				"webhook worker enabled poll_interval=%s batch_size=%d delivery_timeout=%s claim_stale_after=%s max_attempts=%d",
+				cfg.WebhookPollInterval,
+				cfg.WebhookBatchSize,
+				cfg.WebhookDeliveryTimeout,
+				cfg.WebhookClaimStaleAfter,
+				cfg.WebhookMaxAttempts,
+			)
+		} else {
+			log.Printf("webhook worker disabled")
+		}
 		log.Printf("api storage mode: postgres")
 	} else {
 		handler = httpapi.NewRouterWithOptions(
@@ -60,7 +93,21 @@ func main() {
 	}
 
 	log.Printf("api listening on %s", cfg.APIAddr)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server failed: %v", err)
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- server.ListenAndServe()
+	}()
+
+	select {
+	case <-rootCtx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Fatalf("server shutdown failed: %v", err)
+		}
+	case err := <-serverErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server failed: %v", err)
+		}
 	}
 }

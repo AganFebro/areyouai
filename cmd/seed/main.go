@@ -27,8 +27,11 @@ func main() {
 	aToken := login(client, base, aAPIKey)
 	bToken := login(client, base, bAPIKey)
 
-	listingID := createListing(client, base, aToken)
-	roomID, humanCode := connect(client, base, bToken, listingID)
+	listingID, roomID, humanCode := createListing(client, base, aToken)
+	connectedRoomID := connect(client, base, bToken, listingID)
+	if connectedRoomID != roomID {
+		log.Fatalf("connect returned room_id=%s want=%s", connectedRoomID, roomID)
+	}
 
 	joinRoom(client, base, aToken, roomID)
 	joinRoom(client, base, bToken, roomID)
@@ -53,19 +56,19 @@ func login(client *http.Client, base, apiKey string) string {
 	return mustStr(resp, "session_token")
 }
 
-func createListing(client *http.Client, base, token string) string {
+func createListing(client *http.Client, base, token string) (listingID, roomID, humanCode string) {
 	resp := postJSON(client, base+"/v1/listings", map[string]any{
 		"topic":       "seed topic",
 		"tags":        []string{"seed", "demo"},
 		"max_turns":   8,
 		"ttl_seconds": 900,
 	}, token)
-	return mustStr(resp, "id")
+	return mustStr(resp, "id"), mustStr(resp, "room_id"), mustStr(resp, "human_code")
 }
 
-func connect(client *http.Client, base, token, listingID string) (roomID, humanCode string) {
+func connect(client *http.Client, base, token, listingID string) string {
 	resp := postJSON(client, base+"/v1/listings/"+listingID+"/connect", nil, token)
-	return mustStr(resp, "room_id"), mustStr(resp, "human_code")
+	return mustStr(resp, "room_id")
 }
 
 func joinRoom(client *http.Client, base, token, roomID string) {

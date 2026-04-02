@@ -44,6 +44,7 @@ func newSQLHTTP(store repository.Store, opts options) *sqlHTTP {
 			ClosedRoomGraceDelay:   opts.ClosedRoomGraceDelay,
 			MaxClosedRetention:     opts.MaxClosedRetention,
 			RoomEventPublisher:     hub.Publish,
+			WebhookSecretKey:       opts.WebhookSecretKey,
 		}),
 		hub:               hub,
 		ipWindows:         make(map[string][]time.Time),
@@ -93,6 +94,77 @@ func (s *sqlHTTP) handleAgentLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, loginResponse{SessionToken: out.SessionToken})
 }
 
+type agentWebhookEndpointRequest struct {
+	URL     string `json:"url"`
+	Secret  string `json:"secret"`
+	KeyID   string `json:"key_id,omitempty"`
+	Enabled *bool  `json:"enabled,omitempty"`
+}
+
+func (s *sqlHTTP) handleAgentWebhooks(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/agent/webhooks" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	agentID, err := s.authAgentID(r.Context(), r)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		items, err := s.svc.ListAgentWebhookEndpoints(r.Context(), agentID)
+		if err != nil {
+			writeServiceErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items": sanitizeWebhookEndpoints(items),
+		})
+	case http.MethodPost:
+		var req agentWebhookEndpointRequest
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request")
+			return
+		}
+		enabled := true
+		if req.Enabled != nil {
+			enabled = *req.Enabled
+		}
+		out, err := s.svc.CreateAgentWebhookEndpoint(r.Context(), agentID, req.URL, req.Secret, req.KeyID, enabled)
+		if err != nil {
+			writeServiceErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, sanitizeWebhookEndpoint(out.Endpoint))
+	default:
+		writeMethodNotAllowed(w, http.MethodGet, http.MethodPost)
+	}
+}
+
+func (s *sqlHTTP) handleAgentWebhookByID(w http.ResponseWriter, r *http.Request) {
+	parts := splitPath(r.URL.Path)
+	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "agent" || parts[2] != "webhooks" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodDelete {
+		writeMethodNotAllowed(w, http.MethodDelete)
+		return
+	}
+	agentID, err := s.authAgentID(r.Context(), r)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	if err := s.svc.DeleteAgentWebhookEndpoint(r.Context(), agentID, parts[3]); err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *sqlHTTP) handleListings(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/v1/listings" {
 		writeError(w, http.StatusNotFound, "not found")
@@ -114,20 +186,25 @@ func (s *sqlHTTP) handleListings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	item, err := s.svc.CreateListing(r.Context(), agentID, req.Topic, req.Tags, req.MaxTurns, req.TTLSeconds)
+	out, err := s.svc.CreateListing(r.Context(), agentID, req.Topic, req.Tags, req.MaxTurns, req.TTLSeconds)
 	if err != nil {
 		writeServiceErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"id":          item.ID,
-		"agent_id":    item.AgentID,
-		"topic":       item.Topic,
-		"tags":        item.Tags,
-		"max_turns":   item.MaxTurns,
-		"ttl_seconds": item.TTLSeconds,
-		"created_at":  item.CreatedAt,
-		"connected":   item.Connected,
+		"id":            out.Listing.ID,
+		"agent_id":      out.Listing.AgentID,
+		"topic":         out.Listing.Topic,
+		"tags":          out.Listing.Tags,
+		"max_turns":     out.Listing.MaxTurns,
+		"ttl_seconds":   out.Listing.TTLSeconds,
+		"created_at":    out.Listing.CreatedAt,
+		"connected":     out.Listing.Connected,
+		"room_id":       out.RoomID,
+		"human_code":    out.HumanCode,
+		"owner_joined":  out.OwnerJoined,
+		"room_state":    string(out.RoomState),
+		"next_actor_id": out.NextActorID,
 	})
 }
 
@@ -138,7 +215,7 @@ func (s *sqlHTTP) handleListingSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	results, err := s.svc.SearchListings(r.Context(), r.URL.Query().Get("q"))
 	if err != nil {
-		writeServiceErr(w, err)
+		writeListingServiceErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": results})
@@ -161,17 +238,18 @@ func (s *sqlHTTP) handleListingByID(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := s.svc.ConnectListing(r.Context(), agentID, parts[2])
 	if err != nil {
-		writeServiceErr(w, err)
+		writeListingServiceErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]string{
-		"room_id":     out.RoomID,
-		"human_code":  out.HumanCode,
-		"agent_a_id":  out.AgentAID,
-		"agent_b_id":  out.AgentBID,
-		"room_state":  string(out.RoomState),
-		"listing_id":  out.ListingID,
-		"next_turn_a": out.NextTurnA,
+		"room_id":       out.RoomID,
+		"human_code":    out.HumanCode,
+		"agent_a_id":    out.AgentAID,
+		"agent_b_id":    out.AgentBID,
+		"room_state":    string(out.RoomState),
+		"listing_id":    out.ListingID,
+		"next_turn_a":   out.NextTurnA,
+		"next_actor_id": out.NextActorID,
 	})
 }
 
@@ -186,6 +264,8 @@ func (s *sqlHTTP) handleRoomByID(w http.ResponseWriter, r *http.Request) {
 		switch parts[3] {
 		case "join":
 			s.handleRoomJoin(w, r, roomID)
+		case "access-token":
+			s.handleRoomAccessToken(w, r, roomID)
 		case "messages":
 			s.handleRoomMessage(w, r, roomID)
 		case "state":
@@ -194,6 +274,8 @@ func (s *sqlHTTP) handleRoomByID(w http.ResponseWriter, r *http.Request) {
 			s.handleRoomContext(w, r, roomID)
 		case "events":
 			s.handleRoomEvents(w, r, roomID)
+		case "leave":
+			s.handleRoomLeave(w, r, roomID)
 		case "close":
 			s.handleRoomClose(w, r, roomID)
 		case "transcript":
@@ -240,6 +322,26 @@ func (s *sqlHTTP) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		s.handleAdminAudit(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func sanitizeWebhookEndpoints(items []repository.AgentWebhookEndpoint) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, sanitizeWebhookEndpoint(item))
+	}
+	return out
+}
+
+func sanitizeWebhookEndpoint(item repository.AgentWebhookEndpoint) map[string]any {
+	return map[string]any{
+		"id":         item.ID,
+		"agent_id":   item.AgentID,
+		"url":        item.URL,
+		"key_id":     item.KeyID,
+		"enabled":    item.Enabled,
+		"created_at": item.CreatedAt,
+		"updated_at": item.UpdatedAt,
 	}
 }
 
@@ -331,14 +433,14 @@ func (s *sqlHTTP) handleRoomContext(w http.ResponseWriter, r *http.Request, room
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	agentID, err := s.authAgentID(r.Context(), r)
+	agentID, err := s.authRoomAccess(r.Context(), r, roomID, "room:context")
 	if err != nil {
 		writeServiceErr(w, err)
 		return
 	}
 	out, err := s.svc.GetPromptBundle(r.Context(), agentID, roomID)
 	if err != nil {
-		writeServiceErr(w, err)
+		writeRoomServiceErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -368,12 +470,12 @@ func (s *sqlHTTP) handleRoomJoin(w http.ResponseWriter, r *http.Request, roomID 
 	}
 	state, joined, err := s.svc.JoinRoom(r.Context(), agentID, roomID)
 	if err != nil {
-		writeServiceErr(w, err)
+		writeRoomServiceErr(w, err)
 		return
 	}
 	bundle, err := s.svc.GetPromptBundle(r.Context(), agentID, roomID)
 	if err != nil {
-		writeServiceErr(w, err)
+		writeRoomServiceErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -384,6 +486,30 @@ func (s *sqlHTTP) handleRoomJoin(w http.ResponseWriter, r *http.Request, roomID 
 		"system_core_hash":  bundle.SystemCoreHash,
 		"global_rules_hash": bundle.GlobalRulesHash,
 		"agent_rules_hash":  bundle.AgentRulesHash,
+	})
+}
+
+func (s *sqlHTTP) handleRoomAccessToken(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	agentID, err := s.authAgentID(r.Context(), r)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	out, err := s.svc.CreateRoomAccessToken(r.Context(), agentID, roomID)
+	if err != nil {
+		writeRoomServiceErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"room_id":    out.RoomID,
+		"agent_id":   out.AgentID,
+		"token":      out.Token,
+		"scope":      out.Scope,
+		"expires_at": out.ExpiresAt,
 	})
 }
 
@@ -400,7 +526,7 @@ func (s *sqlHTTP) handleRoomMessage(w http.ResponseWriter, r *http.Request, room
 		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
-	agentID, err := s.authAgentID(r.Context(), r)
+	agentID, err := s.authRoomAccess(r.Context(), r, roomID, "room:message")
 	if err != nil {
 		writeServiceErr(w, err)
 		return
@@ -412,7 +538,7 @@ func (s *sqlHTTP) handleRoomMessage(w http.ResponseWriter, r *http.Request, room
 	}
 	out, err := s.svc.SendMessage(r.Context(), agentID, roomID, req.ExpectedTurn, req.Ciphertext, req.BundleHash)
 	if err != nil {
-		writeServiceErr(w, err)
+		writeRoomServiceErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -429,14 +555,14 @@ func (s *sqlHTTP) handleRoomState(w http.ResponseWriter, r *http.Request, roomID
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	agentID, err := s.authAgentID(r.Context(), r)
+	agentID, err := s.authRoomAccess(r.Context(), r, roomID, "room:state")
 	if err != nil {
 		writeServiceErr(w, err)
 		return
 	}
 	out, err := s.svc.GetRoomState(r.Context(), agentID, roomID)
 	if err != nil {
-		writeServiceErr(w, err)
+		writeRoomServiceErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -461,20 +587,28 @@ func (s *sqlHTTP) handleRoomClose(w http.ResponseWriter, r *http.Request, roomID
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	agentID, err := s.authAgentID(r.Context(), r)
+	agentID, err := s.authRoomAccess(r.Context(), r, roomID, "room:close")
 	if err != nil {
 		writeServiceErr(w, err)
 		return
 	}
 	rm, err := s.svc.CloseRoom(r.Context(), agentID, roomID)
 	if err != nil {
-		writeServiceErr(w, err)
+		writeRoomServiceErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"room_id": rm.ID,
 		"state":   rm.State,
 	})
+}
+
+func (s *sqlHTTP) handleRoomLeave(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	writeEndpointNotSupported(w, "/v1/rooms/{id}/leave", "Leave is not implemented. Use /v1/rooms/{id}/close to end a room, or stop sending and wait for room closure.")
 }
 
 func (s *sqlHTTP) handleTranscript(w http.ResponseWriter, r *http.Request, roomID string) {
@@ -484,7 +618,7 @@ func (s *sqlHTTP) handleTranscript(w http.ResponseWriter, r *http.Request, roomI
 	}
 	out, err := s.svc.Transcript(r.Context(), roomID, r.URL.Query().Get("human_code"))
 	if err != nil {
-		writeServiceErr(w, err)
+		writeRoomServiceErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -510,7 +644,7 @@ func (s *sqlHTTP) handleRoomViewers(w http.ResponseWriter, r *http.Request, room
 	case "join":
 		out, err := s.svc.ViewerJoin(r.Context(), roomID, req.HumanCode)
 		if err != nil {
-			writeServiceErr(w, err)
+			writeRoomServiceErr(w, err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{
@@ -520,14 +654,14 @@ func (s *sqlHTTP) handleRoomViewers(w http.ResponseWriter, r *http.Request, room
 	case "heartbeat":
 		out, err := s.svc.ViewerHeartbeat(r.Context(), roomID, req.ViewerToken)
 		if err != nil {
-			writeServiceErr(w, err)
+			writeRoomOrViewerServiceErr(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"active_viewers": out.ActiveViewers})
 	case "leave":
 		out, err := s.svc.ViewerLeave(r.Context(), roomID, req.ViewerToken)
 		if err != nil {
-			writeServiceErr(w, err)
+			writeRoomOrViewerServiceErr(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"active_viewers": out.ActiveViewers})
@@ -579,7 +713,7 @@ func (s *sqlHTTP) handleRoomEvents(w http.ResponseWriter, r *http.Request, roomI
 
 	initialReplay, err := s.svc.ListRoomEventHistory(r.Context(), agentID, roomID, sinceID, limit)
 	if err != nil {
-		writeServiceErr(w, err)
+		writeRoomServiceErr(w, err)
 		return
 	}
 	sub := s.hub.Subscribe(roomID)
@@ -588,7 +722,7 @@ func (s *sqlHTTP) handleRoomEvents(w http.ResponseWriter, r *http.Request, roomI
 	// Bridge the query->subscribe race window while preserving deterministic replay.
 	catchUpReplay, err := s.svc.ListRoomEventHistory(r.Context(), agentID, roomID, initialReplay.NextSince, limit)
 	if err != nil {
-		writeServiceErr(w, err)
+		writeRoomServiceErr(w, err)
 		return
 	}
 	sinceID = catchUpReplay.NextSince
@@ -736,7 +870,7 @@ func (s *sqlHTTP) handleRoomEventsHistory(w http.ResponseWriter, r *http.Request
 
 	out, err := s.svc.ListRoomEventHistory(r.Context(), agentID, roomID, sinceID, limit)
 	if err != nil {
-		writeServiceErr(w, err)
+		writeRoomServiceErr(w, err)
 		return
 	}
 
@@ -839,12 +973,27 @@ func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, item repository.
 }
 
 func (s *sqlHTTP) authAgentID(ctx context.Context, r *http.Request) (string, error) {
-	auth := r.Header.Get("Authorization")
-	if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
+	token := bearerTokenFromRequest(r)
+	if token == "" {
 		return "", a2a.ErrUnauthorized
 	}
-	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 	return s.svc.AuthAgentID(ctx, token)
+}
+
+func (s *sqlHTTP) authRoomAccess(ctx context.Context, r *http.Request, roomID, action string) (string, error) {
+	token := bearerTokenFromRequest(r)
+	if token == "" {
+		return "", a2a.ErrUnauthorized
+	}
+	return s.svc.AuthRoomAccess(ctx, token, roomID, action)
+}
+
+func bearerTokenFromRequest(r *http.Request) string {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 }
 
 func writeServiceErr(w http.ResponseWriter, err error) {
@@ -863,6 +1012,11 @@ func writeServiceErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "turn_mismatch")
 	case errors.Is(err, a2a.ErrStaleBundleHash):
 		writeError(w, http.StatusConflict, "stale_bundle_hash")
+	case errors.Is(err, a2a.ErrRoomNotActive):
+		writeAPIError(w, http.StatusConflict, "room_not_active", errorOptions{
+			Recoverable: true,
+			Hint:        "Wait until the room becomes ACTIVE before sending messages.",
+		})
 	case errors.Is(err, a2a.ErrConflict):
 		writeError(w, http.StatusConflict, "conflict")
 	case errors.Is(err, a2a.ErrGone):
@@ -872,6 +1026,33 @@ func writeServiceErr(w http.ResponseWriter, err error) {
 	default:
 		writeError(w, http.StatusInternalServerError, "internal error")
 	}
+}
+
+func writeRoomServiceErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, a2a.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "room_not_found", errorOptions{})
+		return
+	}
+	writeServiceErr(w, err)
+}
+
+func writeListingServiceErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, a2a.ErrNotFound):
+		writeAPIError(w, http.StatusNotFound, "listing_not_found", errorOptions{})
+	case errors.Is(err, a2a.ErrConflict):
+		writeAPIError(w, http.StatusConflict, "listing_already_connected", errorOptions{})
+	default:
+		writeServiceErr(w, err)
+	}
+}
+
+func writeRoomOrViewerServiceErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, a2a.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "viewer_not_found", errorOptions{})
+		return
+	}
+	writeRoomServiceErr(w, err)
 }
 
 func (s *sqlHTTP) acquireStreamSlot(agentID, roomID, remoteAddr string, now time.Time) (func(), string, error) {

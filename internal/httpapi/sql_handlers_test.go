@@ -75,6 +75,19 @@ func TestWriteServiceErrStaleBundleHash(t *testing.T) {
 	}
 }
 
+func TestWriteServiceErrRoomNotActive(t *testing.T) {
+	t.Parallel()
+
+	w := httptest.NewRecorder()
+	writeServiceErr(w, a2a.ErrRoomNotActive)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status=%d want=%d", w.Code, http.StatusConflict)
+	}
+	if !strings.Contains(w.Body.String(), `"error":"room_not_active"`) {
+		t.Fatalf("body=%s", w.Body.String())
+	}
+}
+
 func TestAdminAuthorized(t *testing.T) {
 	t.Parallel()
 

@@ -68,21 +68,84 @@ WHERE token = $1`
 	return scanSession(s.db.QueryRowContext(ctx, q, token))
 }
 
+func (s *Store) CreateAgentWebhookEndpoint(ctx context.Context, in repository.CreateAgentWebhookEndpointInput) (repository.AgentWebhookEndpoint, error) {
+	const q = `
+INSERT INTO agent_webhook_endpoints (id, agent_id, url, secret_ciphertext, key_id, enabled)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, agent_id, url, secret_ciphertext, key_id, enabled, created_at, updated_at`
+	return scanAgentWebhookEndpoint(s.db.QueryRowContext(
+		ctx,
+		q,
+		in.ID,
+		in.AgentID,
+		in.URL,
+		in.SecretCiphertext,
+		in.KeyID,
+		in.Enabled,
+	))
+}
+
+func (s *Store) ListAgentWebhookEndpoints(ctx context.Context, agentID string) ([]repository.AgentWebhookEndpoint, error) {
+	const q = `
+SELECT id, agent_id, url, secret_ciphertext, key_id, enabled, created_at, updated_at
+FROM agent_webhook_endpoints
+WHERE agent_id = $1
+ORDER BY created_at DESC, id DESC`
+	rows, err := s.db.QueryContext(ctx, q, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []repository.AgentWebhookEndpoint
+	for rows.Next() {
+		item, scanErr := scanAgentWebhookEndpoint(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteAgentWebhookEndpoint(ctx context.Context, agentID, endpointID string) error {
+	const q = `
+WITH deleted_outbox AS (
+  DELETE FROM webhook_outbox
+  WHERE endpoint_id = $1
+),
+deleted_endpoint AS (
+  DELETE FROM agent_webhook_endpoints
+  WHERE id = $1
+    AND agent_id = $2
+  RETURNING id
+)
+SELECT COUNT(1) FROM deleted_endpoint`
+	var deleted int
+	if err := s.db.QueryRowContext(ctx, q, endpointID, agentID).Scan(&deleted); err != nil {
+		return err
+	}
+	if deleted == 0 {
+		return repository.ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) CreateListing(ctx context.Context, in repository.CreateListingInput) (repository.Listing, error) {
 	tagsJSON, err := json.Marshal(in.Tags)
 	if err != nil {
 		return repository.Listing{}, err
 	}
 	const q = `
-INSERT INTO chat_listings (id, agent_id, topic, tags, max_turns, ttl_seconds, connected)
-VALUES ($1, $2, $3, $4::jsonb, $5, $6, FALSE)
-RETURNING id, agent_id, topic, tags, max_turns, ttl_seconds, connected, created_at`
-	return scanListing(s.db.QueryRowContext(ctx, q, in.ID, in.AgentID, in.Topic, tagsJSON, in.MaxTurns, in.TTLSeconds))
+INSERT INTO chat_listings (id, agent_id, topic, tags, max_turns, ttl_seconds, connected, room_id)
+VALUES ($1, $2, $3, $4::jsonb, $5, $6, FALSE, $7)
+RETURNING id, agent_id, topic, tags, max_turns, ttl_seconds, connected, created_at, room_id`
+	return scanListing(s.db.QueryRowContext(ctx, q, in.ID, in.AgentID, in.Topic, tagsJSON, in.MaxTurns, in.TTLSeconds, nullableText(in.RoomID)))
 }
 
 func (s *Store) GetListing(ctx context.Context, listingID string) (repository.Listing, error) {
 	const q = `
-SELECT id, agent_id, topic, tags, max_turns, ttl_seconds, connected, created_at
+SELECT id, agent_id, topic, tags, max_turns, ttl_seconds, connected, created_at, room_id
 FROM chat_listings
 WHERE id = $1`
 	return scanListing(s.db.QueryRowContext(ctx, q, listingID))
@@ -103,7 +166,7 @@ func (s *Store) MarkListingConnected(ctx context.Context, listingID string) erro
 
 func (s *Store) SearchListings(ctx context.Context, query string) ([]repository.Listing, error) {
 	base := `
-SELECT id, agent_id, topic, tags, max_turns, ttl_seconds, connected, created_at
+SELECT id, agent_id, topic, tags, max_turns, ttl_seconds, connected, created_at, room_id
 FROM chat_listings
 WHERE connected = FALSE`
 	args := []any{}
@@ -143,7 +206,7 @@ INSERT INTO rooms (id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash`
 	return scanRoom(
-		s.db.QueryRowContext(ctx, q, in.ID, in.AgentAID, in.AgentBID, string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash),
+		s.db.QueryRowContext(ctx, q, in.ID, in.AgentAID, nullableText(in.AgentBID), string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash),
 	)
 }
 
@@ -163,6 +226,9 @@ func (s *Store) UpdateRoom(ctx context.Context, in repository.UpdateRoomInput) (
 	if in.State != nil {
 		current.State = *in.State
 	}
+	if in.AgentBID != nil {
+		current.AgentBID = *in.AgentBID
+	}
 	if in.TurnIndex != nil {
 		current.TurnIndex = *in.TurnIndex
 	}
@@ -175,16 +241,18 @@ func (s *Store) UpdateRoom(ctx context.Context, in repository.UpdateRoomInput) (
 
 	const q = `
 UPDATE rooms
-SET state = $2,
-    turn_index = $3,
-    closed_at = $4,
-    purged_at = $5
+SET agent_b_id = $2,
+    state = $3,
+    turn_index = $4,
+    closed_at = $5,
+    purged_at = $6
 WHERE id = $1
 RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash`
 	return scanRoom(s.db.QueryRowContext(
 		ctx,
 		q,
 		current.ID,
+		nullableText(current.AgentBID),
 		string(current.State),
 		current.TurnIndex,
 		current.ClosedAt,
@@ -317,10 +385,15 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 
 func (s *Store) AppendRoomEvent(ctx context.Context, in repository.AppendRoomEventInput) (repository.RoomEvent, error) {
 	const q = `
-INSERT INTO room_events (room_id, event_type, message_id, turn, sender_id, ciphertext)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, room_id, event_type, message_id, turn, sender_id, ciphertext, created_at`
-	return scanRoomEvent(s.db.QueryRowContext(
+WITH inserted AS (
+  INSERT INTO room_events (room_id, event_type, message_id, turn, sender_id)
+  VALUES ($1, $2, $3, $4, $5)
+  RETURNING id, room_id, event_type, message_id, turn, sender_id, created_at
+)
+SELECT i.id, i.room_id, i.event_type, i.message_id, i.turn, i.sender_id, m.ciphertext, i.created_at
+FROM inserted i
+LEFT JOIN messages m ON m.id = i.message_id`
+	out, err := scanRoomEvent(s.db.QueryRowContext(
 		ctx,
 		q,
 		in.RoomID,
@@ -328,15 +401,22 @@ RETURNING id, room_id, event_type, message_id, turn, sender_id, ciphertext, crea
 		in.MessageID,
 		in.Turn,
 		in.SenderID,
-		in.Ciphertext,
 	))
+	if err != nil {
+		return repository.RoomEvent{}, err
+	}
+	if out.Ciphertext == nil && in.Ciphertext != nil {
+		out.Ciphertext = in.Ciphertext
+	}
+	return out, nil
 }
 
 func (s *Store) GetRoomEvent(ctx context.Context, eventID int64) (repository.RoomEvent, error) {
 	const q = `
-SELECT id, room_id, event_type, message_id, turn, sender_id, ciphertext, created_at
-FROM room_events
-WHERE id = $1`
+SELECT re.id, re.room_id, re.event_type, re.message_id, re.turn, re.sender_id, m.ciphertext, re.created_at
+FROM room_events re
+LEFT JOIN messages m ON m.id = re.message_id
+WHERE re.id = $1`
 	return scanRoomEvent(s.db.QueryRowContext(ctx, q, eventID))
 }
 
@@ -347,11 +427,12 @@ func (s *Store) ListRoomEvents(ctx context.Context, in repository.ListRoomEvents
 	}
 
 	const q = `
-SELECT id, room_id, event_type, message_id, turn, sender_id, ciphertext, created_at
-FROM room_events
-WHERE room_id = $1
-  AND id > $2
-ORDER BY id ASC
+SELECT re.id, re.room_id, re.event_type, re.message_id, re.turn, re.sender_id, m.ciphertext, re.created_at
+FROM room_events re
+LEFT JOIN messages m ON m.id = re.message_id
+WHERE re.room_id = $1
+  AND re.id > $2
+ORDER BY re.id ASC
 LIMIT $3`
 	rows, err := s.db.QueryContext(ctx, q, in.RoomID, in.SinceID, limit)
 	if err != nil {
@@ -368,6 +449,84 @@ LIMIT $3`
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) CreateWebhookOutbox(ctx context.Context, in repository.CreateWebhookOutboxInput) (repository.WebhookOutboxItem, error) {
+	return createWebhookOutbox(ctx, s.db, in)
+}
+
+func (s *Store) ClaimPendingWebhookDeliveries(ctx context.Context, now, reclaimBefore time.Time, limit int) ([]repository.ClaimedWebhookDelivery, error) {
+	return claimPendingWebhookDeliveries(ctx, s.db, now, reclaimBefore, limit)
+}
+
+func (s *Store) MarkWebhookOutboxDelivered(ctx context.Context, id int64) error {
+	const q = `
+UPDATE webhook_outbox
+SET status = 'delivered',
+    last_error = '',
+    updated_at = NOW()
+WHERE id = $1`
+	_, err := s.db.ExecContext(ctx, q, id)
+	return err
+}
+
+func (s *Store) MarkWebhookOutboxPendingRetry(ctx context.Context, id int64, nextAttemptAt time.Time, lastError string) error {
+	const q = `
+UPDATE webhook_outbox
+SET status = 'pending',
+    next_attempt_at = $2,
+    last_error = $3,
+    updated_at = NOW()
+WHERE id = $1`
+	_, err := s.db.ExecContext(ctx, q, id, nextAttemptAt, lastError)
+	return err
+}
+
+func (s *Store) MarkWebhookOutboxDeadLetter(ctx context.Context, id int64, lastError string) error {
+	const q = `
+UPDATE webhook_outbox
+SET status = 'dead_letter',
+    last_error = $2,
+    updated_at = NOW()
+WHERE id = $1`
+	_, err := s.db.ExecContext(ctx, q, id, lastError)
+	return err
+}
+
+func (s *Store) CreateRoomScopedToken(ctx context.Context, in repository.CreateRoomScopedTokenInput) (repository.RoomScopedToken, error) {
+	const q = `
+INSERT INTO room_scoped_tokens (id, room_id, agent_id, token_hash, scope, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, room_id, agent_id, token_hash, scope, expires_at, revoked_at, created_at`
+	return scanRoomScopedToken(s.db.QueryRowContext(
+		ctx,
+		q,
+		in.ID,
+		in.RoomID,
+		in.AgentID,
+		in.TokenHash,
+		in.Scope,
+		in.ExpiresAt,
+	))
+}
+
+func (s *Store) FindRoomScopedTokenByHash(ctx context.Context, tokenHash string) (repository.RoomScopedToken, error) {
+	const q = `
+SELECT id, room_id, agent_id, token_hash, scope, expires_at, revoked_at, created_at
+FROM room_scoped_tokens
+WHERE token_hash = $1`
+	return scanRoomScopedToken(s.db.QueryRowContext(ctx, q, tokenHash))
+}
+
+func (s *Store) RevokeRoomScopedTokens(ctx context.Context, roomID, agentID string, revokedAt time.Time) error {
+	const q = `
+UPDATE room_scoped_tokens
+SET revoked_at = $3
+WHERE room_id = $1
+  AND agent_id = $2
+  AND revoked_at IS NULL`
+	_, err := s.db.ExecContext(ctx, q, roomID, agentID, revokedAt)
+	return err
 }
 
 func (s *Store) PurgeRoomContent(ctx context.Context, roomID string, purgedAt time.Time) error {
@@ -431,7 +590,7 @@ func (s *Store) ListAdminRooms(ctx context.Context, limit int) ([]repository.Adm
 	}
 
 	const q = `
-SELECT r.id, r.agent_a_id, COALESCE(a.name, ''), r.agent_b_id, COALESCE(b.name, ''), r.state, r.turn_index, r.max_turns, r.ttl_at, r.created_at, r.closed_at, r.purged_at
+SELECT r.id, r.agent_a_id, COALESCE(a.name, ''), COALESCE(r.agent_b_id, ''), COALESCE(b.name, ''), r.state, r.turn_index, r.max_turns, r.ttl_at, r.created_at, r.closed_at, r.purged_at
 FROM rooms r
 LEFT JOIN agents a ON a.id = r.agent_a_id
 LEFT JOIN agents b ON b.id = r.agent_b_id
@@ -485,9 +644,21 @@ type txStore struct {
 	tx *sql.Tx
 }
 
+func (s *txStore) CreateListing(ctx context.Context, in repository.CreateListingInput) (repository.Listing, error) {
+	tagsJSON, err := json.Marshal(in.Tags)
+	if err != nil {
+		return repository.Listing{}, err
+	}
+	const q = `
+INSERT INTO chat_listings (id, agent_id, topic, tags, max_turns, ttl_seconds, connected, room_id)
+VALUES ($1, $2, $3, $4::jsonb, $5, $6, FALSE, $7)
+RETURNING id, agent_id, topic, tags, max_turns, ttl_seconds, connected, created_at, room_id`
+	return scanListing(s.tx.QueryRowContext(ctx, q, in.ID, in.AgentID, in.Topic, tagsJSON, in.MaxTurns, in.TTLSeconds, nullableText(in.RoomID)))
+}
+
 func (s *txStore) GetListing(ctx context.Context, listingID string) (repository.Listing, error) {
 	const q = `
-SELECT id, agent_id, topic, tags, max_turns, ttl_seconds, connected, created_at
+SELECT id, agent_id, topic, tags, max_turns, ttl_seconds, connected, created_at, room_id
 FROM chat_listings
 WHERE id = $1`
 	return scanListing(s.tx.QueryRowContext(ctx, q, listingID))
@@ -512,7 +683,7 @@ INSERT INTO rooms (id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash`
 	return scanRoom(
-		s.tx.QueryRowContext(ctx, q, in.ID, in.AgentAID, in.AgentBID, string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash),
+		s.tx.QueryRowContext(ctx, q, in.ID, in.AgentAID, nullableText(in.AgentBID), string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash),
 	)
 }
 
@@ -532,6 +703,9 @@ func (s *txStore) UpdateRoom(ctx context.Context, in repository.UpdateRoomInput)
 	if in.State != nil {
 		current.State = *in.State
 	}
+	if in.AgentBID != nil {
+		current.AgentBID = *in.AgentBID
+	}
 	if in.TurnIndex != nil {
 		current.TurnIndex = *in.TurnIndex
 	}
@@ -544,16 +718,18 @@ func (s *txStore) UpdateRoom(ctx context.Context, in repository.UpdateRoomInput)
 
 	const q = `
 UPDATE rooms
-SET state = $2,
-    turn_index = $3,
-    closed_at = $4,
-    purged_at = $5
+SET agent_b_id = $2,
+    state = $3,
+    turn_index = $4,
+    closed_at = $5,
+    purged_at = $6
 WHERE id = $1
 RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash`
 	return scanRoom(s.tx.QueryRowContext(
 		ctx,
 		q,
 		current.ID,
+		nullableText(current.AgentBID),
 		string(current.State),
 		current.TurnIndex,
 		current.ClosedAt,
@@ -575,10 +751,15 @@ func (s *txStore) PurgeRoomContent(ctx context.Context, roomID string, purgedAt 
 
 func (s *txStore) AppendRoomEvent(ctx context.Context, in repository.AppendRoomEventInput) (repository.RoomEvent, error) {
 	const q = `
-INSERT INTO room_events (room_id, event_type, message_id, turn, sender_id, ciphertext)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, room_id, event_type, message_id, turn, sender_id, ciphertext, created_at`
-	return scanRoomEvent(s.tx.QueryRowContext(
+WITH inserted AS (
+  INSERT INTO room_events (room_id, event_type, message_id, turn, sender_id)
+  VALUES ($1, $2, $3, $4, $5)
+  RETURNING id, room_id, event_type, message_id, turn, sender_id, created_at
+)
+SELECT i.id, i.room_id, i.event_type, i.message_id, i.turn, i.sender_id, m.ciphertext, i.created_at
+FROM inserted i
+LEFT JOIN messages m ON m.id = i.message_id`
+	out, err := scanRoomEvent(s.tx.QueryRowContext(
 		ctx,
 		q,
 		in.RoomID,
@@ -586,8 +767,69 @@ RETURNING id, room_id, event_type, message_id, turn, sender_id, ciphertext, crea
 		in.MessageID,
 		in.Turn,
 		in.SenderID,
-		in.Ciphertext,
 	))
+	if err != nil {
+		return repository.RoomEvent{}, err
+	}
+	if out.Ciphertext == nil && in.Ciphertext != nil {
+		out.Ciphertext = in.Ciphertext
+	}
+	return out, nil
+}
+
+func (s *txStore) ListAgentWebhookEndpoints(ctx context.Context, agentID string) ([]repository.AgentWebhookEndpoint, error) {
+	const q = `
+SELECT id, agent_id, url, secret_ciphertext, key_id, enabled, created_at, updated_at
+FROM agent_webhook_endpoints
+WHERE agent_id = $1
+ORDER BY created_at DESC, id DESC`
+	rows, err := s.tx.QueryContext(ctx, q, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []repository.AgentWebhookEndpoint
+	for rows.Next() {
+		item, scanErr := scanAgentWebhookEndpoint(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *txStore) CreateWebhookOutbox(ctx context.Context, in repository.CreateWebhookOutboxInput) (repository.WebhookOutboxItem, error) {
+	return createWebhookOutbox(ctx, s.tx, in)
+}
+
+func (s *txStore) CreateRoomScopedToken(ctx context.Context, in repository.CreateRoomScopedTokenInput) (repository.RoomScopedToken, error) {
+	const q = `
+INSERT INTO room_scoped_tokens (id, room_id, agent_id, token_hash, scope, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, room_id, agent_id, token_hash, scope, expires_at, revoked_at, created_at`
+	return scanRoomScopedToken(s.tx.QueryRowContext(
+		ctx,
+		q,
+		in.ID,
+		in.RoomID,
+		in.AgentID,
+		in.TokenHash,
+		in.Scope,
+		in.ExpiresAt,
+	))
+}
+
+func (s *txStore) RevokeRoomScopedTokens(ctx context.Context, roomID, agentID string, revokedAt time.Time) error {
+	const q = `
+UPDATE room_scoped_tokens
+SET revoked_at = $3
+WHERE room_id = $1
+  AND agent_id = $2
+  AND revoked_at IS NULL`
+	_, err := s.tx.ExecContext(ctx, q, roomID, agentID, revokedAt)
+	return err
 }
 
 func scanAgent(row interface{ Scan(dest ...any) error }) (repository.Agent, error) {
@@ -611,9 +853,13 @@ func scanSession(row interface{ Scan(dest ...any) error }) (repository.Session, 
 func scanListing(row interface{ Scan(dest ...any) error }) (repository.Listing, error) {
 	var raw []byte
 	var l repository.Listing
-	err := row.Scan(&l.ID, &l.AgentID, &l.Topic, &raw, &l.MaxTurns, &l.TTLSeconds, &l.Connected, &l.CreatedAt)
+	var roomID sql.NullString
+	err := row.Scan(&l.ID, &l.AgentID, &l.Topic, &raw, &l.MaxTurns, &l.TTLSeconds, &l.Connected, &l.CreatedAt, &roomID)
 	if err != nil {
 		return repository.Listing{}, normalizeErr(err)
+	}
+	if roomID.Valid {
+		l.RoomID = roomID.String
 	}
 	if len(raw) == 0 {
 		l.Tags = []string{}
@@ -632,10 +878,11 @@ func scanListingRows(rows *sql.Rows) (repository.Listing, error) {
 func scanRoom(row interface{ Scan(dest ...any) error }) (repository.Room, error) {
 	var r repository.Room
 	var state string
+	var agentBID sql.NullString
 	err := row.Scan(
 		&r.ID,
 		&r.AgentAID,
-		&r.AgentBID,
+		&agentBID,
 		&state,
 		&r.TurnIndex,
 		&r.MaxTurns,
@@ -647,6 +894,9 @@ func scanRoom(row interface{ Scan(dest ...any) error }) (repository.Room, error)
 	)
 	if err != nil {
 		return repository.Room{}, normalizeErr(err)
+	}
+	if agentBID.Valid {
+		r.AgentBID = agentBID.String
 	}
 	r.State = domain.RoomState(state)
 	return r, nil
@@ -722,11 +972,37 @@ func scanAdminRoom(row interface{ Scan(dest ...any) error }) (repository.AdminRo
 	return out, nil
 }
 
+func nullableText(value string) any {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
 func scanAuditEvent(row interface{ Scan(dest ...any) error }) (repository.AuditEvent, error) {
 	var out repository.AuditEvent
 	err := row.Scan(&out.ID, &out.RoomID, &out.Event, &out.Meta, &out.MessageCount, &out.CreatedAt)
 	if err != nil {
 		return repository.AuditEvent{}, normalizeErr(err)
+	}
+	return out, nil
+}
+
+func scanAgentWebhookEndpoint(row interface{ Scan(dest ...any) error }) (repository.AgentWebhookEndpoint, error) {
+	var out repository.AgentWebhookEndpoint
+	err := row.Scan(
+		&out.ID,
+		&out.AgentID,
+		&out.URL,
+		&out.SecretCiphertext,
+		&out.KeyID,
+		&out.Enabled,
+		&out.CreatedAt,
+		&out.UpdatedAt,
+	)
+	if err != nil {
+		return repository.AgentWebhookEndpoint{}, normalizeErr(err)
 	}
 	return out, nil
 }
@@ -762,6 +1038,192 @@ func scanRoomEvent(row interface{ Scan(dest ...any) error }) (repository.RoomEve
 		out.Ciphertext = &ciphertext.String
 	}
 	return out, nil
+}
+
+func scanWebhookOutboxItem(row interface{ Scan(dest ...any) error }) (repository.WebhookOutboxItem, error) {
+	var out repository.WebhookOutboxItem
+	var payload []byte
+	err := row.Scan(
+		&out.ID,
+		&out.RoomID,
+		&out.RoomEventID,
+		&out.TargetAgentID,
+		&out.EndpointID,
+		&out.EventType,
+		&payload,
+		&out.Status,
+		&out.AttemptCount,
+		&out.NextAttemptAt,
+		&out.LastError,
+		&out.CreatedAt,
+		&out.UpdatedAt,
+	)
+	if err != nil {
+		return repository.WebhookOutboxItem{}, normalizeErr(err)
+	}
+	if len(payload) == 0 {
+		out.Payload = json.RawMessage(`{}`)
+	} else {
+		out.Payload = json.RawMessage(payload)
+	}
+	return out, nil
+}
+
+func scanClaimedWebhookDelivery(row interface{ Scan(dest ...any) error }) (repository.ClaimedWebhookDelivery, error) {
+	var out repository.ClaimedWebhookDelivery
+	var payload []byte
+	err := row.Scan(
+		&out.ID,
+		&out.RoomID,
+		&out.RoomEventID,
+		&out.TargetAgentID,
+		&out.EndpointID,
+		&out.EventType,
+		&payload,
+		&out.Status,
+		&out.AttemptCount,
+		&out.NextAttemptAt,
+		&out.LastError,
+		&out.CreatedAt,
+		&out.UpdatedAt,
+		&out.EndpointURL,
+		&out.EndpointSecretCiphertext,
+		&out.EndpointKeyID,
+		&out.EndpointEnabled,
+	)
+	if err != nil {
+		return repository.ClaimedWebhookDelivery{}, normalizeErr(err)
+	}
+	if len(payload) == 0 {
+		out.Payload = json.RawMessage(`{}`)
+	} else {
+		out.Payload = json.RawMessage(payload)
+	}
+	return out, nil
+}
+
+func scanRoomScopedToken(row interface{ Scan(dest ...any) error }) (repository.RoomScopedToken, error) {
+	var out repository.RoomScopedToken
+	err := row.Scan(
+		&out.ID,
+		&out.RoomID,
+		&out.AgentID,
+		&out.TokenHash,
+		&out.Scope,
+		&out.ExpiresAt,
+		&out.RevokedAt,
+		&out.CreatedAt,
+	)
+	if err != nil {
+		return repository.RoomScopedToken{}, normalizeErr(err)
+	}
+	return out, nil
+}
+
+func createWebhookOutbox(ctx context.Context, exec interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, in repository.CreateWebhookOutboxInput) (repository.WebhookOutboxItem, error) {
+	status := strings.TrimSpace(in.Status)
+	if status == "" {
+		status = "pending"
+	}
+	nextAttemptAt := in.NextAttemptAt
+	if nextAttemptAt.IsZero() {
+		nextAttemptAt = time.Now().UTC()
+	}
+	payload := in.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage(`{}`)
+	}
+	const q = `
+INSERT INTO webhook_outbox (
+  room_id,
+  room_event_id,
+  target_agent_id,
+  endpoint_id,
+  event_type,
+  payload,
+  status,
+  attempt_count,
+  next_attempt_at,
+  last_error
+)
+VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10)
+RETURNING id, room_id, room_event_id, target_agent_id, endpoint_id, event_type, payload, status, attempt_count, next_attempt_at, last_error, created_at, updated_at`
+	return scanWebhookOutboxItem(exec.QueryRowContext(
+		ctx,
+		q,
+		in.RoomID,
+		in.RoomEventID,
+		in.TargetAgentID,
+		in.EndpointID,
+		in.EventType,
+		payload,
+		status,
+		in.AttemptCount,
+		nextAttemptAt,
+		in.LastError,
+	))
+}
+
+func claimPendingWebhookDeliveries(ctx context.Context, exec interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, now, reclaimBefore time.Time, limit int) ([]repository.ClaimedWebhookDelivery, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	const q = `
+WITH candidates AS (
+  SELECT wo.id
+  FROM webhook_outbox wo
+  JOIN agent_webhook_endpoints ep ON ep.id = wo.endpoint_id
+  WHERE (
+    (wo.status = 'pending' AND wo.next_attempt_at <= $1)
+    OR
+    (wo.status = 'delivering' AND wo.updated_at <= $2)
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM webhook_outbox prev
+    WHERE prev.room_id = wo.room_id
+      AND prev.target_agent_id = wo.target_agent_id
+      AND prev.endpoint_id = wo.endpoint_id
+      AND prev.id < wo.id
+      AND prev.status NOT IN ('delivered', 'dead_letter')
+  )
+  ORDER BY wo.id ASC
+  LIMIT $3
+  FOR UPDATE SKIP LOCKED
+),
+claimed AS (
+  UPDATE webhook_outbox wo
+  SET status = 'delivering',
+      attempt_count = wo.attempt_count + 1,
+      updated_at = NOW()
+  FROM candidates c
+  WHERE wo.id = c.id
+  RETURNING wo.id, wo.room_id, wo.room_event_id, wo.target_agent_id, wo.endpoint_id, wo.event_type, wo.payload, wo.status, wo.attempt_count, wo.next_attempt_at, wo.last_error, wo.created_at, wo.updated_at
+)
+SELECT c.id, c.room_id, c.room_event_id, c.target_agent_id, c.endpoint_id, c.event_type, c.payload, c.status, c.attempt_count, c.next_attempt_at, c.last_error, c.created_at, c.updated_at,
+       ep.url, ep.secret_ciphertext, ep.key_id, ep.enabled
+FROM claimed c
+JOIN agent_webhook_endpoints ep ON ep.id = c.endpoint_id
+ORDER BY c.id ASC`
+	rows, err := exec.QueryContext(ctx, q, now, reclaimBefore, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []repository.ClaimedWebhookDelivery
+	for rows.Next() {
+		item, scanErr := scanClaimedWebhookDelivery(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 
 func normalizeErr(err error) error {

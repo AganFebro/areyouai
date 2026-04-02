@@ -34,6 +34,7 @@ type options struct {
 	ClosedRoomGraceDelay   time.Duration
 	MaxClosedRetention     time.Duration
 	AdminToken             string
+	WebhookSecretKey       string
 }
 
 type agent struct {
@@ -56,6 +57,7 @@ type listing struct {
 	TTLSecond int       `json:"ttl_seconds"`
 	CreatedAt time.Time `json:"created_at"`
 	Connected bool      `json:"connected"`
+	RoomID    string    `json:"-"`
 }
 
 type room struct {

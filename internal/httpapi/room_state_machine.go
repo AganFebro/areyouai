@@ -14,18 +14,18 @@ type transitionRequest struct {
 
 func roomStateMachine(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
 	var req transitionRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 
 	if err := domain.TransitionState(req.Current, req.Next); err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
+		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 

@@ -87,6 +87,53 @@ func TestRoomEventsAppendAndListOrdered(t *testing.T) {
 	}
 }
 
+func TestRoomEventsHydrateCiphertextFromMessages(t *testing.T) {
+	db := openTestPostgresDB(t)
+	defer db.Close()
+	applyStoreMigrationsForTest(t, db)
+
+	store := NewStore(db)
+	ctx := context.Background()
+	roomID := seedRoomForEvents(t, ctx, store)
+
+	msg, err := store.AppendMessage(ctx, repository.AppendMessageInput{
+		ID:         "msg_events_hydrated",
+		RoomID:     roomID,
+		SenderID:   "agt_a",
+		Turn:       0,
+		Ciphertext: "cipher-hydrated",
+	})
+	if err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+
+	turn := msg.Turn
+	sender := msg.SenderID
+	if _, err := store.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+		RoomID:    roomID,
+		EventType: "message.created",
+		MessageID: &msg.ID,
+		Turn:      &turn,
+		SenderID:  &sender,
+	}); err != nil {
+		t.Fatalf("append room event: %v", err)
+	}
+
+	items, err := store.ListRoomEvents(ctx, repository.ListRoomEventsInput{
+		RoomID: roomID,
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatalf("list room events: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("events len=%d want=1", len(items))
+	}
+	if items[0].Ciphertext == nil || *items[0].Ciphertext != msg.Ciphertext {
+		t.Fatalf("event ciphertext=%v want=%q", items[0].Ciphertext, msg.Ciphertext)
+	}
+}
+
 func TestRoomEventsDeletedOnPurge(t *testing.T) {
 	db := openTestPostgresDB(t)
 	defer db.Close()
@@ -205,9 +252,40 @@ func applyStoreMigrationsForTest(t *testing.T, db *sql.DB) {
 	if err != nil {
 		t.Fatalf("read room events up migration: %v", err)
 	}
+	up4, err := os.ReadFile(filepath.Join(migDir, "000004_api_request_logs.up.sql"))
+	if err != nil {
+		t.Fatalf("read api request logs up migration: %v", err)
+	}
+	up5, err := os.ReadFile(filepath.Join(migDir, "000005_owner_first_listing_flow.up.sql"))
+	if err != nil {
+		t.Fatalf("read owner-first listing flow up migration: %v", err)
+	}
+	up6, err := os.ReadFile(filepath.Join(migDir, "000006_webhook_foundation.up.sql"))
+	if err != nil {
+		t.Fatalf("read webhook foundation up migration: %v", err)
+	}
+	up7, err := os.ReadFile(filepath.Join(migDir, "000007_webhook_endpoint_delete_cascade.up.sql"))
+	if err != nil {
+		t.Fatalf("read webhook endpoint delete cascade up migration: %v", err)
+	}
 
 	if _, err := db.Exec(string(down)); err != nil {
 		t.Fatalf("exec down migration: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS room_scoped_tokens`); err != nil {
+		t.Fatalf("cleanup room scoped tokens: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS webhook_outbox`); err != nil {
+		t.Fatalf("cleanup webhook outbox: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS agent_webhook_endpoints`); err != nil {
+		t.Fatalf("cleanup agent webhook endpoints: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS api_request_logs`); err != nil {
+		t.Fatalf("cleanup api request logs: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS room_context_state`); err != nil {
+		t.Fatalf("cleanup room context state: %v", err)
 	}
 	if _, err := db.Exec(`DROP TABLE IF EXISTS room_events`); err != nil {
 		t.Fatalf("cleanup room events: %v", err)
@@ -220,6 +298,18 @@ func applyStoreMigrationsForTest(t *testing.T, db *sql.DB) {
 	}
 	if _, err := db.Exec(string(up3)); err != nil {
 		t.Fatalf("exec room events up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up4)); err != nil {
+		t.Fatalf("exec api request logs up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up5)); err != nil {
+		t.Fatalf("exec owner-first listing flow up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up6)); err != nil {
+		t.Fatalf("exec webhook foundation up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up7)); err != nil {
+		t.Fatalf("exec webhook endpoint delete cascade up migration: %v", err)
 	}
 }
 

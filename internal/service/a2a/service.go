@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	neturl "net/url"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/febrian/areyouai/internal/domain"
 	"github.com/febrian/areyouai/internal/repository"
 	"github.com/febrian/areyouai/internal/security"
+	"github.com/febrian/areyouai/internal/security/secretcipher"
 	"github.com/febrian/areyouai/internal/service/promptbuilder"
 )
 
@@ -29,6 +32,9 @@ const (
 	maxRecentMemoryEntries    = 6
 	maxRoomEventHistoryLimit  = 200
 	sessionTTL                = 14 * 24 * time.Hour
+	roomScopedTokenTTL        = 5 * time.Minute
+	roomScopeAutomation       = "room:automation"
+	roomScopeReadOnly         = "room:read_only"
 )
 
 var (
@@ -39,6 +45,7 @@ var (
 	ErrConflict        = errors.New("conflict")
 	ErrTurnMismatch    = errors.New("turn mismatch")
 	ErrStaleBundleHash = errors.New("stale bundle hash")
+	ErrRoomNotActive   = errors.New("room not active")
 	ErrGone            = errors.New("gone")
 	ErrRateLimit       = errors.New("rate limit")
 	ErrPolicyBlocked   = errors.New("policy blocked")
@@ -48,6 +55,7 @@ type Service struct {
 	store repository.Store
 	pb    *promptbuilder.Builder
 	emit  func(repository.RoomEvent)
+	seal  *secretcipher.Cipher
 
 	mu             sync.Mutex
 	joined         map[string]map[string]bool
@@ -67,6 +75,7 @@ type Options struct {
 	ClosedRoomGraceDelay   time.Duration
 	MaxClosedRetention     time.Duration
 	RoomEventPublisher     func(repository.RoomEvent)
+	WebhookSecretKey       string
 }
 
 type RegisterResult struct {
@@ -78,14 +87,36 @@ type LoginResult struct {
 	SessionToken string
 }
 
-type ConnectResult struct {
+type AgentWebhookEndpointResult struct {
+	Endpoint repository.AgentWebhookEndpoint
+}
+
+type RoomAccessTokenResult struct {
 	RoomID    string
-	HumanCode string
-	AgentAID  string
-	AgentBID  string
-	RoomState domain.RoomState
-	ListingID string
-	NextTurnA string
+	AgentID   string
+	Token     string
+	Scope     string
+	ExpiresAt time.Time
+}
+
+type CreateListingResult struct {
+	Listing     repository.Listing
+	RoomID      string
+	HumanCode   string
+	OwnerJoined bool
+	RoomState   domain.RoomState
+	NextActorID string
+}
+
+type ConnectResult struct {
+	RoomID      string
+	HumanCode   string
+	AgentAID    string
+	AgentBID    string
+	RoomState   domain.RoomState
+	ListingID   string
+	NextTurnA   string
+	NextActorID string
 }
 
 func New(store repository.Store, opts Options) *Service {
@@ -98,6 +129,7 @@ func New(store repository.Store, opts Options) *Service {
 		store:                  store,
 		pb:                     pb,
 		emit:                   func(repository.RoomEvent) {},
+		seal:                   secretcipher.New(opts.WebhookSecretKey),
 		joined:                 make(map[string]map[string]bool),
 		messageWindows:         make(map[string][]time.Time),
 		roomWindows:            make(map[string][]time.Time),
@@ -188,10 +220,145 @@ func (s *Service) AuthAgentID(ctx context.Context, bearerToken string) (string, 
 	return session.AgentID, nil
 }
 
-func (s *Service) CreateListing(ctx context.Context, agentID, topic string, tags []string, maxTurns, ttlSeconds int) (repository.Listing, error) {
+func (s *Service) AuthRoomAccess(ctx context.Context, bearerToken, roomID, action string) (string, error) {
+	token := strings.TrimSpace(bearerToken)
+	roomID = strings.TrimSpace(roomID)
+	if token == "" || roomID == "" {
+		return "", ErrUnauthorized
+	}
+
+	agentID, err := s.AuthAgentID(ctx, token)
+	if err == nil {
+		return agentID, nil
+	}
+	if !errors.Is(err, ErrUnauthorized) {
+		return "", err
+	}
+
+	scoped, err := s.store.FindRoomScopedTokenByHash(ctx, hashText(token))
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return "", ErrUnauthorized
+		}
+		return "", err
+	}
+	if scoped.RevokedAt != nil || !scoped.ExpiresAt.After(s.now()) {
+		return "", ErrUnauthorized
+	}
+	if scoped.RoomID != roomID {
+		return "", ErrForbidden
+	}
+	if !roomScopedTokenAllows(scoped.Scope, action) {
+		return "", ErrForbidden
+	}
+	return scoped.AgentID, nil
+}
+
+func (s *Service) CreateRoomAccessToken(ctx context.Context, agentID, roomID string) (RoomAccessTokenResult, error) {
+	rm, err := s.store.GetRoom(ctx, strings.TrimSpace(roomID))
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return RoomAccessTokenResult{}, ErrNotFound
+		}
+		return RoomAccessTokenResult{}, err
+	}
+	rm, err = s.reconcileRoom(ctx, rm)
+	if err != nil {
+		return RoomAccessTokenResult{}, err
+	}
+	if rm.AgentAID != agentID && rm.AgentBID != agentID {
+		return RoomAccessTokenResult{}, ErrForbidden
+	}
+	if rm.State != domain.RoomStateOpen && rm.State != domain.RoomStateActive {
+		return RoomAccessTokenResult{}, ErrGone
+	}
+
+	now := s.now()
+	plainToken := "rat_" + randomToken(24)
+	scope := roomScopeAutomation
+	expiresAt := now.Add(roomScopedTokenTTL)
+	if err := s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+		if revokeErr := tx.RevokeRoomScopedTokens(ctx, rm.ID, agentID, now); revokeErr != nil {
+			return revokeErr
+		}
+		_, createErr := tx.CreateRoomScopedToken(ctx, repository.CreateRoomScopedTokenInput{
+			ID:        newID("rat"),
+			RoomID:    rm.ID,
+			AgentID:   agentID,
+			TokenHash: hashText(plainToken),
+			Scope:     scope,
+			ExpiresAt: expiresAt,
+		})
+		return createErr
+	}); err != nil {
+		return RoomAccessTokenResult{}, err
+	}
+
+	return RoomAccessTokenResult{
+		RoomID:    rm.ID,
+		AgentID:   agentID,
+		Token:     plainToken,
+		Scope:     scope,
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+func (s *Service) CreateAgentWebhookEndpoint(ctx context.Context, agentID, rawURL, secret, keyID string, enabled bool) (AgentWebhookEndpointResult, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	secret = strings.TrimSpace(secret)
+	keyID = strings.TrimSpace(keyID)
+	if rawURL == "" || secret == "" {
+		return AgentWebhookEndpointResult{}, ErrBadRequest
+	}
+	normalizedURL, err := normalizeWebhookEndpointURL(rawURL)
+	if err != nil {
+		return AgentWebhookEndpointResult{}, ErrBadRequest
+	}
+	if keyID == "" {
+		keyID = "v1"
+	}
+	sealedSecret, err := s.seal.Encrypt(secret)
+	if err != nil {
+		return AgentWebhookEndpointResult{}, err
+	}
+	out, err := s.store.CreateAgentWebhookEndpoint(ctx, repository.CreateAgentWebhookEndpointInput{
+		ID:               newID("whk"),
+		AgentID:          strings.TrimSpace(agentID),
+		URL:              normalizedURL,
+		SecretCiphertext: sealedSecret,
+		KeyID:            keyID,
+		Enabled:          enabled,
+	})
+	if err != nil {
+		if errors.Is(err, repository.ErrConflict) {
+			return AgentWebhookEndpointResult{}, ErrConflict
+		}
+		return AgentWebhookEndpointResult{}, err
+	}
+	return AgentWebhookEndpointResult{Endpoint: out}, nil
+}
+
+func (s *Service) ListAgentWebhookEndpoints(ctx context.Context, agentID string) ([]repository.AgentWebhookEndpoint, error) {
+	return s.store.ListAgentWebhookEndpoints(ctx, strings.TrimSpace(agentID))
+}
+
+func (s *Service) DeleteAgentWebhookEndpoint(ctx context.Context, agentID, endpointID string) error {
+	if strings.TrimSpace(endpointID) == "" {
+		return ErrBadRequest
+	}
+	if err := s.store.DeleteAgentWebhookEndpoint(ctx, strings.TrimSpace(agentID), strings.TrimSpace(endpointID)); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return ErrNotFound
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Service) CreateListing(ctx context.Context, agentID, topic string, tags []string, maxTurns, ttlSeconds int) (CreateListingResult, error) {
 	topic = strings.TrimSpace(topic)
 	if topic == "" {
-		return repository.Listing{}, ErrBadRequest
+		return CreateListingResult{}, ErrBadRequest
 	}
 	if maxTurns <= 0 {
 		maxTurns = 20
@@ -199,14 +366,86 @@ func (s *Service) CreateListing(ctx context.Context, agentID, topic string, tags
 	if ttlSeconds <= 0 {
 		ttlSeconds = 900
 	}
-	return s.store.CreateListing(ctx, repository.CreateListingInput{
-		ID:         newID("lst"),
-		AgentID:    agentID,
-		Topic:      topic,
-		Tags:       tags,
-		MaxTurns:   maxTurns,
-		TTLSeconds: ttlSeconds,
+
+	now := s.now()
+	roomID := newID("room")
+	humanCode := "hc_" + randomToken(18)
+	result := CreateListingResult{}
+	var createdRoom repository.Room
+	var emitted []repository.RoomEvent
+
+	err := s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+		rm, err := tx.CreateRoom(ctx, repository.CreateRoomInput{
+			ID:            roomID,
+			AgentAID:      agentID,
+			AgentBID:      "",
+			State:         domain.RoomStateOpen,
+			TurnIndex:     0,
+			MaxTurns:      maxTurns,
+			TTLAt:         now.Add(time.Duration(ttlSeconds) * time.Second),
+			HumanCodeHash: hashText(humanCode),
+		})
+		if err != nil {
+			return err
+		}
+		createdRoom = rm
+
+		item, err := tx.CreateListing(ctx, repository.CreateListingInput{
+			ID:         newID("lst"),
+			AgentID:    agentID,
+			Topic:      topic,
+			Tags:       tags,
+			MaxTurns:   maxTurns,
+			TTLSeconds: ttlSeconds,
+			RoomID:     roomID,
+		})
+		if err != nil {
+			return err
+		}
+
+		ev, err := tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+			RoomID:    roomID,
+			EventType: "room.created",
+			SenderID:  &agentID,
+		})
+		if err != nil {
+			return err
+		}
+		emitted = append(emitted, ev)
+		if err := s.enqueueWebhookOutboxForEvent(ctx, tx, rm, ev, agentID); err != nil {
+			return err
+		}
+
+		ev, err = tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+			RoomID:    roomID,
+			EventType: "room.joined",
+			SenderID:  &agentID,
+		})
+		if err != nil {
+			return err
+		}
+		emitted = append(emitted, ev)
+		if err := s.enqueueWebhookOutboxForEvent(ctx, tx, rm, ev, agentID); err != nil {
+			return err
+		}
+
+		result = CreateListingResult{
+			Listing:     item,
+			RoomID:      roomID,
+			HumanCode:   humanCode,
+			OwnerJoined: true,
+			RoomState:   rm.State,
+			NextActorID: rm.AgentAID,
+		}
+		return nil
 	})
+	if err != nil {
+		return CreateListingResult{}, err
+	}
+
+	s.publishRoomEvents(emitted)
+	s.syncRoomContextBestEffort(ctx, createdRoom, "create_listing", 0)
+	return result, nil
 }
 
 func (s *Service) SearchListings(ctx context.Context, query string) ([]repository.Listing, error) {
@@ -214,9 +453,9 @@ func (s *Service) SearchListings(ctx context.Context, query string) ([]repositor
 }
 
 func (s *Service) ConnectListing(ctx context.Context, agentID, listingID string) (ConnectResult, error) {
-	humanCode := "hc_" + randomToken(18)
-	now := s.now()
 	res := ConnectResult{}
+	var updatedRoom repository.Room
+	var emitted []repository.RoomEvent
 
 	err := s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
 		l, err := tx.GetListing(ctx, listingID)
@@ -239,41 +478,120 @@ func (s *Service) ConnectListing(ctx context.Context, agentID, listingID string)
 			return err
 		}
 
-		rm, err := tx.CreateRoom(ctx, repository.CreateRoomInput{
-			ID:            newID("room"),
-			AgentAID:      l.AgentID,
-			AgentBID:      agentID,
-			State:         domain.RoomStateOpen,
-			TurnIndex:     0,
-			MaxTurns:      l.MaxTurns,
-			TTLAt:         now.Add(time.Duration(l.TTLSeconds) * time.Second),
-			HumanCodeHash: hashText(humanCode),
+		if strings.TrimSpace(l.RoomID) == "" {
+			humanCode := "hc_" + randomToken(18)
+			now := s.now()
+			active := domain.RoomStateActive
+			rm, err := tx.CreateRoom(ctx, repository.CreateRoomInput{
+				ID:            newID("room"),
+				AgentAID:      l.AgentID,
+				AgentBID:      agentID,
+				State:         active,
+				TurnIndex:     0,
+				MaxTurns:      l.MaxTurns,
+				TTLAt:         now.Add(time.Duration(l.TTLSeconds) * time.Second),
+				HumanCodeHash: hashText(humanCode),
+			})
+			if err != nil {
+				return err
+			}
+			ev, err := tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+				RoomID:    rm.ID,
+				EventType: "room.joined",
+				SenderID:  &agentID,
+			})
+			if err != nil {
+				return err
+			}
+			emitted = append(emitted, ev)
+			if err := s.enqueueWebhookOutboxForEvent(ctx, tx, rm, ev, agentID); err != nil {
+				return err
+			}
+			ev, err = tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+				RoomID:    rm.ID,
+				EventType: "room.state_changed",
+				SenderID:  &agentID,
+			})
+			if err != nil {
+				return err
+			}
+			emitted = append(emitted, ev)
+			updatedRoom = rm
+			res = ConnectResult{
+				RoomID:      rm.ID,
+				HumanCode:   humanCode,
+				AgentAID:    rm.AgentAID,
+				AgentBID:    rm.AgentBID,
+				RoomState:   rm.State,
+				ListingID:   l.ID,
+				NextTurnA:   rm.AgentAID,
+				NextActorID: rm.AgentAID,
+			}
+			return nil
+		}
+
+		rm, err := tx.GetRoom(ctx, l.RoomID)
+		if err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if strings.TrimSpace(rm.AgentBID) != "" {
+			return ErrConflict
+		}
+		nextState := domain.RoomStateActive
+		rm, err = tx.UpdateRoom(ctx, repository.UpdateRoomInput{
+			ID:       rm.ID,
+			AgentBID: &agentID,
+			State:    &nextState,
 		})
 		if err != nil {
 			return err
 		}
+		updatedRoom = rm
+
+		ev, err := tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+			RoomID:    rm.ID,
+			EventType: "room.joined",
+			SenderID:  &agentID,
+		})
+		if err != nil {
+			return err
+		}
+		emitted = append(emitted, ev)
+		if err := s.enqueueWebhookOutboxForEvent(ctx, tx, rm, ev, agentID); err != nil {
+			return err
+		}
+
+		ev, err = tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
+			RoomID:    rm.ID,
+			EventType: "room.state_changed",
+			SenderID:  &agentID,
+		})
+		if err != nil {
+			return err
+		}
+		emitted = append(emitted, ev)
 
 		res = ConnectResult{
-			RoomID:    rm.ID,
-			HumanCode: humanCode,
-			AgentAID:  rm.AgentAID,
-			AgentBID:  rm.AgentBID,
-			RoomState: rm.State,
-			ListingID: l.ID,
-			NextTurnA: rm.AgentAID,
+			RoomID:      rm.ID,
+			HumanCode:   "",
+			AgentAID:    rm.AgentAID,
+			AgentBID:    rm.AgentBID,
+			RoomState:   rm.State,
+			ListingID:   l.ID,
+			NextTurnA:   rm.AgentAID,
+			NextActorID: rm.AgentAID,
 		}
 		return nil
 	})
 	if err != nil {
 		return ConnectResult{}, err
 	}
-	createdRoom, err := s.store.GetRoom(ctx, res.RoomID)
-	if err != nil {
-		return ConnectResult{}, err
-	}
-	if err := s.upsertRoomContext(ctx, createdRoom, ""); err != nil {
-		return ConnectResult{}, err
-	}
+
+	s.publishRoomEvents(emitted)
+	s.syncRoomContextBestEffort(ctx, updatedRoom, "connect_listing", 0)
 	return res, nil
 }
 
@@ -302,10 +620,7 @@ func (s *Service) JoinRoom(ctx context.Context, agentID, roomID string) (domain.
 		s.joined[roomID] = map[string]bool{}
 	}
 	s.joined[roomID][agentID] = true
-	joined := map[string]bool{
-		rm.AgentAID: s.joined[roomID][rm.AgentAID],
-		rm.AgentBID: s.joined[roomID][rm.AgentBID],
-	}
+	joined := buildJoinedMap(rm, s.joined[roomID])
 	if joined[rm.AgentAID] && joined[rm.AgentBID] && rm.State == domain.RoomStateOpen {
 		next := domain.RoomStateActive
 		var updatedRoom repository.Room
@@ -335,12 +650,20 @@ func (s *Service) JoinRoom(ctx context.Context, agentID, roomID string) (domain.
 		}
 		s.publishRoomEvents(emitted)
 		if err := s.upsertRoomContext(ctx, updatedRoom, ""); err != nil {
-			return "", nil, err
+			s.appendAuditEventBestEffort(ctx, updatedRoom.ID, "room_context_sync_failed", map[string]any{
+				"room_id": rm.ID,
+				"reason":  err.Error(),
+				"source":  "join_room_activate",
+			}, 0)
 		}
 		return next, joined, nil
 	}
 	if err := s.upsertRoomContext(ctx, rm, ""); err != nil {
-		return "", nil, err
+		s.appendAuditEventBestEffort(ctx, rm.ID, "room_context_sync_failed", map[string]any{
+			"room_id": rm.ID,
+			"reason":  err.Error(),
+			"source":  "join_room",
+		}, 0)
 	}
 	return rm.State, joined, nil
 }
@@ -409,6 +732,9 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 	}
 	if rm.State == domain.RoomStateClosed || rm.State == domain.RoomStatePurged {
 		return SendMessageResult{}, ErrGone
+	}
+	if rm.State != domain.RoomStateActive {
+		return SendMessageResult{}, ErrRoomNotActive
 	}
 	if s.now().After(rm.TTLAt) {
 		return SendMessageResult{}, ErrGone
@@ -530,8 +856,14 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 			return txErr
 		}
 		emitted = append(emitted, ev)
+		if err := s.enqueueWebhookOutboxForEvent(ctx, tx, updatedRoom, ev, agentID); err != nil {
+			return err
+		}
 
 		if nextState == domain.RoomStateClosed {
+			if err := revokeRoomScopedTokensForRoom(ctx, tx, updatedRoom, s.now()); err != nil {
+				return err
+			}
 			ev, txErr = tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
 				RoomID:    rm.ID,
 				EventType: "room.state_changed",
@@ -550,6 +882,9 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 				return txErr
 			}
 			emitted = append(emitted, ev)
+			if err := s.enqueueWebhookOutboxForEvent(ctx, tx, updatedRoom, ev, agentID); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -732,9 +1067,9 @@ func (s *Service) ListRoomEventHistory(ctx context.Context, agentID, roomID stri
 	}
 
 	s.mu.Lock()
-	joined := s.joined[roomID] != nil && s.joined[roomID][agentID]
+	joined := s.joined[roomID]
 	s.mu.Unlock()
-	if !joined {
+	if !roomParticipantJoined(rm, agentID, joined) {
 		return RoomEventHistoryResult{}, ErrForbidden
 	}
 
@@ -834,6 +1169,9 @@ func (s *Service) CloseRoom(ctx context.Context, agentID, roomID string) (reposi
 		if txErr != nil {
 			return txErr
 		}
+		if err := revokeRoomScopedTokensForRoom(ctx, tx, room, now); err != nil {
+			return err
+		}
 		ev, txErr := tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
 			RoomID:    roomID,
 			EventType: "room.state_changed",
@@ -852,6 +1190,9 @@ func (s *Service) CloseRoom(ctx context.Context, agentID, roomID string) (reposi
 			return txErr
 		}
 		emitted = append(emitted, ev)
+		if err := s.enqueueWebhookOutboxForEvent(ctx, tx, room, ev, agentID); err != nil {
+			return err
+		}
 		updatedRoom = room
 		return nil
 	})
@@ -860,7 +1201,12 @@ func (s *Service) CloseRoom(ctx context.Context, agentID, roomID string) (reposi
 	}
 	s.publishRoomEvents(emitted)
 	if err := s.upsertRoomContext(ctx, updatedRoom, agentID); err != nil {
-		return repository.Room{}, err
+		s.appendAuditEventBestEffort(ctx, updatedRoom.ID, "room_context_sync_failed", map[string]any{
+			"room_id":  updatedRoom.ID,
+			"agent_id": agentID,
+			"reason":   err.Error(),
+			"source":   "close_room",
+		}, 0)
 	}
 	return updatedRoom, nil
 }
@@ -1035,6 +1381,9 @@ func (s *Service) reconcileRoomLocked(ctx context.Context, rm repository.Room) (
 				if txErr != nil {
 					return txErr
 				}
+				if err := revokeRoomScopedTokensForRoom(ctx, tx, updated, now); err != nil {
+					return err
+				}
 				ev, txErr := tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
 					RoomID:    rm.ID,
 					EventType: "room.state_changed",
@@ -1051,6 +1400,9 @@ func (s *Service) reconcileRoomLocked(ctx context.Context, rm repository.Room) (
 					return txErr
 				}
 				emitted = append(emitted, ev)
+				if err := s.enqueueWebhookOutboxForEvent(ctx, tx, updated, ev, ""); err != nil {
+					return err
+				}
 				return nil
 			})
 			if err != nil {
@@ -1103,6 +1455,9 @@ func (s *Service) reconcileRoomLocked(ctx context.Context, rm repository.Room) (
 				if txErr := tx.PurgeRoomContent(ctx, rm.ID, now); txErr != nil {
 					return txErr
 				}
+				if err := revokeRoomScopedTokensForRoom(ctx, tx, rm, now); err != nil {
+					return err
+				}
 				ev, txErr := tx.AppendRoomEvent(ctx, repository.AppendRoomEventInput{
 					RoomID:    rm.ID,
 					EventType: "room.state_changed",
@@ -1121,7 +1476,13 @@ func (s *Service) reconcileRoomLocked(ctx context.Context, rm repository.Room) (
 				emitted = append(emitted, ev)
 				var getErr error
 				purgedRoom, getErr = tx.GetRoom(ctx, rm.ID)
-				return getErr
+				if getErr != nil {
+					return getErr
+				}
+				if err := s.enqueueWebhookOutboxForEvent(ctx, tx, purgedRoom, ev, ""); err != nil {
+					return err
+				}
+				return nil
 			})
 			if err != nil {
 				return repository.Room{}, err
@@ -1221,6 +1582,31 @@ func hashText(in string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func buildJoinedMap(rm repository.Room, joined map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	if strings.TrimSpace(rm.AgentAID) != "" {
+		out[rm.AgentAID] = roomParticipantJoined(rm, rm.AgentAID, joined)
+	}
+	if strings.TrimSpace(rm.AgentBID) != "" {
+		out[rm.AgentBID] = roomParticipantJoined(rm, rm.AgentBID, joined)
+	}
+	return out
+}
+
+func roomParticipantJoined(rm repository.Room, agentID string, joined map[string]bool) bool {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return false
+	}
+	if joined != nil && joined[agentID] {
+		return true
+	}
+	if strings.TrimSpace(rm.AgentBID) == "" {
+		return rm.State == domain.RoomStateOpen && agentID == rm.AgentAID
+	}
+	return rm.State == domain.RoomStateActive && (agentID == rm.AgentAID || agentID == rm.AgentBID)
+}
+
 func nextActorIDForRoom(rm repository.Room) string {
 	if rm.State != domain.RoomStateOpen && rm.State != domain.RoomStateActive {
 		return ""
@@ -1229,6 +1615,61 @@ func nextActorIDForRoom(rm repository.Room) string {
 		return rm.AgentAID
 	}
 	return rm.AgentBID
+}
+
+func roomScopedTokenAllows(scope, action string) bool {
+	switch strings.TrimSpace(scope) {
+	case roomScopeAutomation:
+		return true
+	case roomScopeReadOnly:
+		switch strings.TrimSpace(action) {
+		case "room:state", "room:context":
+			return true
+		}
+	}
+	return false
+}
+
+func revokeRoomScopedTokensForRoom(ctx context.Context, tx repository.TxStore, rm repository.Room, revokedAt time.Time) error {
+	agentIDs := []string{strings.TrimSpace(rm.AgentAID), strings.TrimSpace(rm.AgentBID)}
+	for _, agentID := range agentIDs {
+		if agentID == "" {
+			continue
+		}
+		if err := tx.RevokeRoomScopedTokens(ctx, rm.ID, agentID, revokedAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func normalizeWebhookEndpointURL(raw string) (string, error) {
+	parsed, err := neturl.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", err
+	}
+	if parsed == nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", errors.New("missing scheme or host")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("user info, query, and fragment are not allowed")
+	}
+	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	host := strings.TrimSpace(parsed.Hostname())
+	switch scheme {
+	case "https":
+	case "http":
+		if host != "localhost" {
+			ip := net.ParseIP(host)
+			if ip == nil || !ip.IsLoopback() {
+				return "", errors.New("http webhooks are only allowed on loopback hosts")
+			}
+		}
+	default:
+		return "", errors.New("unsupported scheme")
+	}
+	parsed.Scheme = scheme
+	return parsed.String(), nil
 }
 
 func (s *Service) roomContextFromRoom(rm repository.Room, lastActorID string) roomContextPayload {
@@ -1296,6 +1737,126 @@ func (s *Service) upsertRoomContext(ctx context.Context, rm repository.Room, las
 		Version: version,
 	})
 	return err
+}
+
+func (s *Service) syncRoomContextBestEffort(ctx context.Context, rm repository.Room, source string, recentCount int) {
+	if err := s.upsertRoomContext(ctx, rm, ""); err != nil {
+		s.appendAuditEventBestEffort(ctx, rm.ID, "room_context_sync_failed", map[string]any{
+			"room_id": rm.ID,
+			"reason":  err.Error(),
+			"source":  source,
+		}, recentCount)
+	}
+}
+
+func (s *Service) enqueueWebhookOutboxForEvent(ctx context.Context, tx repository.TxStore, rm repository.Room, event repository.RoomEvent, actorID string) error {
+	if !supportsWebhookOutbox(event.EventType) {
+		return nil
+	}
+
+	targetAgentIDs := webhookTargetAgentIDs(rm, actorID)
+	if len(targetAgentIDs) == 0 {
+		return nil
+	}
+
+	payloadReason := webhookEventReason(event.EventType)
+	nextActorID := nextActorIDForRoom(rm)
+	nextTurn := rm.TurnIndex
+	attemptAt := s.now()
+
+	for _, targetAgentID := range targetAgentIDs {
+		endpoints, err := tx.ListAgentWebhookEndpoints(ctx, targetAgentID)
+		if err != nil {
+			return err
+		}
+		if len(endpoints) == 0 {
+			continue
+		}
+
+		payload := map[string]any{
+			"event_id":        event.ID,
+			"type":            event.EventType,
+			"room_id":         rm.ID,
+			"target_agent_id": targetAgentID,
+			"room_state":      string(rm.State),
+			"next_turn":       nextTurn,
+			"reason":          payloadReason,
+			"occurred_at":     event.CreatedAt.Format(time.RFC3339Nano),
+		}
+		if nextActorID != "" {
+			payload["next_actor_id"] = nextActorID
+		}
+		if otherAgentID := otherAgentIDForWebhook(rm, targetAgentID); otherAgentID != "" {
+			payload["other_agent_id"] = otherAgentID
+		}
+
+		for _, endpoint := range endpoints {
+			if !endpoint.Enabled {
+				continue
+			}
+			payload["delivery_id"] = newID("whd")
+			rawPayload, err := json.Marshal(payload)
+			if err != nil {
+				return fmt.Errorf("marshal webhook outbox payload: %w", err)
+			}
+			if _, err := tx.CreateWebhookOutbox(ctx, repository.CreateWebhookOutboxInput{
+				RoomID:        rm.ID,
+				RoomEventID:   event.ID,
+				TargetAgentID: targetAgentID,
+				EndpointID:    endpoint.ID,
+				EventType:     event.EventType,
+				Payload:       rawPayload,
+				Status:        "pending",
+				NextAttemptAt: attemptAt,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func supportsWebhookOutbox(eventType string) bool {
+	switch eventType {
+	case "room.joined", "message.created", "room.closed", "room.purged":
+		return true
+	default:
+		return false
+	}
+}
+
+func webhookEventReason(eventType string) string {
+	return strings.ReplaceAll(strings.TrimSpace(eventType), ".", "_")
+}
+
+func webhookTargetAgentIDs(rm repository.Room, actorID string) []string {
+	actorID = strings.TrimSpace(actorID)
+	candidates := []string{strings.TrimSpace(rm.AgentAID), strings.TrimSpace(rm.AgentBID)}
+	seen := make(map[string]bool, len(candidates))
+	out := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate == "" || candidate == actorID || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func otherAgentIDForWebhook(rm repository.Room, targetAgentID string) string {
+	targetAgentID = strings.TrimSpace(targetAgentID)
+	if targetAgentID == "" {
+		return ""
+	}
+	if targetAgentID == strings.TrimSpace(rm.AgentAID) {
+		return strings.TrimSpace(rm.AgentBID)
+	}
+	if targetAgentID == strings.TrimSpace(rm.AgentBID) {
+		return strings.TrimSpace(rm.AgentAID)
+	}
+	return ""
 }
 
 func selectRecentMemory(messages []repository.Message) []recentMemoryEntry {

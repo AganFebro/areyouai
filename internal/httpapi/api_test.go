@@ -54,6 +54,19 @@ func mustString(t *testing.T, m map[string]any, key string) string {
 	return s
 }
 
+func mustPayloadString(t *testing.T, m map[string]any, key string) string {
+	t.Helper()
+	v, ok := m[key]
+	if !ok {
+		t.Fatalf("missing payload key: %s", key)
+	}
+	s, ok := v.(string)
+	if !ok || s == "" {
+		t.Fatalf("payload key %s is not non-empty string", key)
+	}
+	return s
+}
+
 func TestListingConnectAndSequentialMessagingFlow(t *testing.T) {
 	t.Parallel()
 
@@ -94,13 +107,30 @@ func TestListingConnectAndSequentialMessagingFlow(t *testing.T) {
 		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
 	}
 	listingID := mustString(t, body, "id")
+	roomID := mustString(t, body, "room_id")
+	humanCode := mustString(t, body, "human_code")
+	if got, _ := body["owner_joined"].(bool); !got {
+		t.Fatalf("owner_joined=%v body=%v", body["owner_joined"], body)
+	}
+	if got, _ := body["room_state"].(string); got != string("OPEN") {
+		t.Fatalf("create listing room_state=%v body=%v", body["room_state"], body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 0,
+		"ciphertext":    "before-connect",
+	}, tokenA)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("message before connect status=%d body=%v", resp.StatusCode, body)
+	}
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
 	}
-	roomID := mustString(t, body, "room_id")
-	humanCode := mustString(t, body, "human_code")
+	if got, _ := body["room_state"].(string); got != string("ACTIVE") {
+		t.Fatalf("connect room_state=%v body=%v", body["room_state"], body)
+	}
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/join", nil, tokenA)
 	if resp.StatusCode != http.StatusOK {
@@ -199,6 +229,43 @@ func TestModeEndpointInMemory(t *testing.T) {
 	}
 }
 
+func TestRoomLeaveEndpointUnsupported(t *testing.T) {
+	t.Parallel()
+
+	ts := httptest.NewServer(NewRouter())
+	defer ts.Close()
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "agent-a"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register status=%d body=%v", resp.StatusCode, body)
+	}
+	apiKey := mustString(t, body, "api_key")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiKey}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login status=%d body=%v", resp.StatusCode, body)
+	}
+	token := mustString(t, body, "session_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "leave-test",
+		"max_turns":   4,
+		"ttl_seconds": 300,
+	}, token)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	roomID := mustString(t, body, "room_id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/leave", nil, token)
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("leave status=%d body=%v", resp.StatusCode, body)
+	}
+	if got, _ := body["error"].(string); got != "endpoint_not_supported" {
+		t.Fatalf("leave error=%v body=%v", body["error"], body)
+	}
+}
+
 func TestAuthRequiredForListingCreate(t *testing.T) {
 	t.Parallel()
 
@@ -235,13 +302,13 @@ func TestViewerJoinHeartbeatLeave(t *testing.T) {
 		"ttl_seconds": 300,
 	}, tokenA)
 	listingID := mustString(t, body, "id")
+	humanCode := mustString(t, body, "human_code")
 
 	resp, body := doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
 	}
 	roomID := mustString(t, body, "room_id")
-	humanCode := mustString(t, body, "human_code")
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/viewers", map[string]any{
 		"op":         "join",

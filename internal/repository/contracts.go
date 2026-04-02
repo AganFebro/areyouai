@@ -49,6 +49,17 @@ type Store interface {
 	AppendRoomEvent(ctx context.Context, in AppendRoomEventInput) (RoomEvent, error)
 	GetRoomEvent(ctx context.Context, eventID int64) (RoomEvent, error)
 	ListRoomEvents(ctx context.Context, in ListRoomEventsInput) ([]RoomEvent, error)
+	CreateAgentWebhookEndpoint(ctx context.Context, in CreateAgentWebhookEndpointInput) (AgentWebhookEndpoint, error)
+	ListAgentWebhookEndpoints(ctx context.Context, agentID string) ([]AgentWebhookEndpoint, error)
+	DeleteAgentWebhookEndpoint(ctx context.Context, agentID, endpointID string) error
+	CreateWebhookOutbox(ctx context.Context, in CreateWebhookOutboxInput) (WebhookOutboxItem, error)
+	ClaimPendingWebhookDeliveries(ctx context.Context, now, reclaimBefore time.Time, limit int) ([]ClaimedWebhookDelivery, error)
+	MarkWebhookOutboxDelivered(ctx context.Context, id int64) error
+	MarkWebhookOutboxPendingRetry(ctx context.Context, id int64, nextAttemptAt time.Time, lastError string) error
+	MarkWebhookOutboxDeadLetter(ctx context.Context, id int64, lastError string) error
+	CreateRoomScopedToken(ctx context.Context, in CreateRoomScopedTokenInput) (RoomScopedToken, error)
+	FindRoomScopedTokenByHash(ctx context.Context, tokenHash string) (RoomScopedToken, error)
+	RevokeRoomScopedTokens(ctx context.Context, roomID, agentID string, revokedAt time.Time) error
 	PurgeRoomContent(ctx context.Context, roomID string, purgedAt time.Time) error
 
 	GetAdminOverview(ctx context.Context, now time.Time) (AdminOverview, error)
@@ -57,6 +68,7 @@ type Store interface {
 }
 
 type TxStore interface {
+	CreateListing(ctx context.Context, in CreateListingInput) (Listing, error)
 	GetListing(ctx context.Context, listingID string) (Listing, error)
 	MarkListingConnected(ctx context.Context, listingID string) error
 	CreateRoom(ctx context.Context, in CreateRoomInput) (Room, error)
@@ -65,6 +77,10 @@ type TxStore interface {
 	AppendMessage(ctx context.Context, in AppendMessageInput) (Message, error)
 	PurgeRoomContent(ctx context.Context, roomID string, purgedAt time.Time) error
 	AppendRoomEvent(ctx context.Context, in AppendRoomEventInput) (RoomEvent, error)
+	ListAgentWebhookEndpoints(ctx context.Context, agentID string) ([]AgentWebhookEndpoint, error)
+	CreateWebhookOutbox(ctx context.Context, in CreateWebhookOutboxInput) (WebhookOutboxItem, error)
+	CreateRoomScopedToken(ctx context.Context, in CreateRoomScopedTokenInput) (RoomScopedToken, error)
+	RevokeRoomScopedTokens(ctx context.Context, roomID, agentID string, revokedAt time.Time) error
 }
 
 type Agent struct {
@@ -90,6 +106,7 @@ type Listing struct {
 	TTLSeconds int       `json:"ttl_seconds"`
 	Connected  bool      `json:"connected"`
 	CreatedAt  time.Time `json:"created_at"`
+	RoomID     string    `json:"-"`
 }
 
 type Room struct {
@@ -193,6 +210,52 @@ type RoomEvent struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+type AgentWebhookEndpoint struct {
+	ID               string    `json:"id"`
+	AgentID          string    `json:"agent_id"`
+	URL              string    `json:"url"`
+	SecretCiphertext string    `json:"-"`
+	KeyID            string    `json:"key_id"`
+	Enabled          bool      `json:"enabled"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type WebhookOutboxItem struct {
+	ID            int64           `json:"id"`
+	RoomID        string          `json:"room_id"`
+	RoomEventID   int64           `json:"room_event_id"`
+	TargetAgentID string          `json:"target_agent_id"`
+	EndpointID    string          `json:"endpoint_id"`
+	EventType     string          `json:"event_type"`
+	Payload       json.RawMessage `json:"payload"`
+	Status        string          `json:"status"`
+	AttemptCount  int             `json:"attempt_count"`
+	NextAttemptAt time.Time       `json:"next_attempt_at"`
+	LastError     string          `json:"last_error"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+}
+
+type ClaimedWebhookDelivery struct {
+	WebhookOutboxItem
+	EndpointURL              string `json:"endpoint_url"`
+	EndpointSecretCiphertext string `json:"-"`
+	EndpointKeyID            string `json:"endpoint_key_id"`
+	EndpointEnabled          bool   `json:"endpoint_enabled"`
+}
+
+type RoomScopedToken struct {
+	ID        string     `json:"id"`
+	RoomID    string     `json:"room_id"`
+	AgentID   string     `json:"agent_id"`
+	TokenHash string     `json:"-"`
+	Scope     string     `json:"scope"`
+	ExpiresAt time.Time  `json:"expires_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+}
+
 type CreateAgentInput struct {
 	ID         string
 	Name       string
@@ -212,6 +275,7 @@ type CreateListingInput struct {
 	Tags       []string
 	MaxTurns   int
 	TTLSeconds int
+	RoomID     string
 }
 
 type CreateRoomInput struct {
@@ -227,6 +291,7 @@ type CreateRoomInput struct {
 
 type UpdateRoomInput struct {
 	ID        string
+	AgentBID  *string
 	State     *domain.RoomState
 	TurnIndex *int
 	ClosedAt  *time.Time
@@ -289,4 +354,35 @@ type UpsertRoomContextInput struct {
 	RoomID  string
 	Context json.RawMessage
 	Version int
+}
+
+type CreateAgentWebhookEndpointInput struct {
+	ID               string
+	AgentID          string
+	URL              string
+	SecretCiphertext string
+	KeyID            string
+	Enabled          bool
+}
+
+type CreateWebhookOutboxInput struct {
+	RoomID        string
+	RoomEventID   int64
+	TargetAgentID string
+	EndpointID    string
+	EventType     string
+	Payload       json.RawMessage
+	Status        string
+	AttemptCount  int
+	NextAttemptAt time.Time
+	LastError     string
+}
+
+type CreateRoomScopedTokenInput struct {
+	ID        string
+	RoomID    string
+	AgentID   string
+	TokenHash string
+	Scope     string
+	ExpiresAt time.Time
 }
