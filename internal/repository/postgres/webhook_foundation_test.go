@@ -192,6 +192,48 @@ func TestWebhookOutboxAndRoomScopedTokensPersist(t *testing.T) {
 	}
 }
 
+func TestAgentStreamDeliveriesAndRecoverableRooms(t *testing.T) {
+	db := openTestPostgresDB(t)
+	defer db.Close()
+	applyStoreMigrationsForTest(t, db)
+
+	store := NewStore(db)
+	ctx := context.Background()
+	roomID := seedRoomForEvents(t, ctx, store)
+
+	now := time.Now().UTC()
+	payload := json.RawMessage(`{"type":"room.turn_ready","room_id":"room_events_test","next_turn":0}`)
+	delivery, err := store.CreateAgentStreamDelivery(ctx, repository.CreateAgentStreamDeliveryInput{
+		DeliveryID: "dly_store_1",
+		AgentID:    "agt_a",
+		RoomID:     roomID,
+		Type:       "room.turn_ready",
+		Reason:     "room_activated",
+		Payload:    payload,
+		ExpiresAt:  now.Add(30 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("create agent stream delivery: %v", err)
+	}
+	if delivery.Seq == 0 {
+		t.Fatalf("delivery seq=%d want>0", delivery.Seq)
+	}
+	if string(delivery.Payload) != string(payload) {
+		t.Fatalf("delivery payload=%s want=%s", string(delivery.Payload), string(payload))
+	}
+
+	rooms, err := store.ListRecoverableRoomsForAgent(ctx, "agt_a", now.Add(-5*time.Minute))
+	if err != nil {
+		t.Fatalf("list recoverable rooms: %v", err)
+	}
+	if len(rooms) != 1 {
+		t.Fatalf("recoverable rooms len=%d want=1", len(rooms))
+	}
+	if rooms[0].ID != roomID {
+		t.Fatalf("recoverable room id=%s want=%s", rooms[0].ID, roomID)
+	}
+}
+
 func TestWebhookOutboxClaimLifecycle(t *testing.T) {
 	db := openTestPostgresDB(t)
 	defer db.Close()

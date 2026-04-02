@@ -101,6 +101,10 @@ type agentWebhookEndpointRequest struct {
 	Enabled *bool  `json:"enabled,omitempty"`
 }
 
+type agentStreamAckRequest struct {
+	DeliveryID string `json:"delivery_id"`
+}
+
 func (s *sqlHTTP) handleAgentWebhooks(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/v1/agent/webhooks" {
 		writeError(w, http.StatusNotFound, "not found")
@@ -163,6 +167,154 @@ func (s *sqlHTTP) handleAgentWebhookByID(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *sqlHTTP) handleAgentStream(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/agent/stream" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	agentID, err := s.authAgentID(r.Context(), r)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	cursor := parseAgentStreamCursor(r)
+	resume, err := s.svc.ResolveAgentStreamResume(r.Context(), agentID, cursor)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "stream unsupported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.WriteString(w, "retry: 3000\n\n"); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	hello := map[string]any{
+		"type":                          "stream.hello",
+		"agent_id":                      agentID,
+		"resume_status":                 resume.ResumeStatus,
+		"last_acknowledged_delivery_id": resume.LastAcknowledgedDelivery,
+		"server_time":                   time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := writeAgentStreamControlEvent(w, flusher, "stream.hello", hello); err != nil {
+		return
+	}
+	if resume.ResumeStatus == "replay_required" {
+		_ = writeAgentStreamControlEvent(w, flusher, "stream.replay_required", map[string]any{
+			"type":     "stream.replay_required",
+			"agent_id": agentID,
+			"hint":     "Call /v1/agent/actionable-rooms, clear the local cursor, and reconnect without Last-Event-ID.",
+		})
+		return
+	}
+
+	lastSentSeq := resume.AfterSeq
+	if nextSeq, writeErr := s.writePendingAgentStreamBatch(r.Context(), w, flusher, agentID, lastSentSeq, 100); writeErr != nil {
+		return
+	} else {
+		lastSentSeq = nextSeq
+	}
+
+	queryTicker := time.NewTicker(1 * time.Second)
+	keepAliveTicker := time.NewTicker(20 * time.Second)
+	reauthTicker := time.NewTicker(30 * time.Second)
+	defer queryTicker.Stop()
+	defer keepAliveTicker.Stop()
+	defer reauthTicker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-queryTicker.C:
+			nextSeq, writeErr := s.writePendingAgentStreamBatch(r.Context(), w, flusher, agentID, lastSentSeq, 100)
+			if writeErr != nil {
+				return
+			}
+			lastSentSeq = nextSeq
+		case <-reauthTicker.C:
+			if _, authErr := s.authAgentID(r.Context(), r); authErr != nil {
+				_ = writeAgentStreamControlEvent(w, flusher, "auth.relogin_required", map[string]any{
+					"type":     "auth.relogin_required",
+					"agent_id": agentID,
+				})
+				return
+			}
+		case <-keepAliveTicker.C:
+			if _, writeErr := io.WriteString(w, ": keepalive\n\n"); writeErr != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *sqlHTTP) handleAgentStreamAck(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/agent/stream/ack" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	agentID, err := s.authAgentID(r.Context(), r)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	var req agentStreamAckRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if err := s.svc.AckAgentStreamDelivery(r.Context(), agentID, req.DeliveryID); err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"delivery_id": strings.TrimSpace(req.DeliveryID),
+		"status":      "acked",
+	})
+}
+
+func (s *sqlHTTP) handleAgentActionableRooms(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/agent/actionable-rooms" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	agentID, err := s.authAgentID(r.Context(), r)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	out, err := s.svc.ActionableRooms(r.Context(), agentID)
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *sqlHTTP) handleListings(w http.ResponseWriter, r *http.Request) {
@@ -905,6 +1057,13 @@ func parseEventStreamQuery(r *http.Request) (int64, int, error) {
 	return v, limit, nil
 }
 
+func parseAgentStreamCursor(r *http.Request) string {
+	if raw := strings.TrimSpace(r.URL.Query().Get("last_delivery_id")); raw != "" {
+		return raw
+	}
+	return strings.TrimSpace(r.Header.Get("Last-Event-ID"))
+}
+
 func parseEventHistoryQuery(r *http.Request) (int64, int, error) {
 	since := int64(0)
 	if raw := strings.TrimSpace(r.URL.Query().Get("since")); raw != "" {
@@ -970,6 +1129,81 @@ func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, item repository.
 	}
 	flusher.Flush()
 	return nil
+}
+
+func writeAgentStreamControlEvent(w http.ResponseWriter, flusher http.Flusher, eventType string, payload map[string]any) error {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("event: %s\n", strings.TrimSpace(eventType))); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "data: "); err != nil {
+		return err
+	}
+	if _, err := w.Write(raw); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "\n\n"); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func writeAgentStreamDeliveryEvent(w http.ResponseWriter, flusher http.Flusher, item repository.AgentStreamDelivery) error {
+	payload := agentStreamDeliveryPayload(item)
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("id: %s\n", item.DeliveryID)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("event: %s\n", item.Type)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "data: "); err != nil {
+		return err
+	}
+	if _, err := w.Write(raw); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "\n\n"); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func agentStreamDeliveryPayload(item repository.AgentStreamDelivery) map[string]any {
+	out := map[string]any{}
+	if len(item.Payload) > 0 {
+		_ = json.Unmarshal(item.Payload, &out)
+	}
+	out["delivery_id"] = item.DeliveryID
+	out["type"] = item.Type
+	out["agent_id"] = item.AgentID
+	out["room_id"] = item.RoomID
+	out["created_at"] = item.CreatedAt
+	out["expires_at"] = item.ExpiresAt
+	return out
+}
+
+func (s *sqlHTTP) writePendingAgentStreamBatch(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, agentID string, afterSeq int64, limit int) (int64, error) {
+	items, err := s.svc.ListPendingAgentStreamDeliveries(ctx, agentID, afterSeq, limit)
+	if err != nil {
+		return afterSeq, err
+	}
+	lastSeq := afterSeq
+	for _, item := range items {
+		if err := writeAgentStreamDeliveryEvent(w, flusher, item); err != nil {
+			return lastSeq, err
+		}
+		lastSeq = item.Seq
+	}
+	return lastSeq, nil
 }
 
 func (s *sqlHTTP) authAgentID(ctx context.Context, r *http.Request) (string, error) {

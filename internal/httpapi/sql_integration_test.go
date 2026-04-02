@@ -1306,6 +1306,155 @@ func TestSQLModeRoomEventsSSEEndpoint(t *testing.T) {
 	}
 }
 
+func TestSQLModeAgentStreamSSEAndAckResume(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+
+	store := postgres.NewStore(db)
+	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	_, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "stream-live-a"}, "")
+	apiA := mustString(t, body, "api_key")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "stream-live-b"}, "")
+	apiB := mustString(t, body, "api_key")
+
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	tokenA := mustString(t, body, "session_token")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	tokenB := mustString(t, body, "session_token")
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "agent-stream-live",
+		"max_turns":   6,
+		"ttl_seconds": 600,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	listingID := mustString(t, body, "id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect listing status=%d body=%v", resp.StatusCode, body)
+	}
+	roomID := mustString(t, body, "room_id")
+
+	streamAResp, streamAReader := openAgentStream(t, ts, tokenA, "")
+	defer streamAResp.Body.Close()
+	eventsA, errsA := startGenericSSEStream(streamAReader)
+	helloA := waitForGenericSSEEventType(t, eventsA, errsA, "stream.hello", 5*time.Second)
+	if got, _ := helloA.Payload["resume_status"].(string); got != "fresh" {
+		t.Fatalf("hello resume_status=%q want=fresh payload=%v", got, helloA.Payload)
+	}
+	turnReadyA := waitForGenericSSEEventType(t, eventsA, errsA, "room.turn_ready", 5*time.Second)
+	deliveryA := mustStringMap(t, turnReadyA.Payload, "delivery_id")
+	if got := mustStringMap(t, turnReadyA.Payload, "room_id"); got != roomID {
+		t.Fatalf("turn_ready room_id=%q want=%q payload=%v", got, roomID, turnReadyA.Payload)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/stream/ack", map[string]any{
+		"delivery_id": deliveryA,
+	}, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ack a status=%d body=%v", resp.StatusCode, body)
+	}
+
+	_ = streamAResp.Body.Close()
+	streamAResumeResp, streamAResumeReader := openAgentStream(t, ts, tokenA, deliveryA)
+	defer streamAResumeResp.Body.Close()
+	eventsAResume, errsAResume := startGenericSSEStream(streamAResumeReader)
+	helloAResume := waitForGenericSSEEventType(t, eventsAResume, errsAResume, "stream.hello", 5*time.Second)
+	if got, _ := helloAResume.Payload["resume_status"].(string); got != "ok" {
+		t.Fatalf("resume hello status=%q want=ok payload=%v", got, helloAResume.Payload)
+	}
+	expectNoGenericSSEEvent(t, eventsAResume, errsAResume, 1200*time.Millisecond)
+
+	streamBResp, streamBReader := openAgentStream(t, ts, tokenB, "")
+	defer streamBResp.Body.Close()
+	eventsB, errsB := startGenericSSEStream(streamBReader)
+	helloB := waitForGenericSSEEventType(t, eventsB, errsB, "stream.hello", 5*time.Second)
+	if got, _ := helloB.Payload["resume_status"].(string); got != "fresh" {
+		t.Fatalf("hello b resume_status=%q want=fresh payload=%v", got, helloB.Payload)
+	}
+	expectNoGenericSSEEvent(t, eventsB, errsB, 1200*time.Millisecond)
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/context", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("context a status=%d body=%v", resp.StatusCode, body)
+	}
+	bundleA := mustString(t, body, "bundle_hash")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 0,
+		"ciphertext":    "agent-stream-message-a",
+		"bundle_hash":   bundleA,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("message a status=%d body=%v", resp.StatusCode, body)
+	}
+
+	turnReadyB := waitForGenericSSEEventType(t, eventsB, errsB, "room.turn_ready", 5*time.Second)
+	deliveryB := mustStringMap(t, turnReadyB.Payload, "delivery_id")
+	if got := mustStringMap(t, turnReadyB.Payload, "room_id"); got != roomID {
+		t.Fatalf("turn_ready b room_id=%q want=%q payload=%v", got, roomID, turnReadyB.Payload)
+	}
+
+	_ = streamBResp.Body.Close()
+	streamBReplayResp, streamBReplayReader := openAgentStream(t, ts, tokenB, "")
+	defer streamBReplayResp.Body.Close()
+	eventsBReplay, errsBReplay := startGenericSSEStream(streamBReplayReader)
+	_ = waitForGenericSSEEventType(t, eventsBReplay, errsBReplay, "stream.hello", 5*time.Second)
+	turnReadyBReplay := waitForGenericSSEEventType(t, eventsBReplay, errsBReplay, "room.turn_ready", 5*time.Second)
+	if got := mustStringMap(t, turnReadyBReplay.Payload, "delivery_id"); got != deliveryB {
+		t.Fatalf("replayed delivery_id=%q want=%q payload=%v", got, deliveryB, turnReadyBReplay.Payload)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/stream/ack", map[string]any{
+		"delivery_id": deliveryB,
+	}, tokenB)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ack b status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/close", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("close room status=%d body=%v", resp.StatusCode, body)
+	}
+	closedB := waitForGenericSSEEventType(t, eventsBReplay, errsBReplay, "room.closed", 5*time.Second)
+	if got := mustStringMap(t, closedB.Payload, "room_id"); got != roomID {
+		t.Fatalf("closed room_id=%q want=%q payload=%v", got, roomID, closedB.Payload)
+	}
+
+	streamReplayRequiredResp, streamReplayRequiredReader := openAgentStream(t, ts, tokenA, "missing_delivery")
+	defer streamReplayRequiredResp.Body.Close()
+	eventsReplayRequired, errsReplayRequired := startGenericSSEStream(streamReplayRequiredReader)
+	_ = waitForGenericSSEEventType(t, eventsReplayRequired, errsReplayRequired, "stream.hello", 5*time.Second)
+	replayRequired := waitForGenericSSEEventType(t, eventsReplayRequired, errsReplayRequired, "stream.replay_required", 5*time.Second)
+	if got, _ := replayRequired.Payload["type"].(string); got != "stream.replay_required" {
+		t.Fatalf("replay_required payload=%v", replayRequired.Payload)
+	}
+}
+
 type sseEventEnvelope struct {
 	EventID    int64   `json:"event_id"`
 	Type       string  `json:"type"`
@@ -1334,6 +1483,144 @@ func startSSEEventStream(reader *bufio.Reader) (<-chan sseEventEnvelope, <-chan 
 		}
 	}()
 	return events, errs
+}
+
+type genericSSEEnvelope struct {
+	EventID string
+	Type    string
+	Payload map[string]any
+}
+
+func openAgentStream(t *testing.T, ts *httptest.Server, token, lastDeliveryID string) (*http.Response, *bufio.Reader) {
+	t.Helper()
+	url := ts.URL + "/v1/agent/stream"
+	if strings.TrimSpace(lastDeliveryID) != "" {
+		url += "?last_delivery_id=" + lastDeliveryID
+	}
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("new agent stream request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("open agent stream: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("agent stream status=%d body=%s", resp.StatusCode, string(body))
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		resp.Body.Close()
+		t.Fatalf("agent stream content-type=%q", got)
+	}
+	return resp, bufio.NewReader(resp.Body)
+}
+
+func startGenericSSEStream(reader *bufio.Reader) (<-chan genericSSEEnvelope, <-chan error) {
+	events := make(chan genericSSEEnvelope, 32)
+	errs := make(chan error, 1)
+	go func() {
+		defer close(events)
+		for {
+			ev, err := readGenericSSEFrame(reader)
+			if err != nil {
+				if err == io.EOF {
+					return
+				}
+				errs <- err
+				return
+			}
+			events <- ev
+		}
+	}()
+	return events, errs
+}
+
+func waitForGenericSSEEventType(t *testing.T, eventCh <-chan genericSSEEnvelope, errCh <-chan error, eventType string, timeout time.Duration) genericSSEEnvelope {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		select {
+		case err := <-errCh:
+			t.Fatalf("agent stream error: %v", err)
+		case ev, ok := <-eventCh:
+			if !ok {
+				t.Fatalf("agent stream closed while waiting for event type %q", eventType)
+			}
+			if ev.Type == eventType {
+				return ev
+			}
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for agent stream event type %q", eventType)
+		}
+	}
+}
+
+func expectNoGenericSSEEvent(t *testing.T, eventCh <-chan genericSSEEnvelope, errCh <-chan error, timeout time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-errCh:
+		t.Fatalf("agent stream error while expecting silence: %v", err)
+	case ev, ok := <-eventCh:
+		if !ok {
+			return
+		}
+		t.Fatalf("unexpected agent stream event type=%q id=%s", ev.Type, ev.EventID)
+	case <-timer.C:
+	}
+}
+
+func readGenericSSEFrame(reader *bufio.Reader) (genericSSEEnvelope, error) {
+	for {
+		var (
+			eventID   string
+			eventType string
+			dataBuf   strings.Builder
+		)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return genericSSEEnvelope{}, err
+			}
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				if eventType == "" || dataBuf.Len() == 0 {
+					break
+				}
+				payload := map[string]any{}
+				if err := json.Unmarshal([]byte(dataBuf.String()), &payload); err != nil {
+					return genericSSEEnvelope{}, fmt.Errorf("unmarshal generic data: %w", err)
+				}
+				return genericSSEEnvelope{
+					EventID: eventID,
+					Type:    eventType,
+					Payload: payload,
+				}, nil
+			}
+			if strings.HasPrefix(line, ":") || strings.HasPrefix(line, "retry:") {
+				continue
+			}
+			if strings.HasPrefix(line, "id:") {
+				eventID = strings.TrimSpace(strings.TrimPrefix(line, "id:"))
+				continue
+			}
+			if strings.HasPrefix(line, "event:") {
+				eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+				continue
+			}
+			if strings.HasPrefix(line, "data:") {
+				if dataBuf.Len() > 0 {
+					dataBuf.WriteByte('\n')
+				}
+				dataBuf.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			}
+		}
+	}
 }
 
 func waitForSSEEventType(t *testing.T, eventCh <-chan sseEventEnvelope, errCh <-chan error, eventType string, timeout time.Duration) sseEventEnvelope {
@@ -1428,6 +1715,187 @@ func readSSEFrame(reader *bufio.Reader) (sseEventEnvelope, error) {
 	}
 }
 
+func TestSQLModeAgentActionableRoomsEndpoint(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+
+	store := postgres.NewStore(db)
+	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "stream-a"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register a status=%d body=%v", resp.StatusCode, body)
+	}
+	apiA := mustString(t, body, "api_key")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "stream-b"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register b status=%d body=%v", resp.StatusCode, body)
+	}
+	apiB := mustString(t, body, "api_key")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login a status=%d body=%v", resp.StatusCode, body)
+	}
+	tokenA := mustString(t, body, "session_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login b status=%d body=%v", resp.StatusCode, body)
+	}
+	tokenB := mustString(t, body, "session_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "agent stream recovery",
+		"max_turns":   4,
+		"ttl_seconds": 600,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	listingID := mustString(t, body, "id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect listing status=%d body=%v", resp.StatusCode, body)
+	}
+	roomID := mustString(t, body, "room_id")
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/agent/actionable-rooms", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("actionable rooms a status=%d body=%v", resp.StatusCode, body)
+	}
+	actionableA, ok := body["actionable"].([]any)
+	if !ok || len(actionableA) != 1 {
+		t.Fatalf("actionable rooms a payload=%v", body)
+	}
+	itemA, ok := actionableA[0].(map[string]any)
+	if !ok {
+		t.Fatalf("actionable room a payload=%v", actionableA[0])
+	}
+	if got, _ := itemA["room_id"].(string); got != roomID {
+		t.Fatalf("actionable room id=%q want=%q", got, roomID)
+	}
+	if got, _ := itemA["next_actor_id"].(string); got == "" {
+		t.Fatalf("next_actor_id missing: %v", itemA)
+	}
+	if got, _ := itemA["token"].(string); got == "" {
+		t.Fatalf("token missing: %v", itemA)
+	}
+	if terminal, ok := body["terminal"].([]any); !ok || len(terminal) != 0 {
+		t.Fatalf("unexpected terminal payload=%v", body["terminal"])
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/context", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("context a status=%d body=%v", resp.StatusCode, body)
+	}
+	bundleA := mustString(t, body, "bundle_hash")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 0,
+		"ciphertext":    "stream-msg-a",
+		"bundle_hash":   bundleA,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("message a status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/agent/actionable-rooms", nil, tokenB)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("actionable rooms b status=%d body=%v", resp.StatusCode, body)
+	}
+	actionableB, ok := body["actionable"].([]any)
+	if !ok || len(actionableB) != 1 {
+		t.Fatalf("actionable rooms b payload=%v", body)
+	}
+	itemB, ok := actionableB[0].(map[string]any)
+	if !ok {
+		t.Fatalf("actionable room b payload=%v", actionableB[0])
+	}
+	if got, _ := itemB["room_id"].(string); got != roomID {
+		t.Fatalf("actionable room b id=%q want=%q", got, roomID)
+	}
+	if got, _ := itemB["token"].(string); got == "" {
+		t.Fatalf("token missing for b: %v", itemB)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/close", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("close room status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/agent/actionable-rooms", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("actionable rooms after close status=%d body=%v", resp.StatusCode, body)
+	}
+	if actionable, ok := body["actionable"].([]any); !ok || len(actionable) != 0 {
+		t.Fatalf("unexpected actionable after close=%v", body["actionable"])
+	}
+	terminalA, ok := body["terminal"].([]any)
+	if !ok || len(terminalA) == 0 {
+		t.Fatalf("terminal rooms a payload=%v", body)
+	}
+
+	var turnReadyCount, closedCount int
+	rows, err := db.Query(`SELECT agent_id, type FROM agent_stream_deliveries WHERE room_id = $1 ORDER BY seq ASC`, roomID)
+	if err != nil {
+		t.Fatalf("query stream deliveries: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var agentID, typ string
+		if err := rows.Scan(&agentID, &typ); err != nil {
+			t.Fatalf("scan stream delivery: %v", err)
+		}
+		switch typ {
+		case "room.turn_ready":
+			turnReadyCount++
+		case "room.closed":
+			closedCount++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate stream deliveries: %v", err)
+	}
+	if turnReadyCount < 2 {
+		t.Fatalf("room.turn_ready count=%d want>=2", turnReadyCount)
+	}
+	if closedCount != 2 {
+		t.Fatalf("room.closed count=%d want=2", closedCount)
+	}
+}
+
+func mustStringMap(t *testing.T, m map[string]any, key string) string {
+	t.Helper()
+	got, ok := m[key].(string)
+	if !ok || got == "" {
+		t.Fatalf("missing string key %q in %v", key, m)
+	}
+	return got
+}
+
 func applyMigrationsForTest(t *testing.T, db *sql.DB) {
 	t.Helper()
 
@@ -1465,9 +1933,16 @@ func applyMigrationsForTest(t *testing.T, db *sql.DB) {
 	if err != nil {
 		t.Fatalf("read webhook endpoint delete cascade up migration: %v", err)
 	}
+	up8, err := os.ReadFile(filepath.Join(migDir, "000008_agent_stream_deliveries.up.sql"))
+	if err != nil {
+		t.Fatalf("read agent stream deliveries up migration: %v", err)
+	}
 
 	if _, err := db.Exec(string(down)); err != nil {
 		t.Fatalf("exec down migration: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS agent_stream_deliveries`); err != nil {
+		t.Fatalf("cleanup agent stream deliveries: %v", err)
 	}
 	if _, err := db.Exec(`DROP TABLE IF EXISTS room_scoped_tokens`); err != nil {
 		t.Fatalf("cleanup room scoped tokens: %v", err)
@@ -1507,6 +1982,9 @@ func applyMigrationsForTest(t *testing.T, db *sql.DB) {
 	}
 	if _, err := db.Exec(string(up7)); err != nil {
 		t.Fatalf("exec webhook endpoint delete cascade up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up8)); err != nil {
+		t.Fatalf("exec agent stream deliveries up migration: %v", err)
 	}
 }
 

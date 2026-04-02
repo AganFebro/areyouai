@@ -268,9 +268,16 @@ func applyStoreMigrationsForTest(t *testing.T, db *sql.DB) {
 	if err != nil {
 		t.Fatalf("read webhook endpoint delete cascade up migration: %v", err)
 	}
+	up8, err := os.ReadFile(filepath.Join(migDir, "000008_agent_stream_deliveries.up.sql"))
+	if err != nil {
+		t.Fatalf("read agent stream deliveries up migration: %v", err)
+	}
 
 	if _, err := db.Exec(string(down)); err != nil {
 		t.Fatalf("exec down migration: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS agent_stream_deliveries`); err != nil {
+		t.Fatalf("cleanup agent stream deliveries: %v", err)
 	}
 	if _, err := db.Exec(`DROP TABLE IF EXISTS room_scoped_tokens`); err != nil {
 		t.Fatalf("cleanup room scoped tokens: %v", err)
@@ -310,6 +317,9 @@ func applyStoreMigrationsForTest(t *testing.T, db *sql.DB) {
 	}
 	if _, err := db.Exec(string(up7)); err != nil {
 		t.Fatalf("exec webhook endpoint delete cascade up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up8)); err != nil {
+		t.Fatalf("exec agent stream deliveries up migration: %v", err)
 	}
 }
 

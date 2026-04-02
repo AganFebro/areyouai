@@ -131,6 +131,66 @@ SELECT COUNT(1) FROM deleted_endpoint`
 	return nil
 }
 
+func (s *Store) CreateAgentStreamDelivery(ctx context.Context, in repository.CreateAgentStreamDeliveryInput) (repository.AgentStreamDelivery, error) {
+	return createAgentStreamDelivery(ctx, s.db, in)
+}
+
+func (s *Store) GetAgentStreamDelivery(ctx context.Context, agentID, deliveryID string) (repository.AgentStreamDelivery, error) {
+	const q = `
+SELECT seq, delivery_id, agent_id, room_id, type, reason, payload, status, acked_at, expires_at, created_at
+FROM agent_stream_deliveries
+WHERE agent_id = $1 AND delivery_id = $2`
+	return scanAgentStreamDelivery(s.db.QueryRowContext(ctx, q, agentID, deliveryID))
+}
+
+func (s *Store) ListPendingAgentStreamDeliveries(ctx context.Context, agentID string, afterSeq int64, now time.Time, limit int) ([]repository.AgentStreamDelivery, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 100
+	}
+	const q = `
+SELECT seq, delivery_id, agent_id, room_id, type, reason, payload, status, acked_at, expires_at, created_at
+FROM agent_stream_deliveries
+WHERE agent_id = $1
+  AND seq > $2
+  AND status = 'pending'
+  AND expires_at > $3
+ORDER BY seq ASC
+LIMIT $4`
+	rows, err := s.db.QueryContext(ctx, q, agentID, afterSeq, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []repository.AgentStreamDelivery
+	for rows.Next() {
+		item, scanErr := scanAgentStreamDelivery(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AckAgentStreamDelivery(ctx context.Context, agentID, deliveryID string, ackedAt time.Time) error {
+	const q = `
+UPDATE agent_stream_deliveries
+SET status = 'acked',
+    acked_at = COALESCE(acked_at, $3)
+WHERE agent_id = $1
+  AND delivery_id = $2`
+	res, err := s.db.ExecContext(ctx, q, agentID, deliveryID, ackedAt)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return repository.ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) CreateListing(ctx context.Context, in repository.CreateListingInput) (repository.Listing, error) {
 	tagsJSON, err := json.Marshal(in.Tags)
 	if err != nil {
@@ -194,6 +254,37 @@ WHERE connected = FALSE`
 		item, err := scanListingRows(rows)
 		if err != nil {
 			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListRecoverableRoomsForAgent(ctx context.Context, agentID string, since time.Time) ([]repository.Room, error) {
+	const q = `
+SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash
+FROM rooms
+WHERE (agent_a_id = $1 OR agent_b_id = $1)
+  AND (
+    state = $3
+    OR (closed_at IS NOT NULL AND closed_at >= $2)
+    OR (purged_at IS NOT NULL AND purged_at >= $2)
+  )
+ORDER BY
+  CASE WHEN state = $3 THEN 0 ELSE 1 END,
+  COALESCE(purged_at, closed_at, created_at) DESC,
+  id DESC`
+	rows, err := s.db.QueryContext(ctx, q, agentID, since, string(domain.RoomStateActive))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []repository.Room
+	for rows.Next() {
+		item, scanErr := scanRoom(rows)
+		if scanErr != nil {
+			return nil, scanErr
 		}
 		out = append(out, item)
 	}
@@ -518,6 +609,16 @@ WHERE token_hash = $1`
 	return scanRoomScopedToken(s.db.QueryRowContext(ctx, q, tokenHash))
 }
 
+func (s *Store) TouchRoomScopedToken(ctx context.Context, tokenHash string, lastUsedAt, expiresAt time.Time) error {
+	const q = `
+UPDATE room_scoped_tokens
+SET expires_at = $2
+WHERE token_hash = $1
+  AND revoked_at IS NULL`
+	_, err := s.db.ExecContext(ctx, q, tokenHash, expiresAt)
+	return err
+}
+
 func (s *Store) RevokeRoomScopedTokens(ctx context.Context, roomID, agentID string, revokedAt time.Time) error {
 	const q = `
 UPDATE room_scoped_tokens
@@ -775,6 +876,10 @@ LEFT JOIN messages m ON m.id = i.message_id`
 		out.Ciphertext = in.Ciphertext
 	}
 	return out, nil
+}
+
+func (s *txStore) CreateAgentStreamDelivery(ctx context.Context, in repository.CreateAgentStreamDeliveryInput) (repository.AgentStreamDelivery, error) {
+	return createAgentStreamDelivery(ctx, s.tx, in)
 }
 
 func (s *txStore) ListAgentWebhookEndpoints(ctx context.Context, agentID string) ([]repository.AgentWebhookEndpoint, error) {
@@ -1118,6 +1223,75 @@ func scanRoomScopedToken(row interface{ Scan(dest ...any) error }) (repository.R
 		return repository.RoomScopedToken{}, normalizeErr(err)
 	}
 	return out, nil
+}
+
+func scanAgentStreamDelivery(row interface{ Scan(dest ...any) error }) (repository.AgentStreamDelivery, error) {
+	var out repository.AgentStreamDelivery
+	var payload []byte
+	err := row.Scan(
+		&out.Seq,
+		&out.DeliveryID,
+		&out.AgentID,
+		&out.RoomID,
+		&out.Type,
+		&out.Reason,
+		&payload,
+		&out.Status,
+		&out.AckedAt,
+		&out.ExpiresAt,
+		&out.CreatedAt,
+	)
+	if err != nil {
+		return repository.AgentStreamDelivery{}, normalizeErr(err)
+	}
+	if len(payload) == 0 {
+		out.Payload = json.RawMessage(`{}`)
+	} else {
+		out.Payload = json.RawMessage(payload)
+	}
+	return out, nil
+}
+
+func createAgentStreamDelivery(ctx context.Context, exec interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, in repository.CreateAgentStreamDeliveryInput) (repository.AgentStreamDelivery, error) {
+	status := strings.TrimSpace(in.Status)
+	if status == "" {
+		status = "pending"
+	}
+	payload := in.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage(`{}`)
+	}
+	expiresAt := in.ExpiresAt
+	if expiresAt.IsZero() {
+		expiresAt = time.Now().UTC().Add(30 * time.Minute)
+	}
+	const q = `
+INSERT INTO agent_stream_deliveries (
+  delivery_id,
+  agent_id,
+  room_id,
+  type,
+  reason,
+  payload,
+  status,
+  expires_at
+)
+VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
+RETURNING seq, delivery_id, agent_id, room_id, type, reason, payload, status, acked_at, expires_at, created_at`
+	return scanAgentStreamDelivery(exec.QueryRowContext(
+		ctx,
+		q,
+		in.DeliveryID,
+		in.AgentID,
+		in.RoomID,
+		in.Type,
+		in.Reason,
+		payload,
+		status,
+		expiresAt,
+	))
 }
 
 func createWebhookOutbox(ctx context.Context, exec interface {

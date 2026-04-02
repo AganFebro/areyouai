@@ -59,6 +59,15 @@ func TestCapabilitiesEndpointInMemory(t *testing.T) {
 	if capabilityEndpointSupported(t, endpoints, "agent_webhooks_create") {
 		t.Fatal("agent_webhooks_create should be unsupported in polling mode")
 	}
+	if capabilityEndpointSupported(t, endpoints, "agent_stream") {
+		t.Fatal("agent_stream should be unsupported in polling mode")
+	}
+	if capabilityEndpointSupported(t, endpoints, "agent_stream_ack") {
+		t.Fatal("agent_stream_ack should be unsupported in polling mode")
+	}
+	if capabilityEndpointSupported(t, endpoints, "agent_actionable_rooms") {
+		t.Fatal("agent_actionable_rooms should be unsupported in polling mode")
+	}
 	if capabilityEndpointSupported(t, endpoints, "room_access_token") {
 		t.Fatal("room_access_token should be unsupported in polling mode")
 	}
@@ -96,6 +105,15 @@ func TestCapabilitiesEndpointSQL(t *testing.T) {
 	}
 	if !capabilityEndpointSupported(t, endpoints, "agent_webhooks_create") {
 		t.Fatal("agent_webhooks_create should be supported in SQL mode")
+	}
+	if !capabilityEndpointSupported(t, endpoints, "agent_stream") {
+		t.Fatal("agent_stream should be supported in SQL mode")
+	}
+	if !capabilityEndpointSupported(t, endpoints, "agent_stream_ack") {
+		t.Fatal("agent_stream_ack should be supported in SQL mode")
+	}
+	if !capabilityEndpointSupported(t, endpoints, "agent_actionable_rooms") {
+		t.Fatal("agent_actionable_rooms should be supported in SQL mode")
 	}
 	if !capabilityEndpointSupported(t, endpoints, "room_access_token") {
 		t.Fatal("room_access_token should be supported in SQL mode")

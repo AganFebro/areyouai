@@ -42,6 +42,7 @@ func capabilitiesInfo(sqlMode bool) http.HandlerFunc {
 				"owner_first_listing": true,
 				"structured_errors":   true,
 				"prompt_context":      sqlMode,
+				"agent_stream":        sqlMode,
 				"events_stream":       sqlMode,
 				"events_history":      sqlMode,
 				"events_webhook":      sqlMode,
@@ -83,6 +84,9 @@ func capabilityEndpoints(sqlMode bool) []capabilityEndpoint {
 	}
 	if sqlMode {
 		endpoints = append(endpoints,
+			capabilityEndpoint{Name: "agent_stream", Method: http.MethodGet, Path: "/v1/agent/stream", Auth: "bearer", Supported: true},
+			capabilityEndpoint{Name: "agent_stream_ack", Method: http.MethodPost, Path: "/v1/agent/stream/ack", Auth: "bearer", Supported: true},
+			capabilityEndpoint{Name: "agent_actionable_rooms", Method: http.MethodGet, Path: "/v1/agent/actionable-rooms", Auth: "bearer", Supported: true},
 			capabilityEndpoint{Name: "agent_webhooks_list", Method: http.MethodGet, Path: "/v1/agent/webhooks", Auth: "bearer", Supported: true},
 			capabilityEndpoint{Name: "agent_webhooks_create", Method: http.MethodPost, Path: "/v1/agent/webhooks", Auth: "bearer", Supported: true},
 			capabilityEndpoint{Name: "agent_webhooks_delete", Method: http.MethodDelete, Path: "/v1/agent/webhooks/{id}", Auth: "bearer", Supported: true},
@@ -94,6 +98,36 @@ func capabilityEndpoints(sqlMode bool) []capabilityEndpoint {
 		return endpoints
 	}
 	endpoints = append(endpoints,
+		capabilityEndpoint{
+			Name:           "agent_stream",
+			Method:         http.MethodGet,
+			Path:           "/v1/agent/stream",
+			Auth:           "bearer",
+			Supported:      false,
+			StatusIfCalled: http.StatusNotFound,
+			Error:          "not_found",
+			Hint:           "Agent stream is only available in SQL mode.",
+		},
+		capabilityEndpoint{
+			Name:           "agent_stream_ack",
+			Method:         http.MethodPost,
+			Path:           "/v1/agent/stream/ack",
+			Auth:           "bearer",
+			Supported:      false,
+			StatusIfCalled: http.StatusNotFound,
+			Error:          "not_found",
+			Hint:           "Agent stream acknowledgement is only available in SQL mode.",
+		},
+		capabilityEndpoint{
+			Name:           "agent_actionable_rooms",
+			Method:         http.MethodGet,
+			Path:           "/v1/agent/actionable-rooms",
+			Auth:           "bearer",
+			Supported:      false,
+			StatusIfCalled: http.StatusNotFound,
+			Error:          "not_found",
+			Hint:           "Agent recovery is only available in SQL mode.",
+		},
 		capabilityEndpoint{
 			Name:           "agent_webhooks_list",
 			Method:         http.MethodGet,

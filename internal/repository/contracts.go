@@ -49,6 +49,11 @@ type Store interface {
 	AppendRoomEvent(ctx context.Context, in AppendRoomEventInput) (RoomEvent, error)
 	GetRoomEvent(ctx context.Context, eventID int64) (RoomEvent, error)
 	ListRoomEvents(ctx context.Context, in ListRoomEventsInput) ([]RoomEvent, error)
+	CreateAgentStreamDelivery(ctx context.Context, in CreateAgentStreamDeliveryInput) (AgentStreamDelivery, error)
+	GetAgentStreamDelivery(ctx context.Context, agentID, deliveryID string) (AgentStreamDelivery, error)
+	ListPendingAgentStreamDeliveries(ctx context.Context, agentID string, afterSeq int64, now time.Time, limit int) ([]AgentStreamDelivery, error)
+	AckAgentStreamDelivery(ctx context.Context, agentID, deliveryID string, ackedAt time.Time) error
+	ListRecoverableRoomsForAgent(ctx context.Context, agentID string, since time.Time) ([]Room, error)
 	CreateAgentWebhookEndpoint(ctx context.Context, in CreateAgentWebhookEndpointInput) (AgentWebhookEndpoint, error)
 	ListAgentWebhookEndpoints(ctx context.Context, agentID string) ([]AgentWebhookEndpoint, error)
 	DeleteAgentWebhookEndpoint(ctx context.Context, agentID, endpointID string) error
@@ -59,6 +64,7 @@ type Store interface {
 	MarkWebhookOutboxDeadLetter(ctx context.Context, id int64, lastError string) error
 	CreateRoomScopedToken(ctx context.Context, in CreateRoomScopedTokenInput) (RoomScopedToken, error)
 	FindRoomScopedTokenByHash(ctx context.Context, tokenHash string) (RoomScopedToken, error)
+	TouchRoomScopedToken(ctx context.Context, tokenHash string, lastUsedAt, expiresAt time.Time) error
 	RevokeRoomScopedTokens(ctx context.Context, roomID, agentID string, revokedAt time.Time) error
 	PurgeRoomContent(ctx context.Context, roomID string, purgedAt time.Time) error
 
@@ -77,6 +83,7 @@ type TxStore interface {
 	AppendMessage(ctx context.Context, in AppendMessageInput) (Message, error)
 	PurgeRoomContent(ctx context.Context, roomID string, purgedAt time.Time) error
 	AppendRoomEvent(ctx context.Context, in AppendRoomEventInput) (RoomEvent, error)
+	CreateAgentStreamDelivery(ctx context.Context, in CreateAgentStreamDeliveryInput) (AgentStreamDelivery, error)
 	ListAgentWebhookEndpoints(ctx context.Context, agentID string) ([]AgentWebhookEndpoint, error)
 	CreateWebhookOutbox(ctx context.Context, in CreateWebhookOutboxInput) (WebhookOutboxItem, error)
 	CreateRoomScopedToken(ctx context.Context, in CreateRoomScopedTokenInput) (RoomScopedToken, error)
@@ -208,6 +215,20 @@ type RoomEvent struct {
 	SenderID   *string   `json:"sender_id,omitempty"`
 	Ciphertext *string   `json:"ciphertext,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+type AgentStreamDelivery struct {
+	Seq        int64           `json:"seq"`
+	DeliveryID string          `json:"delivery_id"`
+	AgentID    string          `json:"agent_id"`
+	RoomID     string          `json:"room_id"`
+	Type       string          `json:"type"`
+	Reason     string          `json:"reason"`
+	Payload    json.RawMessage `json:"payload"`
+	Status     string          `json:"status"`
+	CreatedAt  time.Time       `json:"created_at"`
+	AckedAt    *time.Time      `json:"acked_at,omitempty"`
+	ExpiresAt  time.Time       `json:"expires_at"`
 }
 
 type AgentWebhookEndpoint struct {
@@ -348,6 +369,17 @@ type ListRoomEventsInput struct {
 	RoomID  string
 	SinceID int64
 	Limit   int
+}
+
+type CreateAgentStreamDeliveryInput struct {
+	DeliveryID string
+	AgentID    string
+	RoomID     string
+	Type       string
+	Reason     string
+	Payload    json.RawMessage
+	Status     string
+	ExpiresAt  time.Time
 }
 
 type UpsertRoomContextInput struct {

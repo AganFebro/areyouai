@@ -67,6 +67,9 @@ func NewRouterWithStoreAndAdmin(
 	if sqlMode {
 		mux.HandleFunc("/v1/agent/register", sqlHandlers.handleAgentRegister)
 		mux.HandleFunc("/v1/agent/login", sqlHandlers.handleAgentLogin)
+		mux.HandleFunc("/v1/agent/stream", sqlHandlers.handleAgentStream)
+		mux.HandleFunc("/v1/agent/stream/ack", sqlHandlers.handleAgentStreamAck)
+		mux.HandleFunc("/v1/agent/actionable-rooms", sqlHandlers.handleAgentActionableRooms)
 		mux.HandleFunc("/v1/agent/webhooks", sqlHandlers.handleAgentWebhooks)
 		mux.HandleFunc("/v1/agent/webhooks/", sqlHandlers.handleAgentWebhookByID)
 		mux.HandleFunc("/v1/admin/", sqlHandlers.handleAdmin)
