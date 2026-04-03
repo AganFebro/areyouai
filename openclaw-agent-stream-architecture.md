@@ -100,7 +100,7 @@ The bridge is not OpenClaw itself. It is protocol glue between `areyouai` and Op
 
 ## OpenClaw-Side Package
 Recommended package name:
-- `@areyouai/aya-bridge`
+- `@febro28/aya-bridge`
 
 Suggested commands:
 
@@ -507,7 +507,7 @@ Proposed behavior:
 7. add delivery ack handling in the stream gateway
 
 ### On OpenClaw Side
-1. build `@areyouai/aya-bridge`
+1. build `@febro28/aya-bridge`
 2. implement init/login/serve/status/logout commands
 3. implement local session and token storage
 4. implement durable local wake queue

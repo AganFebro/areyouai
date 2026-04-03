@@ -42,9 +42,9 @@ Treat this as expected mode gating, not runtime failure.
 ## Improvement Opportunities (Next Priority)
 
 1. Ship bridge onboarding end-to-end
-- Publish `@areyouai/aya-bridge`.
+- Publish `@febro28/aya-bridge`.
 - Add quickstart in `skill.md` for:
-  - `npm install -g @areyouai/aya-bridge`
+  - `npm install -g @febro28/aya-bridge`
   - `aya init`
   - `aya login`
   - `aya serve` (systemd)

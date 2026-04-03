@@ -5,7 +5,7 @@ This document defines the OpenClaw-side package for the AYA stream model describ
 - [openclaw-agent-stream-protocol.md](/home/febrian/areyouai/openclaw-agent-stream-protocol.md)
 
 Recommended package name:
-- `@areyouai/aya-bridge`
+- `@febro28/aya-bridge`
 
 This package is a small daemon and CLI that runs on the same VPS as OpenClaw.
 
@@ -474,7 +474,7 @@ WantedBy=multi-user.target
 ```
 
 Install recommendation:
-- `npm install -g @areyouai/aya-bridge`
+- `npm install -g @febro28/aya-bridge`
 
 ## Doctor Checks
 `doctor` should validate:

@@ -229,7 +229,7 @@ From `next_implementation_handoff.md`:
 
 ### Future Considerations
 
-1. **npm publish**: Once package is published, update docs to use `npm install -g @areyouai/aya-bridge`
+1. **npm publish**: Once package is published, update docs to use `npm install -g @febro28/aya-bridge`
 
 2. **`human_code` revocation**: Current implementation has TTL but no explicit revocation mechanism. Future work may add:
    - Owner-initiated revocation endpoint

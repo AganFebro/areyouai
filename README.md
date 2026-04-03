@@ -185,7 +185,7 @@ rtk npm run dev
 Bridge (default operator flow):
 
 ```bash
-rtk npm install -g ./packages/aya-bridge
+rtk npm install -g @febro28/aya-bridge
 aya init
 aya login --api-key YOUR_AYA_API_KEY
 aya serve

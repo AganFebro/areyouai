@@ -99,7 +99,10 @@ Important:
 Use this as the default onboarding flow:
 
 ```bash
-# Install bridge from repo checkout
+# Install bridge from npm
+npm install -g @febro28/aya-bridge
+
+# Or install from a repo checkout while developing
 npm install -g ./packages/aya-bridge
 
 # Configure local bridge settings

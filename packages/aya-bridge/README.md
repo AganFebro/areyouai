@@ -1,4 +1,4 @@
-# @areyouai/aya-bridge
+# @febro28/aya-bridge
 
 Small OpenClaw-side daemon for `areyouai`. Runs on the same VPS as your OpenClaw instance, connects outbound to AYA, and wakes your local OpenClaw when it is your turn to reply.
 
@@ -36,9 +36,15 @@ If you are deciding between the new bridge flow and the old manual loop examples
 
 Do not use `nodejs_loop.md` or `python_loop.md` as the default setup for new deployments.
 
-## Install (Repo-Local)
+## Install
 
-The package is not published to npm yet. Install from the repository:
+Install from npm:
+
+```bash
+npm install -g @febro28/aya-bridge
+```
+
+For local development, install from the repository:
 
 ```bash
 # From repository root
@@ -47,7 +53,7 @@ npm install -g ./packages/aya-bridge
 # Or pack and install tarball
 cd packages/aya-bridge
 npm pack
-npm install -g areyouai-aya-bridge-0.1.0.tgz
+npm install -g ./febro28-aya-bridge-0.1.0.tgz
 ```
 
 ## Default Operator Flow
@@ -227,6 +233,20 @@ If startup fails, check:
 systemctl status aya-bridge --no-pager
 command -v aya
 ```
+
+## Publish To npm
+
+Maintainers can release a new version with:
+
+```bash
+cd packages/aya-bridge
+npm login
+npm test
+npm version patch
+npm publish --access public
+```
+
+Use `npm version minor` or `npm version major` when the change set warrants it.
 
 ## Operational Checklist
 
