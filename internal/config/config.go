@@ -16,6 +16,9 @@ type Config struct {
 	MaxClosedRetention     time.Duration
 	WebhookWorkerEnabled   bool
 	WebhookSecretKey       string
+	WebhookSecretKeyset    string
+	RoomDEKKey             string
+	RoomDEKKeyset          string
 	WebhookPollInterval    time.Duration
 	WebhookDeliveryTimeout time.Duration
 	WebhookClaimStaleAfter time.Duration
@@ -23,6 +26,9 @@ type Config struct {
 	WebhookMaxAttempts     int
 	WebhookBaseBackoff     time.Duration
 	WebhookMaxBackoff      time.Duration
+	PurgeWorkerEnabled     bool
+	PurgePollInterval      time.Duration
+	PurgeBatchSize         int
 }
 
 func Load() Config {
@@ -36,6 +42,9 @@ func Load() Config {
 		MaxClosedRetention:     getDurationSeconds("MAX_CLOSED_RETENTION_SECONDS", 86400),
 		WebhookWorkerEnabled:   getBool("WEBHOOK_WORKER_ENABLED", true),
 		WebhookSecretKey:       getenv("WEBHOOK_SECRET_ENCRYPTION_KEY", ""),
+		WebhookSecretKeyset:    getenv("WEBHOOK_SECRET_ENCRYPTION_KEYS", ""),
+		RoomDEKKey:             getenv("ROOM_DEK_ENCRYPTION_KEY", ""),
+		RoomDEKKeyset:          getenv("ROOM_DEK_ENCRYPTION_KEYS", ""),
 		WebhookPollInterval:    getDurationSeconds("WEBHOOK_POLL_INTERVAL_SECONDS", 2),
 		WebhookDeliveryTimeout: getDurationSeconds("WEBHOOK_DELIVERY_TIMEOUT_SECONDS", 10),
 		WebhookClaimStaleAfter: getDurationSeconds("WEBHOOK_CLAIM_STALE_AFTER_SECONDS", 45),
@@ -43,6 +52,9 @@ func Load() Config {
 		WebhookMaxAttempts:     getInt("WEBHOOK_MAX_ATTEMPTS", 8),
 		WebhookBaseBackoff:     getDurationSeconds("WEBHOOK_BASE_BACKOFF_SECONDS", 5),
 		WebhookMaxBackoff:      getDurationSeconds("WEBHOOK_MAX_BACKOFF_SECONDS", 300),
+		PurgeWorkerEnabled:     getBool("PURGE_WORKER_ENABLED", true),
+		PurgePollInterval:      getDurationSeconds("PURGE_POLL_INTERVAL_SECONDS", 15),
+		PurgeBatchSize:         getInt("PURGE_BATCH_SIZE", 200),
 	}
 }
 

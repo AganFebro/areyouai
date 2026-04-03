@@ -6,7 +6,7 @@
     "aya": "./bin/aya.js"
   },
   "scripts": {
-    "test": "node ./test/run.js parse && node ./test/run.js turn && node ./test/run.js retry"
+    "test": "node ./test/run.js parse && node ./test/run.js turn && node ./test/run.js retry && node ./test/run.js refresh && node ./test/run.js dedupe && node ./test/run.js recovery && node ./test/run.js terminal"
   },
   "engines": {
     "node": ">=20"

@@ -157,6 +157,23 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("message a turn0 status=%d body=%v", resp.StatusCode, body)
 	}
+	var storedMessageCipher string
+	if err := db.QueryRow(`SELECT ciphertext FROM messages WHERE room_id = $1 AND turn = 0`, roomID).Scan(&storedMessageCipher); err != nil {
+		t.Fatalf("query stored message ciphertext: %v", err)
+	}
+	if storedMessageCipher == "cipher-sql-1" {
+		t.Fatalf("stored message remained plaintext: %q", storedMessageCipher)
+	}
+	if !strings.HasPrefix(storedMessageCipher, "enc:v1:") {
+		t.Fatalf("stored message ciphertext prefix mismatch: %q", storedMessageCipher)
+	}
+	var storedRoomKey string
+	if err := db.QueryRow(`SELECT message_key_ciphertext FROM rooms WHERE id = $1`, roomID).Scan(&storedRoomKey); err != nil {
+		t.Fatalf("query stored room key: %v", err)
+	}
+	if storedRoomKey == "" {
+		t.Fatal("expected wrapped room message key to be stored")
+	}
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
 		"expected_turn": 1,
@@ -232,7 +249,7 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 		t.Fatalf("second close room status=%d body=%v", resp.StatusCode, body)
 	}
 
-	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/transcript?human_code="+humanCode, nil, "")
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/transcript", map[string]any{"human_code": humanCode}, "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("transcript status=%d body=%v", resp.StatusCode, body)
 	}
@@ -281,6 +298,20 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	}
 	if _, ok := body["agents_total"]; !ok {
 		t.Fatalf("admin overview missing agents_total: %v", body)
+	}
+	if _, err := db.Exec(`UPDATE rooms SET closed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1`, roomID); err != nil {
+		t.Fatalf("backdate closed room: %v", err)
+	}
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/admin/overview", nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin overview status=%d body=%v", resp.StatusCode, body)
+	}
+	purge, ok := body["purge"].(map[string]any)
+	if !ok {
+		t.Fatalf("admin overview missing purge telemetry: %v", body)
+	}
+	if ready, _ := purge["ready_for_purge"].(float64); ready < 1 {
+		t.Fatalf("purge ready_for_purge=%v want>=1 purge=%v", purge["ready_for_purge"], purge)
 	}
 
 	resp, body = doJSON(t, ts, http.MethodGet, "/v1/admin/rooms", nil, "")
@@ -1420,6 +1451,15 @@ func TestSQLModeAgentStreamSSEAndAckResume(t *testing.T) {
 	}
 
 	_ = streamBResp.Body.Close()
+	streamBUnackedCursorResp, streamBUnackedCursorReader := openAgentStream(t, ts, tokenB, deliveryB)
+	defer streamBUnackedCursorResp.Body.Close()
+	eventsBUnackedCursor, errsBUnackedCursor := startGenericSSEStream(streamBUnackedCursorReader)
+	_ = waitForGenericSSEEventType(t, eventsBUnackedCursor, errsBUnackedCursor, "stream.hello", 5*time.Second)
+	replayRequiredForUnacked := waitForGenericSSEEventType(t, eventsBUnackedCursor, errsBUnackedCursor, "stream.replay_required", 5*time.Second)
+	if got, _ := replayRequiredForUnacked.Payload["type"].(string); got != "stream.replay_required" {
+		t.Fatalf("replay_required for unacked cursor payload=%v", replayRequiredForUnacked.Payload)
+	}
+
 	streamBReplayResp, streamBReplayReader := openAgentStream(t, ts, tokenB, "")
 	defer streamBReplayResp.Body.Close()
 	eventsBReplay, errsBReplay := startGenericSSEStream(streamBReplayReader)
@@ -1452,6 +1492,119 @@ func TestSQLModeAgentStreamSSEAndAckResume(t *testing.T) {
 	replayRequired := waitForGenericSSEEventType(t, eventsReplayRequired, errsReplayRequired, "stream.replay_required", 5*time.Second)
 	if got, _ := replayRequired.Payload["type"].(string); got != "stream.replay_required" {
 		t.Fatalf("replay_required payload=%v", replayRequired.Payload)
+	}
+}
+
+func TestSQLModeRoomEventsStreamReplaysFullBacklogBeforeLive(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+	store := postgres.NewStore(db)
+	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	_, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "backlog-a"}, "")
+	apiA := mustString(t, body, "api_key")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "backlog-b"}, "")
+	apiB := mustString(t, body, "api_key")
+
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	tokenA := mustString(t, body, "session_token")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	tokenB := mustString(t, body, "session_token")
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "room-backlog",
+		"max_turns":   8,
+		"ttl_seconds": 600,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	listingID := mustString(t, body, "id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect listing status=%d body=%v", resp.StatusCode, body)
+	}
+	roomID := mustString(t, body, "room_id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/join", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("join a status=%d body=%v", resp.StatusCode, body)
+	}
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/join", nil, tokenB)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("join b status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/events/history?limit=1", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("history baseline status=%d body=%v", resp.StatusCode, body)
+	}
+	baseline := int64(0)
+	if next, ok := body["next_since"].(float64); ok {
+		baseline = int64(next)
+	}
+
+	for i := 0; i < 205; i++ {
+		if _, err := store.AppendRoomEvent(context.Background(), repository.AppendRoomEventInput{
+			RoomID:    roomID,
+			EventType: "backlog.event",
+		}); err != nil {
+			t.Fatalf("append backlog room event %d: %v", i, err)
+		}
+	}
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/rooms/"+roomID+"/events?since="+strconv.FormatInt(baseline, 10), nil)
+	if err != nil {
+		t.Fatalf("new sse request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tokenA)
+	sseResp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("open sse stream: %v", err)
+	}
+	defer sseResp.Body.Close()
+	if sseResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(sseResp.Body)
+		t.Fatalf("sse status=%d body=%s", sseResp.StatusCode, string(body))
+	}
+
+	reader := bufio.NewReader(sseResp.Body)
+	eventCh, errCh := startSSEEventStream(reader)
+	count := 0
+	deadline := time.NewTimer(8 * time.Second)
+	defer deadline.Stop()
+	for count < 205 {
+		select {
+		case err := <-errCh:
+			t.Fatalf("sse stream error: %v", err)
+		case ev := <-eventCh:
+			if ev.Type == "backlog.event" {
+				count++
+			}
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for backlog replay count=%d", count)
+		}
 	}
 }
 
@@ -1937,12 +2090,41 @@ func applyMigrationsForTest(t *testing.T, db *sql.DB) {
 	if err != nil {
 		t.Fatalf("read agent stream deliveries up migration: %v", err)
 	}
+	up9, err := os.ReadFile(filepath.Join(migDir, "000009_human_code_ttl.up.sql"))
+	if err != nil {
+		t.Fatalf("read human code ttl up migration: %v", err)
+	}
+	up10, err := os.ReadFile(filepath.Join(migDir, "000010_stream_coordination.up.sql"))
+	if err != nil {
+		t.Fatalf("read stream coordination up migration: %v", err)
+	}
+	up11, err := os.ReadFile(filepath.Join(migDir, "000011_human_code_ttl_backfill.up.sql"))
+	if err != nil {
+		t.Fatalf("read human code ttl backfill up migration: %v", err)
+	}
+	up12, err := os.ReadFile(filepath.Join(migDir, "000012_agent_policy_state.up.sql"))
+	if err != nil {
+		t.Fatalf("read agent policy state up migration: %v", err)
+	}
+	up13, err := os.ReadFile(filepath.Join(migDir, "000013_room_message_key.up.sql"))
+	if err != nil {
+		t.Fatalf("read room message key up migration: %v", err)
+	}
 
 	if _, err := db.Exec(string(down)); err != nil {
 		t.Fatalf("exec down migration: %v", err)
 	}
 	if _, err := db.Exec(`DROP TABLE IF EXISTS agent_stream_deliveries`); err != nil {
 		t.Fatalf("cleanup agent stream deliveries: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS room_event_stream_open_events`); err != nil {
+		t.Fatalf("cleanup room event stream open events: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS room_event_stream_leases`); err != nil {
+		t.Fatalf("cleanup room event stream leases: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS agent_policy_state`); err != nil {
+		t.Fatalf("cleanup agent policy state: %v", err)
 	}
 	if _, err := db.Exec(`DROP TABLE IF EXISTS room_scoped_tokens`); err != nil {
 		t.Fatalf("cleanup room scoped tokens: %v", err)
@@ -1985,6 +2167,21 @@ func applyMigrationsForTest(t *testing.T, db *sql.DB) {
 	}
 	if _, err := db.Exec(string(up8)); err != nil {
 		t.Fatalf("exec agent stream deliveries up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up9)); err != nil {
+		t.Fatalf("exec human code ttl up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up10)); err != nil {
+		t.Fatalf("exec stream coordination up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up11)); err != nil {
+		t.Fatalf("exec human code ttl backfill up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up12)); err != nil {
+		t.Fatalf("exec agent policy state up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up13)); err != nil {
+		t.Fatalf("exec room message key up migration: %v", err)
 	}
 }
 

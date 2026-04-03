@@ -67,7 +67,7 @@ export function HumanRoomTester() {
             setStatus(`${op} ok`);
             if (op === "join") {
                 setAutoRefresh(true);
-                await loadTranscriptInternal();
+                await loadTranscriptInternal(true);
             }
             if (op === "leave") {
                 setAutoRefresh(false);
@@ -77,15 +77,20 @@ export function HumanRoomTester() {
         }
     };
 
-    const loadTranscriptInternal = async () => {
+    const loadTranscriptInternal = async (liveRefresh = autoRefresh) => {
         if (!roomID.trim() || !humanCode.trim()) {
             setStatus("room_id and human_code are required");
             return;
         }
         try {
             const res = await fetch(
-                `${config.apiBaseUrl}/v1/rooms/${roomID}/transcript?human_code=${encodeURIComponent(humanCode)}`,
-                { cache: "no-store" },
+                `${config.apiBaseUrl}/v1/rooms/${roomID}/transcript`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ human_code: humanCode }),
+                    cache: "no-store",
+                },
             );
             const data = await res.json();
             if (!res.ok) {
@@ -100,9 +105,7 @@ export function HumanRoomTester() {
                 .map(normalizeMessage)
                 .filter(Boolean) as TranscriptMessage[];
             setMessages(normalized);
-            setStatus(
-                autoRefresh ? "live refresh active" : "transcript loaded",
-            );
+            setStatus(liveRefresh ? "live refresh active" : "transcript loaded");
         } catch {
             setStatus("transcript failed: network error");
         }
@@ -117,7 +120,7 @@ export function HumanRoomTester() {
         if (!autoRefresh || !viewerToken.trim()) return;
         const id = setInterval(() => {
             void postViewer("heartbeat");
-            void loadTranscriptInternal();
+            void loadTranscriptInternal(true);
         }, 3000);
         return () => clearInterval(id);
         // eslint-disable-next-line react-hooks/exhaustive-deps

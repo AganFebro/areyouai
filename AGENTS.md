@@ -24,6 +24,7 @@ Source of product requirements: `A2A_PLAN.md`.
   - agent stream over SSE: `GET /v1/agent/stream`
   - durable ack: `POST /v1/agent/stream/ack`
   - recovery: `GET /v1/agent/actionable-rooms`
+  - room replay: `GET /v1/rooms/{id}/events` and `GET /v1/rooms/{id}/events/history`
 - Auth:
   - session bearer tokens for agent APIs
   - short-lived room-scoped tokens via `POST /v1/rooms/{id}/access-token`
@@ -33,6 +34,14 @@ Source of product requirements: `A2A_PLAN.md`.
 - OpenClaw sidecar:
   - package: `packages/aya-bridge`
   - CLI command: `aya`
+- Runtime note:
+  - SSE is the current agent transport
+  - WebSocket is a future target, not the live contract
+
+## SQL-Mode Boundary
+- The durable stream/recovery, room-token, webhook, and admin APIs are SQL-mode only.
+- When `POSTGRES_DSN` is empty, those routes are intentionally unavailable.
+- Treat that as expected mode gating, not as a bug.
 
 ## Primary Stack
 - Backend API: Go
@@ -78,9 +87,10 @@ Suggested package layout:
 ## Frontend Conventions (Next.js)
 - Use App Router + TypeScript.
 - Keep UI components presentational; move data logic to hooks/services.
-- Treat transcript pages as read-only owner views using `human_code`.
+- Treat transcript pages as read-only owner views using `human_code` in the POST body.
 - Prefer server-side validation for access-sensitive flows.
 - Keep admin routes disabled by default unless explicitly enabled.
+- Do not reintroduce transcript query-string auth for `human_code`.
 
 Suggested layout:
 - `apps/web/app`
@@ -89,10 +99,12 @@ Suggested layout:
 
 ## API and Behavior Rules
 - Implement endpoints defined in `A2A_PLAN.md` section 5.
+- Keep `/v1/capabilities` as the machine-readable source of truth for implemented modes and route support.
 - Preserve error semantics: `401`, `403`, `404`, `409`, `410`, `429`.
 - `POST /v1/rooms/{id}/messages` must require and validate `expected_turn`.
 - Non-`ACTIVE` rooms reject new messages (`room_not_active`).
-- `/v1/capabilities` is the machine-readable source of supported endpoints and modes.
+- `POST /v1/rooms/{id}/transcript` uses `human_code` in the request body.
+- `POST /v1/agent/logout` is unsupported in the current protocol.
 - Unsupported lifecycle endpoint `/v1/rooms/{id}/leave` must return structured unsupported semantics.
 - Stream consumers should use:
   - `GET /v1/agent/stream`
@@ -103,6 +115,7 @@ Suggested layout:
 - HTTPS-only deployment.
 - Store API keys and `human_code` as hashes, never plaintext.
 - `human_code` should be treated as secret credential input and never logged.
+- `human_code` should not appear in URLs or referer-bearing flows.
 - Encrypt per room with DEK; use envelope/KMS where available.
 - Hard-delete message content on purge.
 - Store webhook endpoint secrets encrypted at rest.
@@ -131,7 +144,11 @@ Suggested layout:
 - If requirements conflict, follow `A2A_PLAN.md` first.
 - Keep docs aligned with runtime behavior:
   - `skill.md`
+  - `next_steps.md`
   - `docs/protocol.md`
+  - `docs/current-vs-legacy.md`
+  - `docs/openclaw-bridge-details.md`
+  - `docs/openclaw-integration-diagrams.md`
   - `openclaw-agent-stream-architecture.md`
   - `openclaw-agent-stream-protocol.md`
   - `aya-bridge-cli-spec.md`

@@ -69,7 +69,7 @@ func capabilityEndpoints(sqlMode bool) []capabilityEndpoint {
 		{Name: "room_state", Method: http.MethodGet, Path: "/v1/rooms/{id}/state", Auth: "bearer_or_room_token", Supported: true},
 		{Name: "room_messages", Method: http.MethodPost, Path: "/v1/rooms/{id}/messages", Auth: "bearer_or_room_token", Supported: true},
 		{Name: "room_close", Method: http.MethodPost, Path: "/v1/rooms/{id}/close", Auth: "bearer_or_room_token", Supported: true},
-		{Name: "room_transcript", Method: http.MethodGet, Path: "/v1/rooms/{id}/transcript", Auth: "human_code", Supported: true},
+		{Name: "room_transcript", Method: http.MethodPost, Path: "/v1/rooms/{id}/transcript", Auth: "human_code", Supported: true},
 		{Name: "room_viewers", Method: http.MethodPost, Path: "/v1/rooms/{id}/viewers", Auth: "none", Supported: true},
 		{
 			Name:           "room_leave",

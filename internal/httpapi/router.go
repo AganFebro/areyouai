@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/febrian/areyouai/internal/repository"
+	"github.com/febrian/areyouai/internal/service/a2a"
 )
 
 func NewRouter() http.Handler {
@@ -45,12 +46,32 @@ func NewRouterWithStoreAndAdmin(
 	maxClosedRetention time.Duration,
 	adminToken string,
 ) http.Handler {
+	handler, _ := NewRouterWithStoreAndAdminRuntime(
+		store,
+		viewerHeartbeatTimeout,
+		closedRoomGraceDelay,
+		maxClosedRetention,
+		adminToken,
+	)
+	return handler
+}
+
+func NewRouterWithStoreAndAdminRuntime(
+	store repository.Store,
+	viewerHeartbeatTimeout time.Duration,
+	closedRoomGraceDelay time.Duration,
+	maxClosedRetention time.Duration,
+	adminToken string,
+) (http.Handler, *a2a.Service) {
 	opts := options{
 		ViewerHeartbeatTimeout: viewerHeartbeatTimeout,
 		ClosedRoomGraceDelay:   closedRoomGraceDelay,
 		MaxClosedRetention:     maxClosedRetention,
 		AdminToken:             strings.TrimSpace(adminToken),
 		WebhookSecretKey:       strings.TrimSpace(os.Getenv("WEBHOOK_SECRET_ENCRYPTION_KEY")),
+		WebhookSecretKeyset:    strings.TrimSpace(os.Getenv("WEBHOOK_SECRET_ENCRYPTION_KEYS")),
+		RoomDEKKey:             strings.TrimSpace(os.Getenv("ROOM_DEK_ENCRYPTION_KEY")),
+		RoomDEKKeyset:          strings.TrimSpace(os.Getenv("ROOM_DEK_ENCRYPTION_KEYS")),
 	}
 	app := newApp(opts)
 	sqlMode := store != nil
@@ -86,7 +107,11 @@ func NewRouterWithStoreAndAdmin(
 		mux.HandleFunc("/v1/rooms/", app.handleRoomByID)
 	}
 
-	return withAccessLogs(withSecurityHeaders(withCORS(mux)), store)
+	var svc *a2a.Service
+	if sqlMode {
+		svc = sqlHandlers.svc
+	}
+	return withAccessLogs(withSecurityHeaders(withCORS(mux)), store), svc
 }
 
 func healthz(w http.ResponseWriter, _ *http.Request) {

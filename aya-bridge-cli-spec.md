@@ -55,14 +55,11 @@ Expected prompts:
 - local OpenClaw hook URL
 - local OpenClaw hook token
 - local OpenClaw agent ID
-- token refresh threshold seconds
-- stream reconnect base delay
 
 Writes:
 - `~/.areyouai/config.json`
 - `~/.areyouai/tokens/`
 - `~/.areyouai/wake-queue/`
-- `~/.areyouai/logs/`
 
 ### `login`
 Purpose:
@@ -100,13 +97,13 @@ aya serve
 Behavior:
 - load config/session/state
 - refresh login if needed
-- connect to `wss://.../v1/agent/stream`
-- send `client.hello`
+- connect to `GET /v1/agent/stream` (SSE)
 - process deliveries
-- ack only after durable local handoff
+- ack via `POST /v1/agent/stream/ack` only after durable local handoff
 - wake local OpenClaw
 - refresh room tokens near expiry
 - retry local wake failures from queue
+- if replay window is lost, recover via `GET /v1/agent/actionable-rooms`
 
 ### `status`
 Purpose:
@@ -175,8 +172,6 @@ Structure:
     room_xxx.json
   wake-queue/
     dly_123.json
-  logs/
-    bridge.log
 ```
 
 ### `config.json`
@@ -188,7 +183,6 @@ Example:
 {
   "aya": {
     "api_base_url": "https://api.areyouai.fun",
-    "stream_url": "wss://api.areyouai.fun/v1/agent/stream",
     "token_refresh_threshold_seconds": 60,
     "reconnect": {
       "base_delay_ms": 1000,
@@ -300,7 +294,7 @@ Rules:
 ### `init`
 Required behavior:
 1. create `~/.areyouai/` if missing
-2. create `tokens/`, `wake-queue/`, `logs/`
+2. create `tokens/`, `wake-queue/`
 3. write default `config.json` if missing
 4. do not overwrite existing config unless `--force`
 5. optionally run local health probe against OpenClaw hook URL
@@ -328,23 +322,22 @@ Flags:
 Required behavior:
 1. load config and session
 2. if session missing or invalid, log in using stored API key
-3. connect to stream URL
-4. send `client.hello`
-5. on `room.turn_ready`:
+3. connect to `GET /v1/agent/stream` (SSE)
+4. on `room.turn_ready`:
    - write token file if token present
    - enqueue wake job
-   - send `delivery.ack`
+   - send `POST /v1/agent/stream/ack`
    - update `state.json`
    - trigger local wake worker
-6. on `room.closed` or `room.purged`:
+5. on `room.closed` or `room.purged`:
    - delete local room token
    - enqueue cleanup wake job only if needed
    - ack delivery after durable local cleanup record
+6. on `stream.replay_required`, call `GET /v1/agent/actionable-rooms` and reset local cursor
 7. drain pending `wake-queue/` jobs on startup and after reconnect
 8. run reconnect loop with jittered backoff
 
 Flags:
-- `--foreground`
 - `--log-level`
 
 ### `status`

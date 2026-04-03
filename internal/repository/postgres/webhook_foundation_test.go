@@ -357,6 +357,162 @@ func TestWebhookOutboxClaimLifecycle(t *testing.T) {
 	}
 }
 
+func TestRoomEventStreamLeaseLifecycle(t *testing.T) {
+	db := openTestPostgresDB(t)
+	defer db.Close()
+	applyStoreMigrationsForTest(t, db)
+
+	store := NewStore(db)
+	ctx := context.Background()
+	roomID := seedRoomForEvents(t, ctx, store)
+	now := time.Now().UTC()
+
+	first, err := store.AcquireRoomEventStreamLease(ctx, repository.AcquireRoomEventStreamLeaseInput{
+		LeaseID:                 "lease_1",
+		RoomID:                  roomID,
+		AgentID:                 "agt_a",
+		RemoteIP:                "127.0.0.1",
+		Now:                     now,
+		LeaseExpiresAt:          now.Add(2 * time.Minute),
+		MaxActivePerRoomAgent:   1,
+		MaxConnectsPerMinuteKey: 5,
+		MaxConnectsPerMinuteIP:  5,
+	})
+	if err != nil {
+		t.Fatalf("acquire lease_1: %v", err)
+	}
+	if !first.Acquired {
+		t.Fatalf("lease_1 denied reason=%s", first.DeniedReason)
+	}
+
+	second, err := store.AcquireRoomEventStreamLease(ctx, repository.AcquireRoomEventStreamLeaseInput{
+		LeaseID:                 "lease_2",
+		RoomID:                  roomID,
+		AgentID:                 "agt_a",
+		RemoteIP:                "127.0.0.1",
+		Now:                     now,
+		LeaseExpiresAt:          now.Add(2 * time.Minute),
+		MaxActivePerRoomAgent:   1,
+		MaxConnectsPerMinuteKey: 5,
+		MaxConnectsPerMinuteIP:  5,
+	})
+	if err != nil {
+		t.Fatalf("acquire lease_2: %v", err)
+	}
+	if second.Acquired {
+		t.Fatalf("expected second lease denied, got acquired=%v", second.Acquired)
+	}
+	if second.DeniedReason != "max_active_streams_per_agent_room" {
+		t.Fatalf("deny reason=%q want=max_active_streams_per_agent_room", second.DeniedReason)
+	}
+
+	if err := store.ReleaseRoomEventStreamLease(ctx, "lease_1"); err != nil {
+		t.Fatalf("release lease_1: %v", err)
+	}
+
+	third, err := store.AcquireRoomEventStreamLease(ctx, repository.AcquireRoomEventStreamLeaseInput{
+		LeaseID:                 "lease_3",
+		RoomID:                  roomID,
+		AgentID:                 "agt_a",
+		RemoteIP:                "127.0.0.1",
+		Now:                     now,
+		LeaseExpiresAt:          now.Add(2 * time.Minute),
+		MaxActivePerRoomAgent:   1,
+		MaxConnectsPerMinuteKey: 5,
+		MaxConnectsPerMinuteIP:  5,
+	})
+	if err != nil {
+		t.Fatalf("acquire lease_3: %v", err)
+	}
+	if !third.Acquired {
+		t.Fatalf("lease_3 denied reason=%s", third.DeniedReason)
+	}
+}
+
+func TestMessageCoordinationState(t *testing.T) {
+	db := openTestPostgresDB(t)
+	defer db.Close()
+	applyStoreMigrationsForTest(t, db)
+
+	store := NewStore(db)
+	ctx := context.Background()
+	roomID := seedRoomForEvents(t, ctx, store)
+	if _, err := store.AppendMessage(ctx, repository.AppendMessageInput{
+		ID:         "msg_coord_1",
+		RoomID:     roomID,
+		SenderID:   "agt_a",
+		Turn:       0,
+		Ciphertext: "hello",
+	}); err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+
+	now := time.Now().UTC()
+	err := store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+		roomLocker, ok := tx.(repository.RoomLockStore)
+		if !ok {
+			t.Fatal("tx store missing room lock support")
+		}
+		if err := roomLocker.LockRoom(ctx, roomID); err != nil {
+			return err
+		}
+		counter, ok := tx.(repository.MessageCounterStore)
+		if !ok {
+			t.Fatal("tx store missing message counter support")
+		}
+		roomCount, err := counter.CountMessagesByRoomSince(ctx, roomID, now.Add(-time.Minute))
+		if err != nil {
+			return err
+		}
+		if roomCount != 1 {
+			t.Fatalf("roomCount=%d want=1", roomCount)
+		}
+		senderCount, err := counter.CountMessagesBySenderSince(ctx, "agt_a", now.Add(-time.Minute))
+		if err != nil {
+			return err
+		}
+		if senderCount != 1 {
+			t.Fatalf("senderCount=%d want=1", senderCount)
+		}
+		policy, ok := tx.(repository.AgentPolicyStore)
+		if !ok {
+			t.Fatal("tx store missing policy support")
+		}
+		blockedUntil, blocked, err := policy.GetAgentPolicyBlock(ctx, "agt_a", now)
+		if err != nil {
+			return err
+		}
+		if blocked {
+			t.Fatalf("unexpected block at %v", blockedUntil)
+		}
+		state, err := policy.RecordAgentPolicyViolation(ctx, "agt_a", now, 5*time.Minute, 15*time.Minute, 3)
+		if err != nil {
+			return err
+		}
+		if state.ViolationCount != 1 {
+			t.Fatalf("violation count after first record=%d want=1", state.ViolationCount)
+		}
+		state, err = policy.RecordAgentPolicyViolation(ctx, "agt_a", now, 5*time.Minute, 15*time.Minute, 3)
+		if err != nil {
+			return err
+		}
+		if state.ViolationCount != 2 || state.BlockedUntil != nil {
+			t.Fatalf("state after second record=%+v", state)
+		}
+		state, err = policy.RecordAgentPolicyViolation(ctx, "agt_a", now, 5*time.Minute, 15*time.Minute, 3)
+		if err != nil {
+			return err
+		}
+		if state.ViolationCount != 3 || state.BlockedUntil == nil {
+			t.Fatalf("state after third record=%+v", state)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("coordination tx: %v", err)
+	}
+}
+
 func TestWebhookOutboxClaimIndependentPerEndpoint(t *testing.T) {
 	db := openTestPostgresDB(t)
 	defer db.Close()

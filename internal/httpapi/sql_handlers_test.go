@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -8,8 +9,29 @@ import (
 	"testing"
 	"time"
 
+	"github.com/febrian/areyouai/internal/repository"
 	"github.com/febrian/areyouai/internal/service/a2a"
 )
+
+type fakeLeaseStore struct {
+	acquireOut repository.AcquireRoomEventStreamLeaseResult
+	acquireErr error
+	releaseErr error
+	acquired   int
+	released   int
+	lastIn     repository.AcquireRoomEventStreamLeaseInput
+}
+
+func (f *fakeLeaseStore) AcquireRoomEventStreamLease(_ context.Context, in repository.AcquireRoomEventStreamLeaseInput) (repository.AcquireRoomEventStreamLeaseResult, error) {
+	f.acquired++
+	f.lastIn = in
+	return f.acquireOut, f.acquireErr
+}
+
+func (f *fakeLeaseStore) ReleaseRoomEventStreamLease(_ context.Context, _ string) error {
+	f.released++
+	return f.releaseErr
+}
 
 func TestAllowIPMessageRateLimit(t *testing.T) {
 	t.Parallel()
@@ -101,14 +123,49 @@ func TestAdminAuthorized(t *testing.T) {
 
 	req2 := httptest.NewRequest(http.MethodGet, "/v1/admin/overview", nil)
 	req2.Header.Set("X-Admin-Token", "adm_secret")
-	if !h.adminAuthorized(req2) {
-		t.Fatal("expected admin auth success with X-Admin-Token")
+	if h.adminAuthorized(req2) {
+		t.Fatal("expected admin auth failure with legacy X-Admin-Token")
 	}
 
 	req3 := httptest.NewRequest(http.MethodGet, "/v1/admin/overview", nil)
 	req3.Header.Set("Authorization", "Bearer wrong")
 	if h.adminAuthorized(req3) {
 		t.Fatal("expected admin auth failure for wrong bearer token")
+	}
+}
+
+func TestHandleAdminRejectsLegacyXAdminToken(t *testing.T) {
+	t.Parallel()
+
+	h := &sqlHTTP{adminToken: "adm_secret"}
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/overview", nil)
+	req.Header.Set("X-Admin-Token", "adm_secret")
+	w := httptest.NewRecorder()
+
+	h.handleAdmin(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"error":"invalid_request"`) {
+		t.Fatalf("body=%s", w.Body.String())
+	}
+}
+
+func TestHandleAdminRejectsAdminTokenInQuery(t *testing.T) {
+	t.Parallel()
+
+	h := &sqlHTTP{adminToken: "adm_secret"}
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/overview?admin_token=adm_secret", nil)
+	w := httptest.NewRecorder()
+
+	h.handleAdmin(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"error":"invalid_request"`) {
+		t.Fatalf("body=%s", w.Body.String())
 	}
 }
 
@@ -195,13 +252,13 @@ func TestAcquireStreamSlotMaxActivePerAgentRoom(t *testing.T) {
 	now := time.Now().UTC()
 	releases := make([]func(), 0, maxActiveStreamsPerAgentRoom)
 	for i := 0; i < maxActiveStreamsPerAgentRoom; i++ {
-		release, _, err := h.acquireStreamSlot("agt_a", "room_x", "127.0.0.1:1234", now)
+		release, _, err := h.acquireStreamSlot(context.Background(), "agt_a", "room_x", "127.0.0.1:1234", now)
 		if err != nil {
 			t.Fatalf("unexpected acquire error at %d: %v", i, err)
 		}
 		releases = append(releases, release)
 	}
-	if _, reason, err := h.acquireStreamSlot("agt_a", "room_x", "127.0.0.1:1234", now); !errors.Is(err, a2a.ErrRateLimit) {
+	if _, reason, err := h.acquireStreamSlot(context.Background(), "agt_a", "room_x", "127.0.0.1:1234", now); !errors.Is(err, a2a.ErrRateLimit) {
 		t.Fatalf("expected rate limit err, got reason=%q err=%v", reason, err)
 	}
 	for _, release := range releases {
@@ -215,13 +272,13 @@ func TestAcquireStreamSlotReconnectFloodPerRoomAgent(t *testing.T) {
 	h := &sqlHTTP{}
 	now := time.Now().UTC()
 	for i := 0; i < maxStreamConnectsPerMinuteRoomKey; i++ {
-		release, _, err := h.acquireStreamSlot("agt_flood", "room_flood", "127.0.0.1:5555", now)
+		release, _, err := h.acquireStreamSlot(context.Background(), "agt_flood", "room_flood", "127.0.0.1:5555", now)
 		if err != nil {
 			t.Fatalf("unexpected acquire error at %d: %v", i, err)
 		}
 		release()
 	}
-	if _, reason, err := h.acquireStreamSlot("agt_flood", "room_flood", "127.0.0.1:5555", now); !errors.Is(err, a2a.ErrRateLimit) {
+	if _, reason, err := h.acquireStreamSlot(context.Background(), "agt_flood", "room_flood", "127.0.0.1:5555", now); !errors.Is(err, a2a.ErrRateLimit) {
 		t.Fatalf("expected flood rate limit err, got reason=%q err=%v", reason, err)
 	}
 }
@@ -233,13 +290,57 @@ func TestAcquireStreamSlotReconnectFloodPerIP(t *testing.T) {
 	now := time.Now().UTC()
 	for i := 0; i < maxStreamConnectsPerMinuteIP; i++ {
 		agentID := "agt_" + string(rune('a'+(i%26)))
-		release, _, err := h.acquireStreamSlot(agentID, "room_"+string(rune('a'+(i%26))), "10.0.0.1:9999", now)
+		release, _, err := h.acquireStreamSlot(context.Background(), agentID, "room_"+string(rune('a'+(i%26))), "10.0.0.1:9999", now)
 		if err != nil {
 			t.Fatalf("unexpected acquire error at %d: %v", i, err)
 		}
 		release()
 	}
-	if _, reason, err := h.acquireStreamSlot("agt_final", "room_final", "10.0.0.1:9999", now); !errors.Is(err, a2a.ErrRateLimit) {
+	if _, reason, err := h.acquireStreamSlot(context.Background(), "agt_final", "room_final", "10.0.0.1:9999", now); !errors.Is(err, a2a.ErrRateLimit) {
 		t.Fatalf("expected ip flood rate limit err, got reason=%q err=%v", reason, err)
+	}
+}
+
+func TestHandleTranscriptRejectsHumanCodeInQuery(t *testing.T) {
+	t.Parallel()
+
+	h := &sqlHTTP{}
+	req := httptest.NewRequest(http.MethodPost, "/v1/rooms/room_x/transcript?human_code=hc_x", strings.NewReader(`{"human_code":"hc_x"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.handleTranscript(w, req, "room_x")
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"error":"invalid_request"`) {
+		t.Fatalf("body=%s", w.Body.String())
+	}
+}
+
+func TestAcquireStreamSlotUsesDistributedLeaseStore(t *testing.T) {
+	t.Parallel()
+
+	leases := &fakeLeaseStore{
+		acquireOut: repository.AcquireRoomEventStreamLeaseResult{Acquired: true},
+	}
+	h := &sqlHTTP{streamLeaseStore: leases}
+	release, reason, err := h.acquireStreamSlot(context.Background(), "agt_dist", "room_dist", "127.0.0.1:3456", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("acquire stream slot: %v", err)
+	}
+	if reason != "" {
+		t.Fatalf("deny reason=%q want empty", reason)
+	}
+	if leases.acquired != 1 {
+		t.Fatalf("acquired calls=%d want=1", leases.acquired)
+	}
+	if leases.lastIn.RoomID != "room_dist" || leases.lastIn.AgentID != "agt_dist" {
+		t.Fatalf("unexpected acquire input: %+v", leases.lastIn)
+	}
+	release()
+	if leases.released != 1 {
+		t.Fatalf("released calls=%d want=1", leases.released)
 	}
 }

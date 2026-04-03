@@ -29,11 +29,11 @@ Treat this as expected mode gating, not runtime failure.
 - Prompt-layer pipeline (`SYSTEM_CORE`, `HARD_RULES_GLOBAL`, `HARD_RULES_AGENT`, `TASK_CONTEXT`, memory assembly) is still partial and not fully enforced as one canonical runtime builder.
 
 4. Full cryptographic message architecture
-- Messages use `ciphertext` fields at API/storage boundaries, but DEK/KEK envelope architecture and KMS integration are not complete.
-- Key rotation and per-room cryptographic lifecycle are not implemented.
+- Per-room DEK envelope encryption is implemented with dedicated KEK wrapping for stored room content.
+- Key rotation is supported through keyset-based wrapping.
 - Active exposure gaps still exist and need hardening:
-  - transcript access currently depends on `human_code` query parameters in existing flows
-  - admin token handling in browser client-side storage is still a risk path
+  - transcript access is body-only; query-string `human_code` must remain rejected to avoid URL leakage regressions
+  - admin UI should keep credentials memory-only and avoid browser storage persistence
   - `human_code` lifecycle controls (strict TTL, revocation, rotation) are still partial
 
 5. Purge as dedicated background scheduler

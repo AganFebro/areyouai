@@ -36,6 +36,7 @@ const (
 	agentStreamReplayWindow   = 30 * time.Minute
 	roomScopeAutomation       = "room:automation"
 	roomScopeReadOnly         = "room:read_only"
+	humanCodeTTL              = 24 * time.Hour
 )
 
 var (
@@ -53,10 +54,11 @@ var (
 )
 
 type Service struct {
-	store repository.Store
-	pb    *promptbuilder.Builder
-	emit  func(repository.RoomEvent)
-	seal  *secretcipher.Cipher
+	store    repository.Store
+	pb       *promptbuilder.Builder
+	emit     func(repository.RoomEvent)
+	seal     *secretcipher.Cipher
+	roomSeal *secretcipher.Cipher
 
 	mu             sync.Mutex
 	joined         map[string]map[string]bool
@@ -77,6 +79,9 @@ type Options struct {
 	MaxClosedRetention     time.Duration
 	RoomEventPublisher     func(repository.RoomEvent)
 	WebhookSecretKey       string
+	WebhookSecretKeyset    string
+	RoomDEKKey             string
+	RoomDEKKeyset          string
 }
 
 type RegisterResult struct {
@@ -157,7 +162,8 @@ func New(store repository.Store, opts Options) *Service {
 		store:                  store,
 		pb:                     pb,
 		emit:                   func(repository.RoomEvent) {},
-		seal:                   secretcipher.New(opts.WebhookSecretKey),
+		seal:                   secretcipher.NewWithKeyset(opts.WebhookSecretKey, opts.WebhookSecretKeyset),
+		roomSeal:               secretcipher.NewWithKeyset(opts.RoomDEKKey, opts.RoomDEKKeyset),
 		joined:                 make(map[string]map[string]bool),
 		messageWindows:         make(map[string][]time.Time),
 		roomWindows:            make(map[string][]time.Time),
@@ -424,6 +430,12 @@ func (s *Service) ResolveAgentStreamResume(ctx context.Context, agentID, lastDel
 			LastAcknowledgedDelivery: "",
 		}, nil
 	}
+	if !strings.EqualFold(strings.TrimSpace(delivery.Status), "acked") {
+		return AgentStreamResumeResult{
+			ResumeStatus:             "replay_required",
+			LastAcknowledgedDelivery: "",
+		}, nil
+	}
 	return AgentStreamResumeResult{
 		AfterSeq:                 delivery.Seq,
 		ResumeStatus:             "ok",
@@ -523,15 +535,22 @@ func (s *Service) CreateListing(ctx context.Context, agentID, topic string, tags
 	var emitted []repository.RoomEvent
 
 	err := s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+		humanCodeExpiresAt := now.Add(humanCodeTTL)
+		messageKeyCiphertext, _, err := s.newRoomMessageCipher()
+		if err != nil {
+			return err
+		}
 		rm, err := tx.CreateRoom(ctx, repository.CreateRoomInput{
-			ID:            roomID,
-			AgentAID:      agentID,
-			AgentBID:      "",
-			State:         domain.RoomStateOpen,
-			TurnIndex:     0,
-			MaxTurns:      maxTurns,
-			TTLAt:         now.Add(time.Duration(ttlSeconds) * time.Second),
-			HumanCodeHash: hashText(humanCode),
+			ID:                   roomID,
+			AgentAID:             agentID,
+			AgentBID:             "",
+			State:                domain.RoomStateOpen,
+			TurnIndex:            0,
+			MaxTurns:             maxTurns,
+			TTLAt:                now.Add(time.Duration(ttlSeconds) * time.Second),
+			HumanCodeHash:        hashText(humanCode),
+			HumanCodeExpiresAt:   &humanCodeExpiresAt,
+			MessageKeyCiphertext: messageKeyCiphertext,
 		})
 		if err != nil {
 			return err
@@ -629,16 +648,23 @@ func (s *Service) ConnectListing(ctx context.Context, agentID, listingID string)
 		if strings.TrimSpace(l.RoomID) == "" {
 			humanCode := "hc_" + randomToken(18)
 			now := s.now()
+			humanCodeExpiresAt := now.Add(humanCodeTTL)
 			active := domain.RoomStateActive
+			messageKeyCiphertext, _, err := s.newRoomMessageCipher()
+			if err != nil {
+				return err
+			}
 			rm, err := tx.CreateRoom(ctx, repository.CreateRoomInput{
-				ID:            newID("room"),
-				AgentAID:      l.AgentID,
-				AgentBID:      agentID,
-				State:         active,
-				TurnIndex:     0,
-				MaxTurns:      l.MaxTurns,
-				TTLAt:         now.Add(time.Duration(l.TTLSeconds) * time.Second),
-				HumanCodeHash: hashText(humanCode),
+				ID:                   newID("room"),
+				AgentAID:             l.AgentID,
+				AgentBID:             agentID,
+				State:                active,
+				TurnIndex:            0,
+				MaxTurns:             l.MaxTurns,
+				TTLAt:                now.Add(time.Duration(l.TTLSeconds) * time.Second),
+				HumanCodeHash:        hashText(humanCode),
+				HumanCodeExpiresAt:   &humanCodeExpiresAt,
+				MessageKeyCiphertext: messageKeyCiphertext,
 			})
 			if err != nil {
 				return err
@@ -834,9 +860,13 @@ type SendMessageResult struct {
 
 type PromptBundleResult struct {
 	BundleHash      string
+	OrderedStack    []string
 	SystemCoreHash  string
 	GlobalRulesHash string
 	AgentRulesHash  string
+	IdentityHash    string
+	SoulHash        string
+	UserHash        string
 	Prompt          string
 	NextTurn        int
 	NextActorID     string
@@ -897,31 +927,34 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 		return SendMessageResult{}, ErrGone
 	}
 	now := s.now()
-	if until, blocked := s.blockedUntilLocked(agentID, now); blocked {
-		s.appendAuditEventBestEffort(ctx, roomID, "message_policy_blocked", map[string]any{
-			"room_id":       roomID,
-			"agent_id":      agentID,
-			"code":          "agent_temporarily_blocked",
-			"reason":        "too many policy violations",
-			"blocked_until": until.Format(time.RFC3339),
-		}, 0)
-		return SendMessageResult{}, ErrPolicyBlocked
-	}
-	if !s.allowAgentMessageLocked(agentID, now) {
-		s.appendAuditEventBestEffort(ctx, roomID, "message_rate_limited", map[string]any{
-			"room_id":  roomID,
-			"agent_id": agentID,
-			"scope":    "agent",
-		}, 0)
-		return SendMessageResult{}, ErrRateLimit
-	}
-	if !s.allowRoomMessageLocked(roomID, now) {
-		s.appendAuditEventBestEffort(ctx, roomID, "message_rate_limited", map[string]any{
-			"room_id":  roomID,
-			"agent_id": agentID,
-			"scope":    "room",
-		}, 0)
-		return SendMessageResult{}, ErrRateLimit
+	sharedCoordination := supportsMultiInstanceCoordination(s.store)
+	if !sharedCoordination {
+		if until, blocked := s.blockedUntilLocked(agentID, now); blocked {
+			s.appendAuditEventBestEffort(ctx, roomID, "message_policy_blocked", map[string]any{
+				"room_id":       roomID,
+				"agent_id":      agentID,
+				"code":          "agent_temporarily_blocked",
+				"reason":        "too many policy violations",
+				"blocked_until": until.Format(time.RFC3339),
+			}, 0)
+			return SendMessageResult{}, ErrPolicyBlocked
+		}
+		if !s.allowAgentMessageLocked(agentID, now) {
+			s.appendAuditEventBestEffort(ctx, roomID, "message_rate_limited", map[string]any{
+				"room_id":  roomID,
+				"agent_id": agentID,
+				"scope":    "agent",
+			}, 0)
+			return SendMessageResult{}, ErrRateLimit
+		}
+		if !s.allowRoomMessageLocked(roomID, now) {
+			s.appendAuditEventBestEffort(ctx, roomID, "message_rate_limited", map[string]any{
+				"room_id":  roomID,
+				"agent_id": agentID,
+				"scope":    "room",
+			}, 0)
+			return SendMessageResult{}, ErrRateLimit
+		}
 	}
 	if expectedTurn != rm.TurnIndex {
 		return SendMessageResult{}, ErrTurnMismatch
@@ -936,32 +969,34 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 	}
 
 	decision := security.EvaluateMessageForPersist(ciphertext)
-	if !decision.Allowed {
-		violations := s.recordPolicyViolationLocked(agentID, now)
-		s.appendAuditEventBestEffort(ctx, roomID, "message_policy_blocked", map[string]any{
-			"room_id":          roomID,
-			"agent_id":         agentID,
-			"code":             decision.Code,
-			"reason":           decision.Reason,
-			"violation_count":  violations,
-			"blocked_temporal": violations >= maxPolicyViolationsWindow,
-		}, 0)
-		return SendMessageResult{}, ErrPolicyBlocked
-	}
 
 	bundle, recentCount, err := s.buildBundleForRoom(ctx, rm, agentID)
 	if err != nil {
 		return SendMessageResult{}, err
 	}
-	if !strings.EqualFold(bundle.BundleHash, providedBundleHash) {
-		s.appendAuditEventBestEffort(ctx, roomID, "bundle_hash_mismatch", map[string]any{
-			"room_id":       roomID,
-			"agent_id":      agentID,
-			"expected_hash": bundle.BundleHash,
-			"provided_hash": providedBundleHash,
-			"turn_index":    rm.TurnIndex,
-		}, recentCount)
-		return SendMessageResult{}, ErrStaleBundleHash
+	if !sharedCoordination {
+		if !decision.Allowed {
+			violations := s.recordPolicyViolationLocked(agentID, now)
+			s.appendAuditEventBestEffort(ctx, roomID, "message_policy_blocked", map[string]any{
+				"room_id":          roomID,
+				"agent_id":         agentID,
+				"code":             decision.Code,
+				"reason":           decision.Reason,
+				"violation_count":  violations,
+				"blocked_temporal": violations >= maxPolicyViolationsWindow,
+			}, 0)
+			return SendMessageResult{}, ErrPolicyBlocked
+		}
+		if !strings.EqualFold(bundle.BundleHash, providedBundleHash) {
+			s.appendAuditEventBestEffort(ctx, roomID, "bundle_hash_mismatch", map[string]any{
+				"room_id":       roomID,
+				"agent_id":      agentID,
+				"expected_hash": bundle.BundleHash,
+				"provided_hash": providedBundleHash,
+				"turn_index":    rm.TurnIndex,
+			}, recentCount)
+			return SendMessageResult{}, ErrStaleBundleHash
+		}
 	}
 
 	var msg repository.Message
@@ -970,13 +1005,104 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 	var updatedRoom repository.Room
 	var emitted []repository.RoomEvent
 	err = s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+		messageCipher, encErr := s.roomMessageCipher(rm)
+		if encErr != nil {
+			return encErr
+		}
+		if messageCipher == nil {
+			rm, messageCipher, encErr = s.ensureRoomMessageCipher(ctx, tx, rm)
+			if encErr != nil {
+				return encErr
+			}
+		}
+		storedCiphertext := ciphertext
+		if messageCipher != nil {
+			storedCiphertext, encErr = messageCipher.Encrypt(ciphertext)
+			if encErr != nil {
+				return encErr
+			}
+		}
+		if sharedCoordination {
+			if err := lockSharedMessageCoordination(ctx, tx, roomID, agentID); err != nil {
+				return err
+			}
+			if policyStore, ok := tx.(repository.AgentPolicyStore); ok {
+				if until, blocked, err := policyStore.GetAgentPolicyBlock(ctx, agentID, now); err != nil {
+					return err
+				} else if blocked {
+					s.appendAuditEventBestEffort(ctx, roomID, "message_policy_blocked", map[string]any{
+						"room_id":       roomID,
+						"agent_id":      agentID,
+						"code":          "agent_temporarily_blocked",
+						"reason":        "too many policy violations",
+						"blocked_until": until.Format(time.RFC3339),
+					}, 0)
+					return ErrPolicyBlocked
+				}
+			}
+			if counter, ok := tx.(repository.MessageCounterStore); ok {
+				agentCount, err := counter.CountMessagesBySenderSince(ctx, agentID, now.Add(-1*time.Minute))
+				if err != nil {
+					return err
+				}
+				if agentCount >= maxMessagesPerMinuteAgent {
+					s.appendAuditEventBestEffort(ctx, roomID, "message_rate_limited", map[string]any{
+						"room_id":  roomID,
+						"agent_id": agentID,
+						"scope":    "agent",
+					}, 0)
+					return ErrRateLimit
+				}
+				roomCount, err := counter.CountMessagesByRoomSince(ctx, roomID, now.Add(-1*time.Minute))
+				if err != nil {
+					return err
+				}
+				if roomCount >= maxMessagesPerMinuteRoom {
+					s.appendAuditEventBestEffort(ctx, roomID, "message_rate_limited", map[string]any{
+						"room_id":  roomID,
+						"agent_id": agentID,
+						"scope":    "room",
+					}, 0)
+					return ErrRateLimit
+				}
+			}
+			if !decision.Allowed {
+				state := repository.PolicyState{}
+				if policyStore, ok := tx.(repository.AgentPolicyStore); ok {
+					var recordErr error
+					state, recordErr = policyStore.RecordAgentPolicyViolation(ctx, agentID, now, policyViolationWindow, policyBlockDuration, maxPolicyViolationsWindow)
+					if recordErr != nil {
+						return recordErr
+					}
+				}
+				s.appendAuditEventBestEffort(ctx, roomID, "message_policy_blocked", map[string]any{
+					"room_id":          roomID,
+					"agent_id":         agentID,
+					"code":             decision.Code,
+					"reason":           decision.Reason,
+					"violation_count":  state.ViolationCount,
+					"blocked_temporal": state.BlockedUntil != nil,
+				}, 0)
+				return ErrPolicyBlocked
+			}
+			if !strings.EqualFold(bundle.BundleHash, providedBundleHash) {
+				s.appendAuditEventBestEffort(ctx, roomID, "bundle_hash_mismatch", map[string]any{
+					"room_id":       roomID,
+					"agent_id":      agentID,
+					"expected_hash": bundle.BundleHash,
+					"provided_hash": providedBundleHash,
+					"turn_index":    rm.TurnIndex,
+				}, recentCount)
+				return ErrStaleBundleHash
+			}
+		}
 		var txErr error
 		msg, txErr = tx.AppendMessage(ctx, repository.AppendMessageInput{
 			ID:         newID("msg"),
 			RoomID:     roomID,
 			SenderID:   agentID,
 			Turn:       rm.TurnIndex,
-			Ciphertext: ciphertext,
+			Ciphertext: storedCiphertext,
 		})
 		if txErr != nil {
 			if errors.Is(txErr, repository.ErrConflict) {
@@ -984,6 +1110,7 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 			}
 			return txErr
 		}
+		msg.Ciphertext = ciphertext
 
 		update := repository.UpdateRoomInput{
 			ID:        rm.ID,
@@ -1011,6 +1138,9 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 		})
 		if txErr != nil {
 			return txErr
+		}
+		if ev.Ciphertext != nil {
+			*ev.Ciphertext = ciphertext
 		}
 		emitted = append(emitted, ev)
 		if err := s.enqueueWebhookOutboxForEvent(ctx, tx, updatedRoom, ev, agentID); err != nil {
@@ -1077,6 +1207,9 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 		"system_core_hash":  bundle.SystemCoreHash,
 		"global_rules_hash": bundle.GlobalRulesHash,
 		"agent_rules_hash":  bundle.AgentRulesHash,
+		"identity_hash":     bundle.IdentityHash,
+		"soul_hash":         bundle.SoulHash,
+		"user_hash":         bundle.UserHash,
 		"room_id":           roomID,
 		"agent_id":          agentID,
 		"turn_index":        msg.Turn,
@@ -1128,9 +1261,13 @@ func (s *Service) GetPromptBundle(ctx context.Context, agentID, roomID string) (
 	}
 	return PromptBundleResult{
 		BundleHash:      bundle.BundleHash,
+		OrderedStack:    bundle.OrderedStack,
 		SystemCoreHash:  bundle.SystemCoreHash,
 		GlobalRulesHash: bundle.GlobalRulesHash,
 		AgentRulesHash:  bundle.AgentRulesHash,
+		IdentityHash:    bundle.IdentityHash,
+		SoulHash:        bundle.SoulHash,
+		UserHash:        bundle.UserHash,
 		Prompt:          bundle.Prompt,
 		NextTurn:        rm.TurnIndex,
 		NextActorID:     nextActorIDForRoom(rm),
@@ -1154,6 +1291,10 @@ func (s *Service) buildBundleForRoom(ctx context.Context, rm repository.Room, ag
 	}
 
 	recent, listErr := s.store.ListRoomMessages(ctx, rm.ID)
+	if listErr != nil {
+		return promptbuilder.Bundle{}, 0, listErr
+	}
+	recent, listErr = s.decryptRoomMessages(rm, recent)
 	if listErr != nil {
 		return promptbuilder.Bundle{}, 0, listErr
 	}
@@ -1187,6 +1328,27 @@ type RoomEventHistoryResult struct {
 
 type AdminOverviewResult struct {
 	Overview repository.AdminOverview
+	Purge    PurgeOverviewResult
+}
+
+type LifecycleSweepResult struct {
+	Scanned           int
+	ClosedTransitions int
+	PurgedTransitions int
+	ViewerBlocked     int
+	ReadyForPurge     int
+}
+
+type PurgeOverviewResult struct {
+	Scanned                   int
+	ClosedRooms               int
+	ReadyForPurge             int
+	ViewerBlocked             int
+	OverRetention             int
+	OldestClosedAgeSeconds    int
+	OldestReadyAgeSeconds     int
+	ClosedRoomGraceSeconds    int
+	MaxClosedRetentionSeconds int
 }
 
 func (s *Service) AdminOverview(ctx context.Context) (AdminOverviewResult, error) {
@@ -1194,7 +1356,11 @@ func (s *Service) AdminOverview(ctx context.Context) (AdminOverviewResult, error
 	if err != nil {
 		return AdminOverviewResult{}, err
 	}
-	return AdminOverviewResult{Overview: out}, nil
+	purge, err := s.PurgeOverview(ctx)
+	if err != nil {
+		return AdminOverviewResult{}, err
+	}
+	return AdminOverviewResult{Overview: out, Purge: purge}, nil
 }
 
 func (s *Service) AdminRooms(ctx context.Context, limit int) ([]repository.AdminRoom, error) {
@@ -1203,6 +1369,114 @@ func (s *Service) AdminRooms(ctx context.Context, limit int) ([]repository.Admin
 
 func (s *Service) AdminAudit(ctx context.Context, limit int) ([]repository.AuditEvent, error) {
 	return s.store.ListAuditEvents(ctx, limit)
+}
+
+func (s *Service) PurgeOverview(ctx context.Context) (PurgeOverviewResult, error) {
+	sweepStore, ok := s.store.(repository.RoomLifecycleSweepStore)
+	if !ok {
+		return PurgeOverviewResult{}, fmt.Errorf("purge overview unsupported by backing store")
+	}
+	rooms, err := sweepStore.ListRoomsForLifecycleSweep(ctx, s.now(), 1000)
+	if err != nil {
+		return PurgeOverviewResult{}, err
+	}
+	return s.purgeOverviewFromRooms(ctx, rooms), nil
+}
+
+func (s *Service) purgeOverviewFromRooms(ctx context.Context, rooms []repository.Room) PurgeOverviewResult {
+	now := s.now()
+	out := PurgeOverviewResult{
+		Scanned:                   len(rooms),
+		ClosedRoomGraceSeconds:    int(s.closedRoomGraceDelay.Seconds()),
+		MaxClosedRetentionSeconds: int(s.maxClosedRetention.Seconds()),
+	}
+	for _, rm := range rooms {
+		if rm.State != domain.RoomStateClosed {
+			continue
+		}
+		out.ClosedRooms++
+		closedAt := rm.ClosedAt
+		if closedAt == nil {
+			closedAt = &rm.CreatedAt
+		}
+		age := now.Sub(*closedAt)
+		if age < 0 {
+			age = 0
+		}
+		if secs := int(age.Seconds()); secs > out.OldestClosedAgeSeconds {
+			out.OldestClosedAgeSeconds = secs
+		}
+		activeCount, err := s.store.CountActiveViewers(ctx, rm.ID, now.Add(-s.viewerHeartbeatTimeout))
+		if err != nil {
+			continue
+		}
+		viewerBlocked := activeCount > 0
+		eligibleByGrace := !viewerBlocked && age >= s.closedRoomGraceDelay
+		eligibleByRetention := age >= s.maxClosedRetention
+		if viewerBlocked {
+			out.ViewerBlocked++
+		}
+		if eligibleByGrace || eligibleByRetention {
+			out.ReadyForPurge++
+			if secs := int(age.Seconds()); secs > out.OldestReadyAgeSeconds {
+				out.OldestReadyAgeSeconds = secs
+			}
+		}
+		if eligibleByRetention {
+			out.OverRetention++
+		}
+	}
+	return out
+}
+
+func (s *Service) SweepLifecycle(ctx context.Context, limit int) (LifecycleSweepResult, error) {
+	sweepStore, ok := s.store.(repository.RoomLifecycleSweepStore)
+	if !ok {
+		return LifecycleSweepResult{}, fmt.Errorf("lifecycle sweep unsupported by backing store")
+	}
+	rooms, err := sweepStore.ListRoomsForLifecycleSweep(ctx, s.now(), limit)
+	if err != nil {
+		return LifecycleSweepResult{}, err
+	}
+
+	out := LifecycleSweepResult{Scanned: len(rooms)}
+	for _, candidate := range rooms {
+		before := candidate.State
+		after, reconcileErr := s.reconcileRoom(ctx, candidate)
+		if reconcileErr != nil {
+			return out, reconcileErr
+		}
+		if after.State == domain.RoomStateClosed {
+			activeCount, err := s.store.CountActiveViewers(ctx, after.ID, s.now().Add(-s.viewerHeartbeatTimeout))
+			if err != nil {
+				return out, err
+			}
+			closedAt := after.ClosedAt
+			if closedAt == nil {
+				closedAt = &after.CreatedAt
+			}
+			age := s.now().Sub(*closedAt)
+			if age < 0 {
+				age = 0
+			}
+			if activeCount > 0 {
+				out.ViewerBlocked++
+			}
+			if (activeCount == 0 && age >= s.closedRoomGraceDelay) || age >= s.maxClosedRetention {
+				out.ReadyForPurge++
+			}
+		}
+		if before == after.State {
+			continue
+		}
+		if after.State == domain.RoomStateClosed {
+			out.ClosedTransitions++
+		}
+		if after.State == domain.RoomStatePurged {
+			out.PurgedTransitions++
+		}
+	}
+	return out, nil
 }
 
 func (s *Service) ListRoomEventHistory(ctx context.Context, agentID, roomID string, sinceID int64, limit int) (RoomEventHistoryResult, error) {
@@ -1256,6 +1530,10 @@ func (s *Service) ListRoomEventHistory(ctx context.Context, agentID, roomID stri
 		SinceID: sinceID,
 		Limit:   limit,
 	})
+	if err != nil {
+		return RoomEventHistoryResult{}, err
+	}
+	items, err = s.decryptRoomEvents(rm, items)
 	if err != nil {
 		return RoomEventHistoryResult{}, err
 	}
@@ -1326,6 +1604,22 @@ func (s *Service) CloseRoom(ctx context.Context, agentID, roomID string) (reposi
 	var updatedRoom repository.Room
 	var emitted []repository.RoomEvent
 	err = s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+		if roomLocker, ok := tx.(repository.RoomLockStore); ok {
+			if err := roomLocker.LockRoom(ctx, roomID); err != nil {
+				return err
+			}
+		}
+		current, currentErr := tx.GetRoom(ctx, roomID)
+		if currentErr != nil {
+			return currentErr
+		}
+		if current.State == domain.RoomStatePurged {
+			return ErrGone
+		}
+		if current.State == domain.RoomStateClosed {
+			updatedRoom = current
+			return nil
+		}
 		room, txErr := tx.UpdateRoom(ctx, repository.UpdateRoomInput{
 			ID:       roomID,
 			State:    &closed,
@@ -1407,8 +1701,15 @@ func (s *Service) Transcript(ctx context.Context, roomID, humanCode string) (Tra
 	if subtle.ConstantTimeCompare([]byte(hashText(humanCode)), []byte(rm.HumanCodeHash)) != 1 {
 		return TranscriptResult{}, ErrForbidden
 	}
+	if rm.HumanCodeExpiresAt != nil && s.now().After(*rm.HumanCodeExpiresAt) {
+		return TranscriptResult{}, ErrForbidden
+	}
 
 	msgs, err := s.store.ListRoomMessages(ctx, roomID)
+	if err != nil {
+		return TranscriptResult{}, err
+	}
+	msgs, err = s.decryptRoomMessages(rm, msgs)
 	if err != nil {
 		return TranscriptResult{}, err
 	}
@@ -1436,6 +1737,9 @@ func (s *Service) ViewerJoin(ctx context.Context, roomID, humanCode string) (Vie
 		return ViewerResult{}, ErrGone
 	}
 	if subtle.ConstantTimeCompare([]byte(hashText(strings.TrimSpace(humanCode))), []byte(rm.HumanCodeHash)) != 1 {
+		return ViewerResult{}, ErrForbidden
+	}
+	if rm.HumanCodeExpiresAt != nil && s.now().After(*rm.HumanCodeExpiresAt) {
 		return ViewerResult{}, ErrForbidden
 	}
 
@@ -1540,7 +1844,20 @@ func (s *Service) reconcileRoomLocked(ctx context.Context, rm repository.Room) (
 			var updated repository.Room
 			var emitted []repository.RoomEvent
 			err := s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+				if roomLocker, ok := tx.(repository.RoomLockStore); ok {
+					if err := roomLocker.LockRoom(ctx, rm.ID); err != nil {
+						return err
+					}
+				}
 				var txErr error
+				current, currentErr := tx.GetRoom(ctx, rm.ID)
+				if currentErr != nil {
+					return currentErr
+				}
+				if current.State == domain.RoomStateClosed || current.State == domain.RoomStatePurged {
+					updated = current
+					return nil
+				}
 				updated, txErr = tx.UpdateRoom(ctx, repository.UpdateRoomInput{
 					ID:       rm.ID,
 					State:    &closed,
@@ -1623,6 +1940,22 @@ func (s *Service) reconcileRoomLocked(ctx context.Context, rm repository.Room) (
 			var purgedRoom repository.Room
 			var emitted []repository.RoomEvent
 			err = s.store.WithTx(ctx, func(ctx context.Context, tx repository.TxStore) error {
+				if roomLocker, ok := tx.(repository.RoomLockStore); ok {
+					if err := roomLocker.LockRoom(ctx, rm.ID); err != nil {
+						return err
+					}
+				}
+				current, currentErr := tx.GetRoom(ctx, rm.ID)
+				if currentErr != nil {
+					return currentErr
+				}
+				if current.State == domain.RoomStatePurged {
+					purgedRoom = current
+					return nil
+				}
+				if current.State != domain.RoomStateClosed {
+					return nil
+				}
 				if txErr := tx.PurgeRoomContent(ctx, rm.ID, now); txErr != nil {
 					return txErr
 				}
@@ -1666,14 +1999,9 @@ func (s *Service) reconcileRoomLocked(ctx context.Context, rm repository.Room) (
 				return repository.Room{}, err
 			}
 			s.publishRoomEvents(emitted)
-			if err := s.store.AppendAuditEvent(ctx, repository.AppendAuditEventInput{
-				RoomID:       rm.ID,
-				Event:        "room_purged",
-				Meta:         "content hard-deleted",
-				MessageCount: len(msgs),
-			}); err != nil {
-				return repository.Room{}, err
-			}
+			s.appendAuditEventBestEffort(ctx, rm.ID, "room_purged", map[string]any{
+				"detail": "content hard-deleted",
+			}, len(msgs))
 			return purgedRoom, nil
 		}
 	}
@@ -1821,6 +2149,25 @@ func revokeRoomScopedTokensForRoom(ctx context.Context, tx repository.TxStore, r
 	return nil
 }
 
+func supportsMultiInstanceCoordination(store repository.Store) bool {
+	_, ok := store.(repository.MultiInstanceCoordinationStore)
+	return ok
+}
+
+func lockSharedMessageCoordination(ctx context.Context, tx repository.TxStore, roomID, agentID string) error {
+	if roomLocker, ok := tx.(repository.RoomLockStore); ok {
+		if err := roomLocker.LockRoom(ctx, roomID); err != nil {
+			return err
+		}
+	}
+	if advisoryLocker, ok := tx.(repository.AdvisoryLockStore); ok {
+		if err := advisoryLocker.LockAdvisory(ctx, "agent:"+strings.TrimSpace(agentID)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func normalizeWebhookEndpointURL(raw string) (string, error) {
 	parsed, err := neturl.Parse(strings.TrimSpace(raw))
 	if err != nil {
@@ -1892,6 +2239,10 @@ func (s *Service) formatTaskContext(payload roomContextPayload, agentID string) 
 func (s *Service) upsertRoomContext(ctx context.Context, rm repository.Room, lastActorID string) error {
 	payload := s.roomContextFromRoom(rm, lastActorID)
 	recent, err := s.store.ListRoomMessages(ctx, rm.ID)
+	if err != nil {
+		return err
+	}
+	recent, err = s.decryptRoomMessages(rm, recent)
 	if err != nil {
 		return err
 	}
@@ -2144,6 +2495,85 @@ func selectRecentMemory(messages []repository.Message) []recentMemoryEntry {
 		})
 	}
 	return out
+}
+
+func (s *Service) newRoomMessageCipher() (string, *secretcipher.Cipher, error) {
+	keyMaterial := "mk_" + randomToken(32)
+	wrapped, err := s.roomSeal.Encrypt(keyMaterial)
+	if err != nil {
+		return "", nil, err
+	}
+	return wrapped, secretcipher.New(keyMaterial), nil
+}
+
+func (s *Service) roomMessageCipher(rm repository.Room) (*secretcipher.Cipher, error) {
+	if strings.TrimSpace(rm.MessageKeyCiphertext) == "" {
+		return nil, nil
+	}
+	keyMaterial, err := s.roomSeal.Decrypt(rm.MessageKeyCiphertext)
+	if err != nil {
+		return nil, err
+	}
+	return secretcipher.New(keyMaterial), nil
+}
+
+func (s *Service) ensureRoomMessageCipher(ctx context.Context, tx repository.TxStore, rm repository.Room) (repository.Room, *secretcipher.Cipher, error) {
+	if strings.TrimSpace(rm.MessageKeyCiphertext) != "" {
+		cipher, err := s.roomMessageCipher(rm)
+		return rm, cipher, err
+	}
+	wrapped, cipher, err := s.newRoomMessageCipher()
+	if err != nil {
+		return repository.Room{}, nil, err
+	}
+	updated, err := tx.UpdateRoom(ctx, repository.UpdateRoomInput{
+		ID:                   rm.ID,
+		MessageKeyCiphertext: &wrapped,
+	})
+	if err != nil {
+		return repository.Room{}, nil, err
+	}
+	return updated, cipher, nil
+}
+
+func (s *Service) decryptRoomMessages(rm repository.Room, msgs []repository.Message) ([]repository.Message, error) {
+	cipher, err := s.roomMessageCipher(rm)
+	if err != nil || cipher == nil {
+		return msgs, err
+	}
+	out := make([]repository.Message, len(msgs))
+	copy(out, msgs)
+	for i := range out {
+		if strings.TrimSpace(out[i].Ciphertext) == "" {
+			continue
+		}
+		plain, decErr := cipher.Decrypt(out[i].Ciphertext)
+		if decErr != nil {
+			return nil, decErr
+		}
+		out[i].Ciphertext = plain
+	}
+	return out, nil
+}
+
+func (s *Service) decryptRoomEvents(rm repository.Room, items []repository.RoomEvent) ([]repository.RoomEvent, error) {
+	cipher, err := s.roomMessageCipher(rm)
+	if err != nil || cipher == nil {
+		return items, err
+	}
+	out := make([]repository.RoomEvent, len(items))
+	copy(out, items)
+	for i := range out {
+		if out[i].Ciphertext == nil || strings.TrimSpace(*out[i].Ciphertext) == "" {
+			continue
+		}
+		plain, decErr := cipher.Decrypt(*out[i].Ciphertext)
+		if decErr != nil {
+			return nil, decErr
+		}
+		out[i].Ciphertext = &plain
+	}
+	return out, nil
 }
 
 func (s *Service) publishRoomEvents(events []repository.RoomEvent) {

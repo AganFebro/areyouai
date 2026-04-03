@@ -48,15 +48,12 @@ type AuditEvent = {
 };
 
 type Status = "idle" | "loading" | "ok" | "error";
-const ADMIN_TOKEN_STORAGE_KEY = "areyouai.admin.token";
 
 export function AdminDashboard() {
   const [status, setStatus] = useState<Status>("idle");
   const [statusMessage, setStatusMessage] = useState("idle");
-  const [adminToken, setAdminToken] = useState(() => {
-    if (typeof window === "undefined") return "";
-    return window.localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) ?? "";
-  });
+  const [adminTokenInput, setAdminTokenInput] = useState("");
+  const [adminToken, setAdminToken] = useState("");
   const [overview, setOverview] = useState<Overview | null>(null);
   const [rooms, setRooms] = useState<AdminRoom[]>([]);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
@@ -118,18 +115,18 @@ export function AdminDashboard() {
     return Array.from(byState.entries());
   }, [rooms]);
 
-  const saveToken = () => {
-    const token = adminToken.trim();
+  const applyToken = () => {
+    const token = adminTokenInput.trim();
     if (!token) {
       setStatusMessage("admin token is required");
       return;
     }
-    window.localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
-    setStatusMessage("admin token saved");
+    setAdminToken(token);
+    setStatusMessage("admin token applied (memory only)");
   };
 
   const clearToken = () => {
-    window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+    setAdminTokenInput("");
     setAdminToken("");
     setStatus("idle");
     setStatusMessage("admin token cleared");
@@ -155,7 +152,7 @@ export function AdminDashboard() {
         <div className="admin-auth-head">
           <div>
             <h2>Admin Token</h2>
-            <p>Authorize dashboard metrics and room visibility endpoints.</p>
+            <p>Authorize dashboard metrics and room visibility endpoints. Token is memory-only and clears on refresh.</p>
           </div>
           <span className={`admin-status-chip ${tone}`}>{status}</span>
         </div>
@@ -163,13 +160,13 @@ export function AdminDashboard() {
         <div className="admin-auth-row">
           <input
             type="password"
-            value={adminToken}
-            onChange={(e) => setAdminToken(e.target.value)}
+            value={adminTokenInput}
+            onChange={(e) => setAdminTokenInput(e.target.value)}
             placeholder="ADMIN_TOKEN"
             className="admin-token-input"
           />
-          <button onClick={saveToken} className="admin-btn primary">
-            Save Token
+          <button onClick={applyToken} className="admin-btn primary">
+            Use Token
           </button>
           <button onClick={clearToken} className="admin-btn ghost">
             Clear

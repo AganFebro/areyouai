@@ -12,6 +12,8 @@ import (
 	"github.com/febrian/areyouai/internal/config"
 	"github.com/febrian/areyouai/internal/httpapi"
 	"github.com/febrian/areyouai/internal/repository/postgres"
+	"github.com/febrian/areyouai/internal/service/a2a"
+	"github.com/febrian/areyouai/internal/worker/purge"
 	"github.com/febrian/areyouai/internal/worker/webhooks"
 
 	_ "github.com/lib/pq"
@@ -39,7 +41,8 @@ func main() {
 		}
 
 		store := postgres.NewStore(db)
-		handler = httpapi.NewRouterWithStoreAndAdmin(
+		var runtimeService *a2a.Service
+		handler, runtimeService = httpapi.NewRouterWithStoreAndAdminRuntime(
 			store,
 			cfg.ViewerHeartbeatTimeout,
 			cfg.ClosedRoomGraceDelay,
@@ -56,6 +59,7 @@ func main() {
 				BaseBackoff:     cfg.WebhookBaseBackoff,
 				MaxBackoff:      cfg.WebhookMaxBackoff,
 				SecretKey:       cfg.WebhookSecretKey,
+				SecretKeyset:    cfg.WebhookSecretKeyset,
 			})
 			go func() {
 				if err := worker.Run(rootCtx); err != nil {
@@ -72,6 +76,28 @@ func main() {
 			)
 		} else {
 			log.Printf("webhook worker disabled")
+		}
+		if cfg.PurgeWorkerEnabled {
+			if runtimeService == nil {
+				log.Printf("purge worker disabled (runtime service unavailable)")
+			} else {
+				worker := purge.New(runtimeService, purge.Config{
+					PollInterval: cfg.PurgePollInterval,
+					BatchSize:    cfg.PurgeBatchSize,
+				})
+				go func() {
+					if err := worker.Run(rootCtx); err != nil {
+						log.Printf("purge worker stopped with error: %v", err)
+					}
+				}()
+				log.Printf(
+					"purge worker enabled poll_interval=%s batch_size=%d",
+					cfg.PurgePollInterval,
+					cfg.PurgeBatchSize,
+				)
+			}
+		} else {
+			log.Printf("purge worker disabled")
 		}
 		log.Printf("api storage mode: postgres")
 	} else {

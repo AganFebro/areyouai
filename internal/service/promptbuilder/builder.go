@@ -14,9 +14,16 @@ type Builder struct {
 	systemCoreText   string
 	globalRulesText  string
 	agentRulesText   string
+	identityText     string
+	soulText         string
+	userText         string
+	orderedStack     []string
 	systemCoreHash   string
 	globalRulesHash  string
 	agentRulesHash   string
+	identityHash     string
+	soulHash         string
+	userHash         string
 	maxRecentMessage int
 	maxContextTokens int
 }
@@ -35,9 +42,13 @@ type RecentMessage struct {
 type Bundle struct {
 	Prompt          string
 	BundleHash      string
+	OrderedStack    []string
 	SystemCoreHash  string
 	GlobalRulesHash string
 	AgentRulesHash  string
+	IdentityHash    string
+	SoulHash        string
+	UserHash        string
 }
 
 func NewDefaultBuilder() (*Builder, error) {
@@ -58,18 +69,40 @@ func NewDefaultBuilder() (*Builder, error) {
 	if err != nil {
 		return nil, err
 	}
+	identity, err := os.ReadFile(filepath.Join(root, "prompt_layers", "IDENTITY.default.md"))
+	if err != nil {
+		return nil, err
+	}
+	soul, err := os.ReadFile(filepath.Join(root, "prompt_layers", "SOUL.default.md"))
+	if err != nil {
+		return nil, err
+	}
+	user, err := os.ReadFile(filepath.Join(root, "prompt_layers", "USER.default.md"))
+	if err != nil {
+		return nil, err
+	}
 
 	systemCoreText := strings.TrimSpace(string(systemCore))
 	globalRulesText := strings.TrimSpace(string(globalRules))
 	agentRulesText := strings.TrimSpace(string(agentRules))
+	identityText := strings.TrimSpace(string(identity))
+	soulText := strings.TrimSpace(string(soul))
+	userText := strings.TrimSpace(string(user))
 
 	return &Builder{
 		systemCoreText:   systemCoreText,
 		globalRulesText:  globalRulesText,
 		agentRulesText:   agentRulesText,
+		identityText:     identityText,
+		soulText:         soulText,
+		userText:         userText,
+		orderedStack:     []string{"SYSTEM_CORE", "HARD_RULES_GLOBAL", "HARD_RULES_AGENT", "IDENTITY", "SOUL", "USER", "TASK_CONTEXT", "RECENT_MEMORY"},
 		systemCoreHash:   hash(systemCoreText),
 		globalRulesHash:  hash(globalRulesText),
 		agentRulesHash:   hash(agentRulesText),
+		identityHash:     hash(identityText),
+		soulHash:         hash(soulText),
+		userHash:         hash(userText),
 		maxRecentMessage: 6,
 		maxContextTokens: 1000,
 	}, nil
@@ -81,39 +114,18 @@ func (b *Builder) Build(in BuildInput) Bundle {
 		recent = recent[len(recent)-b.maxRecentMessage:]
 	}
 	recent = b.fitRecentToTokenCap(in.TaskContext, recent)
-
-	var recentLines []string
-	if len(recent) == 0 {
-		recentLines = append(recentLines, "(empty)")
-	} else {
-		for _, m := range recent {
-			recentLines = append(recentLines, fmt.Sprintf("- turn=%d sender=%s msg=%s", m.Turn, m.SenderID, m.Ciphertext))
-		}
-	}
-
-	prompt := strings.Join([]string{
-		"[SYSTEM_CORE]",
-		b.systemCoreText,
-		"",
-		"[HARD_RULES_GLOBAL]",
-		b.globalRulesText,
-		"",
-		"[HARD_RULES_AGENT]",
-		b.agentRulesText,
-		"",
-		"[TASK_CONTEXT]",
-		strings.TrimSpace(in.TaskContext),
-		"",
-		"[RECENT_MEMORY]",
-		strings.Join(recentLines, "\n"),
-	}, "\n")
+	prompt := b.renderCanonicalPrompt(in.TaskContext, recent)
 
 	return Bundle{
 		Prompt:          prompt,
 		BundleHash:      hash(prompt),
+		OrderedStack:    append([]string(nil), b.orderedStack...),
 		SystemCoreHash:  b.systemCoreHash,
 		GlobalRulesHash: b.globalRulesHash,
 		AgentRulesHash:  b.agentRulesHash,
+		IdentityHash:    b.identityHash,
+		SoulHash:        b.soulHash,
+		UserHash:        b.userHash,
 	}
 }
 
@@ -144,30 +156,41 @@ func (b *Builder) fitRecentToTokenCap(taskContext string, recent []RecentMessage
 }
 
 func (b *Builder) composePrompt(taskContext string, recent []RecentMessage) string {
-	var recentLines []string
-	if len(recent) == 0 {
-		recentLines = append(recentLines, "(empty)")
-	} else {
-		for _, m := range recent {
-			recentLines = append(recentLines, fmt.Sprintf("- turn=%d sender=%s msg=%s", m.Turn, m.SenderID, m.Ciphertext))
-		}
+	return b.renderCanonicalPrompt(taskContext, recent)
+}
+
+type promptSection struct {
+	marker string
+	text   string
+}
+
+func (b *Builder) renderCanonicalPrompt(taskContext string, recent []RecentMessage) string {
+	sections := []promptSection{
+		{marker: "SYSTEM_CORE", text: b.systemCoreText},
+		{marker: "HARD_RULES_GLOBAL", text: b.globalRulesText},
+		{marker: "HARD_RULES_AGENT", text: b.agentRulesText},
+		{marker: "IDENTITY", text: b.identityText},
+		{marker: "SOUL", text: b.soulText},
+		{marker: "USER", text: b.userText},
+		{marker: "TASK_CONTEXT", text: strings.TrimSpace(taskContext)},
+		{marker: "RECENT_MEMORY", text: renderRecentMemory(recent)},
 	}
-	return strings.Join([]string{
-		"[SYSTEM_CORE]",
-		b.systemCoreText,
-		"",
-		"[HARD_RULES_GLOBAL]",
-		b.globalRulesText,
-		"",
-		"[HARD_RULES_AGENT]",
-		b.agentRulesText,
-		"",
-		"[TASK_CONTEXT]",
-		strings.TrimSpace(taskContext),
-		"",
-		"[RECENT_MEMORY]",
-		strings.Join(recentLines, "\n"),
-	}, "\n")
+	parts := make([]string, 0, len(sections)*3)
+	for _, section := range sections {
+		parts = append(parts, fmt.Sprintf("[%s]", section.marker), section.text, "")
+	}
+	return strings.TrimRight(strings.Join(parts, "\n"), "\n")
+}
+
+func renderRecentMemory(recent []RecentMessage) string {
+	if len(recent) == 0 {
+		return "(empty)"
+	}
+	lines := make([]string, 0, len(recent))
+	for _, m := range recent {
+		lines = append(lines, fmt.Sprintf("- turn=%d sender=%s msg=%s", m.Turn, m.SenderID, m.Ciphertext))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func estimateTokens(text string) int {

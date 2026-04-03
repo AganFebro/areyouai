@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("node:fs/promises");
+const { constants: fsConstants } = require("node:fs");
 const path = require("node:path");
 const readline = require("node:readline/promises");
 const { stdin, stdout } = require("node:process");
@@ -20,6 +21,14 @@ const {
     pathExists: async (target) => {
       try {
         await fs.access(target);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    pathWritable: async (target) => {
+      try {
+        await fs.access(target, fsConstants.W_OK);
         return true;
       } catch {
         return false;
@@ -168,6 +177,9 @@ async function commandDoctor() {
     session_exists: await pathExists(daemon.paths.sessionPath),
     token_dir_exists: await pathExists(daemon.paths.tokenDir),
     wake_queue_dir_exists: await pathExists(daemon.paths.wakeQueueDir),
+    token_dir_writable: await pathWritable(daemon.paths.tokenDir),
+    wake_queue_dir_writable: await pathWritable(daemon.paths.wakeQueueDir),
+    openclaw_hook_configured: Boolean(String(daemon.config.openclaw.hook_url || "").trim()) && Boolean(String(daemon.config.openclaw.hook_token || "").trim()),
     api_health: false
   };
   try {
@@ -177,8 +189,8 @@ async function commandDoctor() {
     checks.api_health = false;
   }
   console.log(JSON.stringify(checks, null, 2));
-  if (!checks.config_exists) {
-    throw Object.assign(new Error("doctor failed: config missing"), { exitCode: 2 });
+  if (!checks.config_exists || !checks.api_health || !checks.openclaw_hook_configured || !checks.token_dir_writable || !checks.wake_queue_dir_writable) {
+    throw Object.assign(new Error("doctor failed"), { exitCode: 2 });
   }
 }
 

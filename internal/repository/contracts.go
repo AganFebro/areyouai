@@ -16,6 +16,53 @@ type TxRunner interface {
 	WithTx(ctx context.Context, fn func(ctx context.Context, tx TxStore) error) error
 }
 
+// RoomEventStreamLeaseStore is an optional extension used for distributed
+// room-event stream coordination in multi-instance deployments.
+type RoomEventStreamLeaseStore interface {
+	AcquireRoomEventStreamLease(ctx context.Context, in AcquireRoomEventStreamLeaseInput) (AcquireRoomEventStreamLeaseResult, error)
+	ReleaseRoomEventStreamLease(ctx context.Context, leaseID string) error
+}
+
+// AdvisoryLockStore provides transaction-scoped shared coordination hooks for
+// multi-instance rate limits and room guards.
+type AdvisoryLockStore interface {
+	LockAdvisory(ctx context.Context, key string) error
+}
+
+// RoomLockStore provides row-level room serialization for state transitions.
+type RoomLockStore interface {
+	LockRoom(ctx context.Context, roomID string) error
+}
+
+// MessageCounterStore counts recent message activity for shared rate limiting.
+type MessageCounterStore interface {
+	CountMessagesBySenderSince(ctx context.Context, senderID string, since time.Time) (int, error)
+	CountMessagesByRoomSince(ctx context.Context, roomID string, since time.Time) (int, error)
+}
+
+type PolicyState struct {
+	ViolationCount int
+	BlockedUntil   *time.Time
+}
+
+// AgentPolicyStore tracks recent policy violations and temporary blocks.
+type AgentPolicyStore interface {
+	GetAgentPolicyBlock(ctx context.Context, agentID string, now time.Time) (time.Time, bool, error)
+	RecordAgentPolicyViolation(ctx context.Context, agentID string, now time.Time, window time.Duration, blockDuration time.Duration, maxViolations int) (PolicyState, error)
+}
+
+// MultiInstanceCoordinationStore marks backends that can coordinate guards
+// across multiple API instances.
+type MultiInstanceCoordinationStore interface {
+	SupportsMultiInstanceCoordination() bool
+}
+
+// RoomLifecycleSweepStore is an optional extension used by background
+// lifecycle workers to fetch room candidates for close/purge reconciliation.
+type RoomLifecycleSweepStore interface {
+	ListRoomsForLifecycleSweep(ctx context.Context, now time.Time, limit int) ([]Room, error)
+}
+
 type Store interface {
 	TxRunner
 
@@ -117,17 +164,19 @@ type Listing struct {
 }
 
 type Room struct {
-	ID            string           `json:"id"`
-	AgentAID      string           `json:"agent_a_id"`
-	AgentBID      string           `json:"agent_b_id"`
-	State         domain.RoomState `json:"state"`
-	TurnIndex     int              `json:"turn_index"`
-	MaxTurns      int              `json:"max_turns"`
-	TTLAt         time.Time        `json:"ttl_at"`
-	CreatedAt     time.Time        `json:"created_at"`
-	ClosedAt      *time.Time       `json:"closed_at,omitempty"`
-	PurgedAt      *time.Time       `json:"purged_at,omitempty"`
-	HumanCodeHash string           `json:"human_code_hash,omitempty"`
+	ID                   string           `json:"id"`
+	AgentAID             string           `json:"agent_a_id"`
+	AgentBID             string           `json:"agent_b_id"`
+	State                domain.RoomState `json:"state"`
+	TurnIndex            int              `json:"turn_index"`
+	MaxTurns             int              `json:"max_turns"`
+	TTLAt                time.Time        `json:"ttl_at"`
+	CreatedAt            time.Time        `json:"created_at"`
+	ClosedAt             *time.Time       `json:"closed_at,omitempty"`
+	PurgedAt             *time.Time       `json:"purged_at,omitempty"`
+	HumanCodeHash        string           `json:"human_code_hash,omitempty"`
+	HumanCodeExpiresAt   *time.Time       `json:"human_code_expires_at,omitempty"`
+	MessageKeyCiphertext string           `json:"message_key_ciphertext,omitempty"`
 }
 
 type Message struct {
@@ -289,6 +338,26 @@ type CreateSessionInput struct {
 	ExpiresAt *time.Time
 }
 
+type AcquireRoomEventStreamLeaseInput struct {
+	LeaseID                 string
+	RoomID                  string
+	AgentID                 string
+	RemoteIP                string
+	Now                     time.Time
+	LeaseExpiresAt          time.Time
+	MaxActivePerRoomAgent   int
+	MaxConnectsPerMinuteKey int
+	MaxConnectsPerMinuteIP  int
+}
+
+type AcquireRoomEventStreamLeaseResult struct {
+	Acquired             bool
+	DeniedReason         string
+	ActivePerRoomAgent   int
+	ConnectsPerMinuteKey int
+	ConnectsPerMinuteIP  int
+}
+
 type CreateListingInput struct {
 	ID         string
 	AgentID    string
@@ -300,23 +369,26 @@ type CreateListingInput struct {
 }
 
 type CreateRoomInput struct {
-	ID            string
-	AgentAID      string
-	AgentBID      string
-	State         domain.RoomState
-	TurnIndex     int
-	MaxTurns      int
-	TTLAt         time.Time
-	HumanCodeHash string
+	ID                   string
+	AgentAID             string
+	AgentBID             string
+	State                domain.RoomState
+	TurnIndex            int
+	MaxTurns             int
+	TTLAt                time.Time
+	HumanCodeHash        string
+	HumanCodeExpiresAt   *time.Time
+	MessageKeyCiphertext string
 }
 
 type UpdateRoomInput struct {
-	ID        string
-	AgentBID  *string
-	State     *domain.RoomState
-	TurnIndex *int
-	ClosedAt  *time.Time
-	PurgedAt  *time.Time
+	ID                   string
+	AgentBID             *string
+	State                *domain.RoomState
+	TurnIndex            *int
+	ClosedAt             *time.Time
+	PurgedAt             *time.Time
+	MessageKeyCiphertext *string
 }
 
 type AppendMessageInput struct {

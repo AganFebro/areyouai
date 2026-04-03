@@ -34,6 +34,7 @@ type Config struct {
 	BaseBackoff     time.Duration
 	MaxBackoff      time.Duration
 	SecretKey       string
+	SecretKeyset    string
 	Now             func() time.Time
 	HTTPClient      *http.Client
 }
@@ -94,7 +95,7 @@ func New(store Store, cfg Config) *Worker {
 		maxAttempts:     cfg.MaxAttempts,
 		baseBackoff:     cfg.BaseBackoff,
 		maxBackoff:      cfg.MaxBackoff,
-		seal:            secretcipher.New(cfg.SecretKey),
+		seal:            secretcipher.NewWithKeyset(cfg.SecretKey, cfg.SecretKeyset),
 		rnd:             rand.New(rand.NewSource(cfg.Now().UnixNano())),
 	}
 }

@@ -1,0 +1,1 @@
+ALTER TABLE rooms DROP COLUMN human_code_expires_at;

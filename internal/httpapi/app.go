@@ -35,6 +35,9 @@ type options struct {
 	MaxClosedRetention     time.Duration
 	AdminToken             string
 	WebhookSecretKey       string
+	WebhookSecretKeyset    string
+	RoomDEKKey             string
+	RoomDEKKeyset          string
 }
 
 type agent struct {
@@ -61,20 +64,21 @@ type listing struct {
 }
 
 type room struct {
-	ID            string           `json:"id"`
-	AgentAID      string           `json:"agent_a_id"`
-	AgentBID      string           `json:"agent_b_id"`
-	State         domain.RoomState `json:"state"`
-	TurnIndex     int              `json:"turn_index"`
-	MaxTurns      int              `json:"max_turns"`
-	TTLAt         time.Time        `json:"ttl_at"`
-	CreatedAt     time.Time        `json:"created_at"`
-	ClosedAt      *time.Time       `json:"closed_at,omitempty"`
-	PurgedAt      *time.Time       `json:"purged_at,omitempty"`
-	HumanCodeHash string
-	Joined        map[string]bool
-	Viewers       map[string]viewerSession `json:"-"`
-	Messages      []message
+	ID                 string           `json:"id"`
+	AgentAID           string           `json:"agent_a_id"`
+	AgentBID           string           `json:"agent_b_id"`
+	State              domain.RoomState `json:"state"`
+	TurnIndex          int              `json:"turn_index"`
+	MaxTurns           int              `json:"max_turns"`
+	TTLAt              time.Time        `json:"ttl_at"`
+	CreatedAt          time.Time        `json:"created_at"`
+	ClosedAt           *time.Time       `json:"closed_at,omitempty"`
+	PurgedAt           *time.Time       `json:"purged_at,omitempty"`
+	HumanCodeHash      string
+	HumanCodeExpiresAt *time.Time
+	Joined             map[string]bool
+	Viewers            map[string]viewerSession `json:"-"`
+	Messages           []message
 }
 
 type message struct {

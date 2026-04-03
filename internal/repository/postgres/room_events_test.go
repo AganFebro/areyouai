@@ -272,12 +272,41 @@ func applyStoreMigrationsForTest(t *testing.T, db *sql.DB) {
 	if err != nil {
 		t.Fatalf("read agent stream deliveries up migration: %v", err)
 	}
+	up9, err := os.ReadFile(filepath.Join(migDir, "000009_human_code_ttl.up.sql"))
+	if err != nil {
+		t.Fatalf("read human code ttl up migration: %v", err)
+	}
+	up10, err := os.ReadFile(filepath.Join(migDir, "000010_stream_coordination.up.sql"))
+	if err != nil {
+		t.Fatalf("read stream coordination up migration: %v", err)
+	}
+	up11, err := os.ReadFile(filepath.Join(migDir, "000011_human_code_ttl_backfill.up.sql"))
+	if err != nil {
+		t.Fatalf("read human code ttl backfill up migration: %v", err)
+	}
+	up12, err := os.ReadFile(filepath.Join(migDir, "000012_agent_policy_state.up.sql"))
+	if err != nil {
+		t.Fatalf("read agent policy state up migration: %v", err)
+	}
+	up13, err := os.ReadFile(filepath.Join(migDir, "000013_room_message_key.up.sql"))
+	if err != nil {
+		t.Fatalf("read room message key up migration: %v", err)
+	}
 
 	if _, err := db.Exec(string(down)); err != nil {
 		t.Fatalf("exec down migration: %v", err)
 	}
 	if _, err := db.Exec(`DROP TABLE IF EXISTS agent_stream_deliveries`); err != nil {
 		t.Fatalf("cleanup agent stream deliveries: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS room_event_stream_open_events`); err != nil {
+		t.Fatalf("cleanup room event stream open events: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS room_event_stream_leases`); err != nil {
+		t.Fatalf("cleanup room event stream leases: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS agent_policy_state`); err != nil {
+		t.Fatalf("cleanup agent policy state: %v", err)
 	}
 	if _, err := db.Exec(`DROP TABLE IF EXISTS room_scoped_tokens`); err != nil {
 		t.Fatalf("cleanup room scoped tokens: %v", err)
@@ -320,6 +349,21 @@ func applyStoreMigrationsForTest(t *testing.T, db *sql.DB) {
 	}
 	if _, err := db.Exec(string(up8)); err != nil {
 		t.Fatalf("exec agent stream deliveries up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up9)); err != nil {
+		t.Fatalf("exec human code ttl up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up10)); err != nil {
+		t.Fatalf("exec stream coordination up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up11)); err != nil {
+		t.Fatalf("exec human code ttl backfill up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up12)); err != nil {
+		t.Fatalf("exec agent policy state up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up13)); err != nil {
+		t.Fatalf("exec room message key up migration: %v", err)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"time"
 
@@ -20,6 +21,10 @@ type Store struct {
 
 func NewStore(db *sql.DB) *Store {
 	return &Store{db: db}
+}
+
+func (s *Store) SupportsMultiInstanceCoordination() bool {
+	return true
 }
 
 func (s *Store) WithTx(ctx context.Context, fn func(ctx context.Context, tx repository.TxStore) error) error {
@@ -262,7 +267,7 @@ WHERE connected = FALSE`
 
 func (s *Store) ListRecoverableRoomsForAgent(ctx context.Context, agentID string, since time.Time) ([]repository.Room, error) {
 	const q = `
-SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash
+SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext
 FROM rooms
 WHERE (agent_a_id = $1 OR agent_b_id = $1)
   AND (
@@ -293,17 +298,17 @@ ORDER BY
 
 func (s *Store) CreateRoom(ctx context.Context, in repository.CreateRoomInput) (repository.Room, error) {
 	const q = `
-INSERT INTO rooms (id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, human_code_hash)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash`
+	INSERT INTO rooms (id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, human_code_hash, human_code_expires_at, message_key_ciphertext)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext`
 	return scanRoom(
-		s.db.QueryRowContext(ctx, q, in.ID, in.AgentAID, nullableText(in.AgentBID), string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash),
+		s.db.QueryRowContext(ctx, q, in.ID, in.AgentAID, nullableText(in.AgentBID), string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash, nullableTime(in.HumanCodeExpiresAt), nullableText(in.MessageKeyCiphertext)),
 	)
 }
 
 func (s *Store) GetRoom(ctx context.Context, roomID string) (repository.Room, error) {
 	const q = `
-SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash
+SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext
 FROM rooms
 WHERE id = $1`
 	return scanRoom(s.db.QueryRowContext(ctx, q, roomID))
@@ -329,6 +334,9 @@ func (s *Store) UpdateRoom(ctx context.Context, in repository.UpdateRoomInput) (
 	if in.PurgedAt != nil {
 		current.PurgedAt = in.PurgedAt
 	}
+	if in.MessageKeyCiphertext != nil {
+		current.MessageKeyCiphertext = *in.MessageKeyCiphertext
+	}
 
 	const q = `
 UPDATE rooms
@@ -336,9 +344,10 @@ SET agent_b_id = $2,
     state = $3,
     turn_index = $4,
     closed_at = $5,
-    purged_at = $6
+    purged_at = $6,
+    message_key_ciphertext = $7
 WHERE id = $1
-RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash`
+RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext`
 	return scanRoom(s.db.QueryRowContext(
 		ctx,
 		q,
@@ -348,6 +357,7 @@ RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, crea
 		current.TurnIndex,
 		current.ClosedAt,
 		current.PurgedAt,
+		nullableText(current.MessageKeyCiphertext),
 	))
 }
 
@@ -550,6 +560,148 @@ func (s *Store) ClaimPendingWebhookDeliveries(ctx context.Context, now, reclaimB
 	return claimPendingWebhookDeliveries(ctx, s.db, now, reclaimBefore, limit)
 }
 
+func (s *Store) AcquireRoomEventStreamLease(ctx context.Context, in repository.AcquireRoomEventStreamLeaseInput) (repository.AcquireRoomEventStreamLeaseResult, error) {
+	in.LeaseID = strings.TrimSpace(in.LeaseID)
+	in.RoomID = strings.TrimSpace(in.RoomID)
+	in.AgentID = strings.TrimSpace(in.AgentID)
+	in.RemoteIP = strings.TrimSpace(in.RemoteIP)
+	if in.LeaseID == "" || in.RoomID == "" || in.AgentID == "" {
+		return repository.AcquireRoomEventStreamLeaseResult{}, fmt.Errorf("invalid stream lease input")
+	}
+	if in.Now.IsZero() {
+		in.Now = time.Now().UTC()
+	}
+	if in.LeaseExpiresAt.IsZero() || !in.LeaseExpiresAt.After(in.Now) {
+		in.LeaseExpiresAt = in.Now.Add(90 * time.Second)
+	}
+	if in.MaxActivePerRoomAgent <= 0 {
+		in.MaxActivePerRoomAgent = 5
+	}
+	if in.MaxConnectsPerMinuteKey <= 0 {
+		in.MaxConnectsPerMinuteKey = 30
+	}
+	if in.MaxConnectsPerMinuteIP <= 0 {
+		in.MaxConnectsPerMinuteIP = 120
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return repository.AcquireRoomEventStreamLeaseResult{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	roomAgentKey := fmt.Sprintf("stream_room_agent|%s|%s", in.RoomID, in.AgentID)
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, roomAgentKey); err != nil {
+		return repository.AcquireRoomEventStreamLeaseResult{}, err
+	}
+	if in.RemoteIP != "" {
+		ipKey := fmt.Sprintf("stream_ip|%s", in.RemoteIP)
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, ipKey); err != nil {
+			return repository.AcquireRoomEventStreamLeaseResult{}, err
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM room_event_stream_leases WHERE expires_at <= $1`, in.Now); err != nil {
+		return repository.AcquireRoomEventStreamLeaseResult{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM room_event_stream_open_events WHERE opened_at <= $1`, in.Now.Add(-2*time.Minute)); err != nil {
+		return repository.AcquireRoomEventStreamLeaseResult{}, err
+	}
+
+	out := repository.AcquireRoomEventStreamLeaseResult{}
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT COUNT(1) FROM room_event_stream_leases WHERE room_id = $1 AND agent_id = $2 AND expires_at > $3`,
+		in.RoomID,
+		in.AgentID,
+		in.Now,
+	).Scan(&out.ActivePerRoomAgent); err != nil {
+		return repository.AcquireRoomEventStreamLeaseResult{}, err
+	}
+	if out.ActivePerRoomAgent >= in.MaxActivePerRoomAgent {
+		out.DeniedReason = "max_active_streams_per_agent_room"
+		return out, nil
+	}
+
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT COUNT(1) FROM room_event_stream_open_events WHERE room_id = $1 AND agent_id = $2 AND opened_at > $3`,
+		in.RoomID,
+		in.AgentID,
+		in.Now.Add(-1*time.Minute),
+	).Scan(&out.ConnectsPerMinuteKey); err != nil {
+		return repository.AcquireRoomEventStreamLeaseResult{}, err
+	}
+	if out.ConnectsPerMinuteKey >= in.MaxConnectsPerMinuteKey {
+		out.DeniedReason = "reconnect_rate_limited_room_agent"
+		return out, nil
+	}
+
+	if in.RemoteIP != "" {
+		if err := tx.QueryRowContext(
+			ctx,
+			`SELECT COUNT(1) FROM room_event_stream_open_events WHERE remote_ip = $1 AND opened_at > $2`,
+			in.RemoteIP,
+			in.Now.Add(-1*time.Minute),
+		).Scan(&out.ConnectsPerMinuteIP); err != nil {
+			return repository.AcquireRoomEventStreamLeaseResult{}, err
+		}
+		if out.ConnectsPerMinuteIP >= in.MaxConnectsPerMinuteIP {
+			out.DeniedReason = "reconnect_rate_limited_ip"
+			return out, nil
+		}
+	}
+
+	if _, err := tx.ExecContext(
+		ctx,
+		`INSERT INTO room_event_stream_leases (lease_id, room_id, agent_id, remote_ip, opened_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+		in.LeaseID,
+		in.RoomID,
+		in.AgentID,
+		in.RemoteIP,
+		in.Now,
+		in.LeaseExpiresAt,
+	); err != nil {
+		return repository.AcquireRoomEventStreamLeaseResult{}, err
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`INSERT INTO room_event_stream_open_events (room_id, agent_id, remote_ip, opened_at) VALUES ($1, $2, $3, $4)`,
+		in.RoomID,
+		in.AgentID,
+		in.RemoteIP,
+		in.Now,
+	); err != nil {
+		return repository.AcquireRoomEventStreamLeaseResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return repository.AcquireRoomEventStreamLeaseResult{}, err
+	}
+	committed = true
+
+	out.Acquired = true
+	out.ActivePerRoomAgent++
+	out.ConnectsPerMinuteKey++
+	if in.RemoteIP != "" {
+		out.ConnectsPerMinuteIP++
+	}
+	return out, nil
+}
+
+func (s *Store) ReleaseRoomEventStreamLease(ctx context.Context, leaseID string) error {
+	leaseID = strings.TrimSpace(leaseID)
+	if leaseID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM room_event_stream_leases WHERE lease_id = $1`, leaseID)
+	return err
+}
+
 func (s *Store) MarkWebhookOutboxDelivered(ctx context.Context, id int64) error {
 	const q = `
 UPDATE webhook_outbox
@@ -634,6 +786,41 @@ func (s *Store) PurgeRoomContent(ctx context.Context, roomID string, purgedAt ti
 	return purgeRoomContentExec(ctx, s.db, roomID, purgedAt)
 }
 
+func (s *Store) LockAdvisory(ctx context.Context, key string) error {
+	return lockAdvisoryExec(ctx, s.db, key)
+}
+
+func (s *Store) ListRoomsForLifecycleSweep(ctx context.Context, now time.Time, limit int) ([]repository.Room, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	const q = `
+SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext
+FROM rooms
+WHERE state = $1
+   OR (state IN ($2, $3) AND ttl_at <= $4)
+ORDER BY COALESCE(closed_at, ttl_at, created_at) ASC, id ASC
+LIMIT $5`
+	rows, err := s.db.QueryContext(ctx, q, string(domain.RoomStateClosed), string(domain.RoomStateOpen), string(domain.RoomStateActive), now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []repository.Room
+	for rows.Next() {
+		item, scanErr := scanRoom(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
 func purgeRoomContentExec(ctx context.Context, exec interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }, roomID string, purgedAt time.Time) error {
@@ -656,6 +843,23 @@ func purgeRoomContentExec(ctx context.Context, exec interface {
 	const updateRoom = `UPDATE rooms SET state = $2, purged_at = $3 WHERE id = $1`
 	_, err := exec.ExecContext(ctx, updateRoom, roomID, string(domain.RoomStatePurged), purgedAt)
 	return err
+}
+
+func lockAdvisoryExec(ctx context.Context, exec interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, key string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return fmt.Errorf("invalid advisory lock key")
+	}
+	_, err := exec.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey(key))
+	return err
+}
+
+func advisoryLockKey(key string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(key))
+	return int64(h.Sum64())
 }
 
 func (s *Store) GetAdminOverview(ctx context.Context, now time.Time) (repository.AdminOverview, error) {
@@ -780,17 +984,17 @@ func (s *txStore) MarkListingConnected(ctx context.Context, listingID string) er
 
 func (s *txStore) CreateRoom(ctx context.Context, in repository.CreateRoomInput) (repository.Room, error) {
 	const q = `
-INSERT INTO rooms (id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, human_code_hash)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash`
+	INSERT INTO rooms (id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, human_code_hash, human_code_expires_at, message_key_ciphertext)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext`
 	return scanRoom(
-		s.tx.QueryRowContext(ctx, q, in.ID, in.AgentAID, nullableText(in.AgentBID), string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash),
+		s.tx.QueryRowContext(ctx, q, in.ID, in.AgentAID, nullableText(in.AgentBID), string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash, nullableTime(in.HumanCodeExpiresAt), nullableText(in.MessageKeyCiphertext)),
 	)
 }
 
 func (s *txStore) GetRoom(ctx context.Context, roomID string) (repository.Room, error) {
 	const q = `
-SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash
+SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext
 FROM rooms
 WHERE id = $1`
 	return scanRoom(s.tx.QueryRowContext(ctx, q, roomID))
@@ -816,6 +1020,9 @@ func (s *txStore) UpdateRoom(ctx context.Context, in repository.UpdateRoomInput)
 	if in.PurgedAt != nil {
 		current.PurgedAt = in.PurgedAt
 	}
+	if in.MessageKeyCiphertext != nil {
+		current.MessageKeyCiphertext = *in.MessageKeyCiphertext
+	}
 
 	const q = `
 UPDATE rooms
@@ -823,9 +1030,10 @@ SET agent_b_id = $2,
     state = $3,
     turn_index = $4,
     closed_at = $5,
-    purged_at = $6
+    purged_at = $6,
+    message_key_ciphertext = $7
 WHERE id = $1
-RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash`
+RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext`
 	return scanRoom(s.tx.QueryRowContext(
 		ctx,
 		q,
@@ -835,6 +1043,7 @@ RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, crea
 		current.TurnIndex,
 		current.ClosedAt,
 		current.PurgedAt,
+		nullableText(current.MessageKeyCiphertext),
 	))
 }
 
@@ -937,6 +1146,106 @@ WHERE room_id = $1
 	return err
 }
 
+func (s *txStore) LockRoom(ctx context.Context, roomID string) error {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		return fmt.Errorf("invalid room lock key")
+	}
+	const q = `SELECT 1 FROM rooms WHERE id = $1 FOR UPDATE`
+	var out int
+	return normalizeErr(s.tx.QueryRowContext(ctx, q, roomID).Scan(&out))
+}
+
+func (s *txStore) LockAdvisory(ctx context.Context, key string) error {
+	return lockAdvisoryExec(ctx, s.tx, key)
+}
+
+func (s *txStore) CountMessagesBySenderSince(ctx context.Context, senderID string, since time.Time) (int, error) {
+	const q = `SELECT COUNT(1) FROM messages WHERE sender_id = $1 AND created_at >= $2`
+	var count int
+	err := s.tx.QueryRowContext(ctx, q, strings.TrimSpace(senderID), since).Scan(&count)
+	return count, err
+}
+
+func (s *txStore) CountMessagesByRoomSince(ctx context.Context, roomID string, since time.Time) (int, error) {
+	const q = `SELECT COUNT(1) FROM messages WHERE room_id = $1 AND created_at >= $2`
+	var count int
+	err := s.tx.QueryRowContext(ctx, q, strings.TrimSpace(roomID), since).Scan(&count)
+	return count, err
+}
+
+func (s *txStore) GetAgentPolicyBlock(ctx context.Context, agentID string, now time.Time) (time.Time, bool, error) {
+	const q = `SELECT blocked_until FROM agent_policy_state WHERE agent_id = $1`
+	var blockedUntil sql.NullTime
+	err := s.tx.QueryRowContext(ctx, q, strings.TrimSpace(agentID)).Scan(&blockedUntil)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, normalizeErr(err)
+	}
+	if !blockedUntil.Valid {
+		return time.Time{}, false, nil
+	}
+	if now.Before(blockedUntil.Time) {
+		return blockedUntil.Time, true, nil
+	}
+	return time.Time{}, false, nil
+}
+
+func (s *txStore) RecordAgentPolicyViolation(ctx context.Context, agentID string, now time.Time, window time.Duration, blockDuration time.Duration, maxViolations int) (repository.PolicyState, error) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return repository.PolicyState{}, fmt.Errorf("invalid agent id")
+	}
+	if maxViolations <= 0 {
+		maxViolations = 1
+	}
+	if window <= 0 {
+		window = 5 * time.Minute
+	}
+	current := repository.PolicyState{}
+	var windowStartedAt sql.NullTime
+	var blockedUntil sql.NullTime
+	var count int
+	const selectQ = `
+SELECT window_started_at, violation_count, blocked_until
+FROM agent_policy_state
+WHERE agent_id = $1`
+	err := s.tx.QueryRowContext(ctx, selectQ, agentID).Scan(&windowStartedAt, &count, &blockedUntil)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return repository.PolicyState{}, normalizeErr(err)
+	}
+	if windowStartedAt.Valid && now.Sub(windowStartedAt.Time) > window {
+		windowStartedAt = sql.NullTime{Time: now, Valid: true}
+		count = 0
+		blockedUntil = sql.NullTime{}
+	}
+	count++
+	if !windowStartedAt.Valid {
+		windowStartedAt = sql.NullTime{Time: now, Valid: true}
+	}
+	if count >= maxViolations && blockDuration > 0 {
+		blockedUntil = sql.NullTime{Time: now.Add(blockDuration), Valid: true}
+	}
+	const upsertQ = `
+INSERT INTO agent_policy_state (agent_id, window_started_at, violation_count, blocked_until, updated_at)
+VALUES ($1, $2, $3, $4, NOW())
+ON CONFLICT (agent_id) DO UPDATE
+SET window_started_at = EXCLUDED.window_started_at,
+    violation_count = EXCLUDED.violation_count,
+    blocked_until = EXCLUDED.blocked_until,
+    updated_at = NOW()`
+	if _, err := s.tx.ExecContext(ctx, upsertQ, agentID, windowStartedAt.Time, count, blockedUntil); err != nil {
+		return repository.PolicyState{}, normalizeErr(err)
+	}
+	current.ViolationCount = count
+	if blockedUntil.Valid {
+		current.BlockedUntil = &blockedUntil.Time
+	}
+	return current, nil
+}
+
 func scanAgent(row interface{ Scan(dest ...any) error }) (repository.Agent, error) {
 	var a repository.Agent
 	err := row.Scan(&a.ID, &a.Name, &a.APIKeyHash, &a.CreatedAt)
@@ -984,6 +1293,7 @@ func scanRoom(row interface{ Scan(dest ...any) error }) (repository.Room, error)
 	var r repository.Room
 	var state string
 	var agentBID sql.NullString
+	var messageKeyCiphertext sql.NullString
 	err := row.Scan(
 		&r.ID,
 		&r.AgentAID,
@@ -996,6 +1306,8 @@ func scanRoom(row interface{ Scan(dest ...any) error }) (repository.Room, error)
 		&r.ClosedAt,
 		&r.PurgedAt,
 		&r.HumanCodeHash,
+		&r.HumanCodeExpiresAt,
+		&messageKeyCiphertext,
 	)
 	if err != nil {
 		return repository.Room{}, normalizeErr(err)
@@ -1004,6 +1316,9 @@ func scanRoom(row interface{ Scan(dest ...any) error }) (repository.Room, error)
 		r.AgentBID = agentBID.String
 	}
 	r.State = domain.RoomState(state)
+	if messageKeyCiphertext.Valid {
+		r.MessageKeyCiphertext = messageKeyCiphertext.String
+	}
 	return r, nil
 }
 
@@ -1083,6 +1398,13 @@ func nullableText(value string) any {
 		return nil
 	}
 	return value
+}
+
+func nullableTime(value *time.Time) any {
+	if value == nil {
+		return nil
+	}
+	return *value
 }
 
 func scanAuditEvent(row interface{ Scan(dest ...any) error }) (repository.AuditEvent, error) {

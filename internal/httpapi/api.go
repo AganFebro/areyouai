@@ -13,6 +13,7 @@ import (
 const (
 	maxMessagesPerMinute = 30
 	sessionTTLDays       = 14
+	humanCodeTTL         = 24 * time.Hour
 )
 
 type errorResponse struct {
@@ -29,6 +30,10 @@ type errorOptions struct {
 	Hint        string
 	Endpoint    string
 	Allow       []string
+}
+
+func ptrTime(t time.Time) *time.Time {
+	return &t
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -289,15 +294,16 @@ func (a *app) handleListings(w http.ResponseWriter, r *http.Request) {
 		RoomID:    roomID,
 	}
 	rm := room{
-		ID:            roomID,
-		AgentAID:      agentID,
-		AgentBID:      "",
-		State:         domain.RoomStateOpen,
-		TurnIndex:     0,
-		MaxTurns:      req.MaxTurns,
-		TTLAt:         now.Add(time.Duration(req.TTLSeconds) * time.Second),
-		CreatedAt:     now,
-		HumanCodeHash: hashText(humanCode),
+		ID:                 roomID,
+		AgentAID:           agentID,
+		AgentBID:           "",
+		State:              domain.RoomStateOpen,
+		TurnIndex:          0,
+		MaxTurns:           req.MaxTurns,
+		TTLAt:              now.Add(time.Duration(req.TTLSeconds) * time.Second),
+		CreatedAt:          now,
+		HumanCodeHash:      hashText(humanCode),
+		HumanCodeExpiresAt: ptrTime(now.Add(humanCodeTTL)),
 		Joined: map[string]bool{
 			agentID: true,
 		},
@@ -411,15 +417,16 @@ func (a *app) handleListingByID(w http.ResponseWriter, r *http.Request) {
 		humanCode := "hc_" + randomToken(18)
 		now := a.now()
 		rm = room{
-			ID:            newID("room"),
-			AgentAID:      l.AgentID,
-			AgentBID:      agentID,
-			State:         domain.RoomStateActive,
-			TurnIndex:     0,
-			MaxTurns:      l.MaxTurns,
-			TTLAt:         now.Add(time.Duration(l.TTLSecond) * time.Second),
-			CreatedAt:     now,
-			HumanCodeHash: hashText(humanCode),
+			ID:                 newID("room"),
+			AgentAID:           l.AgentID,
+			AgentBID:           agentID,
+			State:              domain.RoomStateActive,
+			TurnIndex:          0,
+			MaxTurns:           l.MaxTurns,
+			TTLAt:              now.Add(time.Duration(l.TTLSecond) * time.Second),
+			CreatedAt:          now,
+			HumanCodeHash:      hashText(humanCode),
+			HumanCodeExpiresAt: ptrTime(now.Add(humanCodeTTL)),
 			Joined: map[string]bool{
 				l.AgentID: true,
 				agentID:   true,
@@ -745,15 +752,31 @@ func (a *app) handleRoomClose(w http.ResponseWriter, r *http.Request, roomID str
 	})
 }
 
+type transcriptRequest struct {
+	HumanCode string `json:"human_code"`
+}
+
 func (a *app) handleTranscript(w http.ResponseWriter, r *http.Request, roomID string) {
 	a.purgeSweep()
 
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if _, ok := r.URL.Query()["human_code"]; ok {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", errorOptions{
+			Hint: "Send human_code in the JSON request body. Query-string human_code is not supported.",
+		})
+		return
+	}
 
-	humanCode := strings.TrimSpace(r.URL.Query().Get("human_code"))
+	var req transcriptRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+
+	humanCode := strings.TrimSpace(req.HumanCode)
 	if humanCode == "" {
 		writeError(w, http.StatusForbidden, "missing human_code")
 		return
@@ -772,6 +795,10 @@ func (a *app) handleTranscript(w http.ResponseWriter, r *http.Request, roomID st
 	}
 	if subtle.ConstantTimeCompare([]byte(hashText(humanCode)), []byte(rm.HumanCodeHash)) != 1 {
 		writeError(w, http.StatusForbidden, "invalid human_code")
+		return
+	}
+	if rm.HumanCodeExpiresAt != nil && a.now().After(*rm.HumanCodeExpiresAt) {
+		writeError(w, http.StatusForbidden, "human_code expired")
 		return
 	}
 
@@ -826,6 +853,10 @@ func (a *app) handleRoomViewers(w http.ResponseWriter, r *http.Request, roomID s
 	case "join":
 		if subtle.ConstantTimeCompare([]byte(hashText(strings.TrimSpace(req.HumanCode))), []byte(rm.HumanCodeHash)) != 1 {
 			writeError(w, http.StatusForbidden, "invalid human_code")
+			return
+		}
+		if rm.HumanCodeExpiresAt != nil && a.now().After(*rm.HumanCodeExpiresAt) {
+			writeError(w, http.StatusForbidden, "human_code expired")
 			return
 		}
 		now := a.now()

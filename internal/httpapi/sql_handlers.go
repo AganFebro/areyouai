@@ -27,6 +27,8 @@ const (
 type sqlHTTP struct {
 	svc *a2a.Service
 	hub *roomEventHub
+	// Optional distributed stream coordination (implemented by Postgres store).
+	streamLeaseStore repository.RoomEventStreamLeaseStore
 
 	mu                sync.Mutex
 	ipWindows         map[string][]time.Time
@@ -38,6 +40,10 @@ type sqlHTTP struct {
 
 func newSQLHTTP(store repository.Store, opts options) *sqlHTTP {
 	hub := newRoomEventHub(64)
+	var streamLeaseStore repository.RoomEventStreamLeaseStore
+	if leaseStore, ok := store.(repository.RoomEventStreamLeaseStore); ok {
+		streamLeaseStore = leaseStore
+	}
 	return &sqlHTTP{
 		svc: a2a.New(store, a2a.Options{
 			ViewerHeartbeatTimeout: opts.ViewerHeartbeatTimeout,
@@ -45,8 +51,12 @@ func newSQLHTTP(store repository.Store, opts options) *sqlHTTP {
 			MaxClosedRetention:     opts.MaxClosedRetention,
 			RoomEventPublisher:     hub.Publish,
 			WebhookSecretKey:       opts.WebhookSecretKey,
+			WebhookSecretKeyset:    opts.WebhookSecretKeyset,
+			RoomDEKKey:             opts.RoomDEKKey,
+			RoomDEKKeyset:          opts.RoomDEKKeyset,
 		}),
 		hub:               hub,
+		streamLeaseStore:  streamLeaseStore,
 		ipWindows:         make(map[string][]time.Time),
 		streamCounts:      make(map[string]int),
 		streamOpenWindows: make(map[string][]time.Time),
@@ -460,6 +470,18 @@ func (s *sqlHTTP) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "admin not configured")
 		return
 	}
+	if strings.TrimSpace(r.Header.Get("X-Admin-Token")) != "" {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", errorOptions{
+			Hint: "Use Authorization: Bearer <admin_token>. X-Admin-Token is not supported.",
+		})
+		return
+	}
+	if _, ok := r.URL.Query()["admin_token"]; ok {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", errorOptions{
+			Hint: "Send admin credentials in Authorization header. Query-string admin_token is not supported.",
+		})
+		return
+	}
 	if !s.adminAuthorized(r) {
 		writeError(w, http.StatusUnauthorized, "missing or invalid admin token")
 		return
@@ -501,9 +523,6 @@ func (s *sqlHTTP) adminAuthorized(r *http.Request) bool {
 	adminToken := strings.TrimSpace(s.adminToken)
 	if adminToken == "" {
 		return false
-	}
-	if x := strings.TrimSpace(r.Header.Get("X-Admin-Token")); x != "" {
-		return subtleConstantTimeEqual(x, adminToken)
 	}
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	if !strings.HasPrefix(auth, "Bearer ") {
@@ -561,13 +580,24 @@ func (s *sqlHTTP) svcAdminOverview(ctx context.Context) (map[string]any, error) 
 		return nil, err
 	}
 	return map[string]any{
-		"agents_total":     out.Overview.AgentsTotal,
-		"sessions_active":  out.Overview.SessionsActive,
-		"rooms_open":       out.Overview.RoomsOpen,
-		"rooms_active":     out.Overview.RoomsActive,
-		"rooms_closed":     out.Overview.RoomsClosed,
-		"rooms_purged":     out.Overview.RoomsPurged,
-		"messages_total":   out.Overview.MessagesTotal,
+		"agents_total":    out.Overview.AgentsTotal,
+		"sessions_active": out.Overview.SessionsActive,
+		"rooms_open":      out.Overview.RoomsOpen,
+		"rooms_active":    out.Overview.RoomsActive,
+		"rooms_closed":    out.Overview.RoomsClosed,
+		"rooms_purged":    out.Overview.RoomsPurged,
+		"messages_total":  out.Overview.MessagesTotal,
+		"purge": map[string]any{
+			"scanned":                      out.Purge.Scanned,
+			"closed_rooms":                 out.Purge.ClosedRooms,
+			"ready_for_purge":              out.Purge.ReadyForPurge,
+			"viewer_blocked":               out.Purge.ViewerBlocked,
+			"over_retention":               out.Purge.OverRetention,
+			"oldest_closed_age_seconds":    out.Purge.OldestClosedAgeSeconds,
+			"oldest_ready_age_seconds":     out.Purge.OldestReadyAgeSeconds,
+			"closed_room_grace_seconds":    out.Purge.ClosedRoomGraceSeconds,
+			"max_closed_retention_seconds": out.Purge.MaxClosedRetentionSeconds,
+		},
 		"generated_at_utc": time.Now().UTC().Format(time.RFC3339),
 	}, nil
 }
@@ -601,11 +631,14 @@ func (s *sqlHTTP) handleRoomContext(w http.ResponseWriter, r *http.Request, room
 		"system_core_hash":   out.SystemCoreHash,
 		"global_rules_hash":  out.GlobalRulesHash,
 		"agent_rules_hash":   out.AgentRulesHash,
+		"identity_hash":      out.IdentityHash,
+		"soul_hash":          out.SoulHash,
+		"user_hash":          out.UserHash,
 		"next_turn":          out.NextTurn,
 		"next_actor_id":      out.NextActorID,
 		"mode":               "sse",
 		"poll_interval_ms":   5000,
-		"ordered_stack":      []string{"SYSTEM_CORE", "HARD_RULES_GLOBAL", "HARD_RULES_AGENT", "TASK_CONTEXT", "RECENT_MEMORY"},
+		"ordered_stack":      out.OrderedStack,
 		"prompt_bundle_text": out.Prompt,
 	})
 }
@@ -638,6 +671,10 @@ func (s *sqlHTTP) handleRoomJoin(w http.ResponseWriter, r *http.Request, roomID 
 		"system_core_hash":  bundle.SystemCoreHash,
 		"global_rules_hash": bundle.GlobalRulesHash,
 		"agent_rules_hash":  bundle.AgentRulesHash,
+		"identity_hash":     bundle.IdentityHash,
+		"soul_hash":         bundle.SoulHash,
+		"user_hash":         bundle.UserHash,
+		"ordered_stack":     bundle.OrderedStack,
 	})
 }
 
@@ -764,11 +801,22 @@ func (s *sqlHTTP) handleRoomLeave(w http.ResponseWriter, r *http.Request, roomID
 }
 
 func (s *sqlHTTP) handleTranscript(w http.ResponseWriter, r *http.Request, roomID string) {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	out, err := s.svc.Transcript(r.Context(), roomID, r.URL.Query().Get("human_code"))
+	if _, ok := r.URL.Query()["human_code"]; ok {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", errorOptions{
+			Hint: "Send human_code in the JSON request body. Query-string human_code is not supported.",
+		})
+		return
+	}
+	var req transcriptRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	out, err := s.svc.Transcript(r.Context(), roomID, strings.TrimSpace(req.HumanCode))
 	if err != nil {
 		writeRoomServiceErr(w, err)
 		return
@@ -837,7 +885,7 @@ func (s *sqlHTTP) handleRoomEvents(w http.ResponseWriter, r *http.Request, roomI
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	releaseStreamSlot, deniedReason, err := s.acquireStreamSlot(agentID, roomID, r.RemoteAddr, time.Now().UTC())
+	releaseStreamSlot, deniedReason, err := s.acquireStreamSlot(r.Context(), agentID, roomID, r.RemoteAddr, time.Now().UTC())
 	if err != nil {
 		subscriberCount := s.hub.SubscriberCount(roomID)
 		meta := map[string]any{
@@ -863,26 +911,6 @@ func (s *sqlHTTP) handleRoomEvents(w http.ResponseWriter, r *http.Request, roomI
 	}
 	defer releaseStreamSlot()
 
-	initialReplay, err := s.svc.ListRoomEventHistory(r.Context(), agentID, roomID, sinceID, limit)
-	if err != nil {
-		writeRoomServiceErr(w, err)
-		return
-	}
-	sub := s.hub.Subscribe(roomID)
-	defer sub.Close()
-
-	// Bridge the query->subscribe race window while preserving deterministic replay.
-	catchUpReplay, err := s.svc.ListRoomEventHistory(r.Context(), agentID, roomID, initialReplay.NextSince, limit)
-	if err != nil {
-		writeRoomServiceErr(w, err)
-		return
-	}
-	sinceID = catchUpReplay.NextSince
-	if sinceID < initialReplay.NextSince {
-		sinceID = initialReplay.NextSince
-	}
-	lastEventID := sinceID
-
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "stream unsupported")
@@ -899,6 +927,34 @@ func (s *sqlHTTP) handleRoomEvents(w http.ResponseWriter, r *http.Request, roomI
 	}
 	flusher.Flush()
 
+	closeReason := "client_disconnected"
+
+	sub := s.hub.Subscribe(roomID)
+	defer sub.Close()
+
+	lastEventID := sinceID
+	for {
+		replay, err := s.svc.ListRoomEventHistory(r.Context(), agentID, roomID, lastEventID, limit)
+		if err != nil {
+			writeRoomServiceErr(w, err)
+			return
+		}
+		if len(replay.Items) == 0 {
+			break
+		}
+		for _, item := range replay.Items {
+			if err := writeSSEEvent(w, flusher, item); err != nil {
+				closeReason = "write_failed"
+				return
+			}
+			lastEventID = item.ID
+		}
+		if len(replay.Items) < limit {
+			break
+		}
+	}
+
+	sinceID = lastEventID
 	subscriberCount := s.hub.SubscriberCount(roomID)
 	openMeta := map[string]any{
 		"room_id":          roomID,
@@ -918,7 +974,6 @@ func (s *sqlHTTP) handleRoomEvents(w http.ResponseWriter, r *http.Request, roomI
 		remoteIP(r.RemoteAddr),
 	)
 
-	closeReason := "client_disconnected"
 	defer func() {
 		eventName := "stream_closed"
 		if closeReason == "dropped_slow_subscriber" {
@@ -945,20 +1000,6 @@ func (s *sqlHTTP) handleRoomEvents(w http.ResponseWriter, r *http.Request, roomI
 		)
 	}()
 
-	for _, item := range initialReplay.Items {
-		if err := writeSSEEvent(w, flusher, item); err != nil {
-			closeReason = "write_failed"
-			return
-		}
-		lastEventID = item.ID
-	}
-	for _, item := range catchUpReplay.Items {
-		if err := writeSSEEvent(w, flusher, item); err != nil {
-			closeReason = "write_failed"
-			return
-		}
-		lastEventID = item.ID
-	}
 	keepAliveTicker := time.NewTicker(20 * time.Second)
 	reauthTicker := time.NewTicker(30 * time.Second)
 	defer keepAliveTicker.Stop()
@@ -1289,7 +1330,11 @@ func writeRoomOrViewerServiceErr(w http.ResponseWriter, err error) {
 	writeRoomServiceErr(w, err)
 }
 
-func (s *sqlHTTP) acquireStreamSlot(agentID, roomID, remoteAddr string, now time.Time) (func(), string, error) {
+func (s *sqlHTTP) acquireStreamSlot(ctx context.Context, agentID, roomID, remoteAddr string, now time.Time) (func(), string, error) {
+	if s.streamLeaseStore != nil {
+		return s.acquireDistributedStreamSlot(ctx, agentID, roomID, remoteAddr, now)
+	}
+
 	key := streamKey(agentID, roomID)
 	ip := remoteIP(remoteAddr)
 	if ip == "" {
@@ -1340,6 +1385,49 @@ func (s *sqlHTTP) acquireStreamSlot(agentID, roomID, remoteAddr string, now time
 				delete(s.streamCounts, key)
 			default:
 				s.streamCounts[key] = curr - 1
+			}
+		})
+	}
+	return release, "", nil
+}
+
+func (s *sqlHTTP) acquireDistributedStreamSlot(ctx context.Context, agentID, roomID, remoteAddr string, now time.Time) (func(), string, error) {
+	if s.streamLeaseStore == nil {
+		return nil, "stream_coordination_unavailable", errors.New("stream lease store unavailable")
+	}
+
+	ip := remoteIP(remoteAddr)
+	if ip == "" {
+		ip = "unknown"
+	}
+	leaseID := newID("sls")
+	out, err := s.streamLeaseStore.AcquireRoomEventStreamLease(ctx, repository.AcquireRoomEventStreamLeaseInput{
+		LeaseID:                 leaseID,
+		RoomID:                  strings.TrimSpace(roomID),
+		AgentID:                 strings.TrimSpace(agentID),
+		RemoteIP:                ip,
+		Now:                     now,
+		LeaseExpiresAt:          now.Add(90 * time.Second),
+		MaxActivePerRoomAgent:   maxActiveStreamsPerAgentRoom,
+		MaxConnectsPerMinuteKey: maxStreamConnectsPerMinuteRoomKey,
+		MaxConnectsPerMinuteIP:  maxStreamConnectsPerMinuteIP,
+	})
+	if err != nil {
+		return nil, "stream_coordination_failed", err
+	}
+	if !out.Acquired {
+		reason := strings.TrimSpace(out.DeniedReason)
+		if reason == "" {
+			reason = "stream_rate_limited"
+		}
+		return nil, reason, a2a.ErrRateLimit
+	}
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			if err := s.streamLeaseStore.ReleaseRoomEventStreamLease(context.Background(), leaseID); err != nil {
+				log.Printf("stream_lease_release_failed lease_id=%s room_id=%s agent_id=%s err=%v", leaseID, roomID, agentID, err)
 			}
 		})
 	}

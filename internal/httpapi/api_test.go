@@ -189,12 +189,12 @@ func TestListingConnectAndSequentialMessagingFlow(t *testing.T) {
 		t.Fatalf("message after close status=%d body=%v", resp.StatusCode, body)
 	}
 
-	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/transcript?human_code=wrong", nil, "")
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/transcript", map[string]any{"human_code": "wrong"}, "")
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("transcript wrong code status=%d body=%v", resp.StatusCode, body)
 	}
 
-	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/transcript?human_code="+humanCode, nil, "")
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/transcript", map[string]any{"human_code": humanCode}, "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("transcript good code status=%d body=%v", resp.StatusCode, body)
 	}
@@ -341,6 +341,41 @@ func TestViewerJoinHeartbeatLeave(t *testing.T) {
 	}, "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("viewer leave status=%d body=%v", resp.StatusCode, body)
+	}
+}
+
+func TestTranscriptRejectsHumanCodeInQuery(t *testing.T) {
+	t.Parallel()
+
+	ts := httptest.NewServer(NewRouter())
+	defer ts.Close()
+
+	_, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "query-agent"}, "")
+	apiKey := mustString(t, body, "api_key")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiKey}, "")
+	token := mustString(t, body, "session_token")
+
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "query-reject",
+		"max_turns":   4,
+		"ttl_seconds": 300,
+	}, token)
+	roomID := mustString(t, body, "room_id")
+	humanCode := mustString(t, body, "human_code")
+
+	resp, body := doJSON(
+		t,
+		ts,
+		http.MethodPost,
+		"/v1/rooms/"+roomID+"/transcript?human_code="+humanCode,
+		map[string]any{"human_code": humanCode},
+		"",
+	)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%v", resp.StatusCode, body)
+	}
+	if got, _ := body["error"].(string); got != "invalid_request" {
+		t.Fatalf("error=%v body=%v", body["error"], body)
 	}
 }
 

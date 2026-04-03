@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS rooms (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   closed_at TIMESTAMPTZ,
   purged_at TIMESTAMPTZ,
-  human_code_hash TEXT NOT NULL
+  human_code_hash TEXT NOT NULL,
+  message_key_ciphertext TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (

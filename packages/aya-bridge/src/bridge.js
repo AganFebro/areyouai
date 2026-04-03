@@ -113,8 +113,24 @@ async function atomicWriteJSON(target, value) {
     `.${path.basename(target)}.${process.pid}.${Date.now()}.${crypto.randomUUID()}.tmp`
   );
   const body = `${JSON.stringify(value, null, 2)}\n`;
-  await fs.writeFile(tmp, body, { mode: 0o600 });
+  const handle = await fs.open(tmp, "w", 0o600);
+  try {
+    await handle.writeFile(body);
+    await handle.sync();
+  } finally {
+    await handle.close().catch(() => {});
+  }
   await fs.rename(tmp, target);
+  try {
+    const dirHandle = await fs.open(dir, "r");
+    try {
+      await dirHandle.sync();
+    } finally {
+      await dirHandle.close().catch(() => {});
+    }
+  } catch {
+    // Best-effort directory sync.
+  }
 }
 
 async function readJSON(target, fallback = null) {
@@ -157,6 +173,18 @@ function parseJSONText(text) {
   } catch {
     return { raw: text };
   }
+}
+
+function parseISOTime(raw) {
+  const text = String(raw || "").trim();
+  if (!text) {
+    return null;
+  }
+  const at = new Date(text);
+  if (Number.isNaN(at.getTime())) {
+    return null;
+  }
+  return at;
 }
 
 function computeBackoffMs(reconnect, attempt) {
@@ -259,8 +287,12 @@ class BridgeDaemon {
     this.state = options.state || {
       last_acknowledged_delivery_id: "",
       last_connected_at: null,
-      last_stream_status: "idle"
+      last_stream_status: "idle",
+      completed_wake_keys: []
     };
+    if (!Array.isArray(this.state.completed_wake_keys)) {
+      this.state.completed_wake_keys = [];
+    }
   }
 
   static async fromDisk(options = {}) {
@@ -275,7 +307,8 @@ class BridgeDaemon {
       state: await readJSON(path.join(resolvePaths(config).baseDir, "state.json"), {
         last_acknowledged_delivery_id: "",
         last_connected_at: null,
-        last_stream_status: "idle"
+        last_stream_status: "idle",
+        completed_wake_keys: []
       })
     });
     await daemon.ensureLayout();
@@ -299,6 +332,45 @@ class BridgeDaemon {
 
   async saveState() {
     await atomicWriteJSON(this.paths.statePath, this.state);
+  }
+
+  normalizeTurnReadyWakeKey(job) {
+    if (String(job?.type || "").trim() !== "room.turn_ready") {
+      return "";
+    }
+    const roomId = String(job?.room_id || "").trim();
+    const nextActorID = String(job?.next_actor_id || "").trim();
+    if (!roomId || !nextActorID || typeof job?.next_turn !== "number") {
+      return "";
+    }
+    return `${roomId}|${job.next_turn}|${nextActorID}`;
+  }
+
+  hasCompletedWakeKey(key) {
+    const normalized = String(key || "").trim();
+    if (!normalized) {
+      return false;
+    }
+    return (this.state.completed_wake_keys || []).includes(normalized);
+  }
+
+  rememberCompletedWakeKey(key) {
+    const normalized = String(key || "").trim();
+    if (!normalized) {
+      return;
+    }
+    const current = Array.isArray(this.state.completed_wake_keys) ? this.state.completed_wake_keys : [];
+    this.state.completed_wake_keys = [normalized, ...current.filter((item) => item !== normalized)].slice(0, 64);
+  }
+
+  forgetCompletedWakeKeysForRoom(roomId) {
+    const targetRoomID = String(roomId || "").trim();
+    if (!targetRoomID) {
+      return;
+    }
+    const prefix = `${targetRoomID}|`;
+    this.state.completed_wake_keys = (Array.isArray(this.state.completed_wake_keys) ? this.state.completed_wake_keys : [])
+      .filter((key) => !String(key || "").startsWith(prefix));
   }
 
   async relogin() {
@@ -408,7 +480,88 @@ class BridgeDaemon {
     return payload;
   }
 
+  async readRoomToken(roomId) {
+    return readJSON(path.join(this.paths.tokenDir, `${roomId}.json`), null);
+  }
+
+  shouldRefreshToken(expiresAt) {
+    const expiry = parseISOTime(expiresAt);
+    if (!expiry) {
+      return true;
+    }
+    const thresholdSeconds = Number(this.config.aya?.token_refresh_threshold_seconds || 60);
+    const thresholdMs = Math.max(0, thresholdSeconds) * 1000;
+    return (expiry.getTime() - Date.now()) <= thresholdMs;
+  }
+
+  async ensureFreshRoomTokenForJob(job) {
+    if (String(job.type || "").trim() !== "room.turn_ready") {
+      return null;
+    }
+    const roomId = String(job.room_id || "").trim();
+    if (!roomId) {
+      return null;
+    }
+
+    const current = await this.readRoomToken(roomId);
+    const hasToken = String(current?.token || "").trim() !== "";
+    const expiresAt = current?.expires_at || job.token_expires_at;
+    const needsRefresh = !hasToken || this.shouldRefreshToken(expiresAt);
+    if (!needsRefresh) {
+      return current;
+    }
+
+    this.logger.info(`refreshing room token room_id=${roomId} reason=pre_wake_or_missing`);
+    const refreshed = await this.refreshRoomToken(roomId);
+    return this.readRoomToken(roomId).catch(() => ({
+      room_id: roomId,
+      token: refreshed.token,
+      expires_at: refreshed.expires_at
+    }));
+  }
+
+  normalizeTurnReadyWakeKey(job) {
+    if (String(job.type || "").trim() !== "room.turn_ready") {
+      return "";
+    }
+    const roomId = String(job.room_id || "").trim();
+    const nextActorID = String(job.next_actor_id || "").trim();
+    if (!roomId || !nextActorID || typeof job.next_turn !== "number") {
+      return "";
+    }
+    return `${roomId}|${job.next_turn}|${nextActorID}`;
+  }
+
+  async findEquivalentPendingWakeJob(job) {
+    const key = this.normalizeTurnReadyWakeKey(job);
+    if (!key) {
+      return "";
+    }
+    const files = await listJSONFiles(this.paths.wakeQueueDir);
+    for (const file of files) {
+      const existing = await readJSON(file, null);
+      if (!existing) {
+        continue;
+      }
+      if (String(existing.status || "pending") === "done") {
+        continue;
+      }
+      if (this.normalizeTurnReadyWakeKey(existing) === key) {
+        return file;
+      }
+    }
+    return "";
+  }
+
   async enqueueWakeJob(job) {
+    const completedKey = this.normalizeTurnReadyWakeKey(job);
+    if (completedKey && this.hasCompletedWakeKey(completedKey)) {
+      return "";
+    }
+    const equivalent = await this.findEquivalentPendingWakeJob(job);
+    if (equivalent) {
+      return equivalent;
+    }
     const file = path.join(this.paths.wakeQueueDir, `${job.delivery_id}.json`);
     const exists = await pathExists(file);
     if (exists) {
@@ -430,6 +583,24 @@ class BridgeDaemon {
       attempt_count: 0
     });
     return file;
+  }
+
+  async dropWakeJobsForRoom(roomId) {
+    const targetRoomID = String(roomId || "").trim();
+    if (!targetRoomID) {
+      return;
+    }
+    const files = await listJSONFiles(this.paths.wakeQueueDir);
+    for (const file of files) {
+      const job = await readJSON(file, null);
+      if (!job) {
+        continue;
+      }
+      if (String(job.room_id || "").trim() !== targetRoomID) {
+        continue;
+      }
+      await removeIfExists(file);
+    }
   }
 
   async updateWakeJob(jobFile, value) {
@@ -454,6 +625,8 @@ class BridgeDaemon {
     if (!hookURL || !hookToken) {
       throw new Error("OpenClaw hook_url/hook_token missing from bridge config");
     }
+    const tokenState = await this.ensureFreshRoomTokenForJob(job);
+    const tokenExpiresAt = tokenState?.expires_at || job.token_expires_at || null;
     const tokenPath = path.join(this.paths.tokenDir, `${roomId}.json`);
     const contract = {
       contract: "aya.wake.v1",
@@ -467,7 +640,7 @@ class BridgeDaemon {
       next_actor_id: job.next_actor_id || null,
       occurred_at: job.occurred_at || null,
       token_path: tokenPath,
-      token_expires_at: job.token_expires_at || null,
+      token_expires_at: tokenExpiresAt,
       instructions: [
         "Read token_path and fetch fresh /v1/rooms/{id}/context before deciding.",
         "Reply exactly once only if next_actor_id in fresh context equals your agent_id.",
@@ -512,6 +685,15 @@ class BridgeDaemon {
       try {
         await this.wakeOpenClaw(job);
         await removeIfExists(file);
+        const completedKey = this.normalizeTurnReadyWakeKey(job);
+        if (completedKey) {
+          this.rememberCompletedWakeKey(completedKey);
+          try {
+            await this.saveState();
+          } catch (err) {
+            this.logger.warn(`wake state persist failed delivery_id=${job.delivery_id} room_id=${job.room_id} error=${err.message}`);
+          }
+        }
         this.logger.info(`wake delivered delivery_id=${job.delivery_id} room_id=${job.room_id}`);
       } catch (err) {
         const nextJob = {
@@ -534,6 +716,9 @@ class BridgeDaemon {
     for (const item of payload.terminal || []) {
       if (item.room_id) {
         await this.deleteRoomToken(item.room_id);
+        await this.dropWakeJobsForRoom(item.room_id);
+        this.forgetCompletedWakeKeysForRoom(item.room_id);
+        await this.saveState();
       }
     }
     for (const item of payload.actionable || []) {
@@ -542,6 +727,13 @@ class BridgeDaemon {
       if (!roomId || !token) {
         continue;
       }
+      const wakeKey = this.normalizeTurnReadyWakeKey(item);
+      if (wakeKey && this.hasCompletedWakeKey(wakeKey)) {
+        await this.dropWakeJobsForRoom(roomId);
+        continue;
+      }
+      // Recovery payload is authoritative; clear stale queued wake jobs for this room.
+      await this.dropWakeJobsForRoom(roomId);
       await this.writeRoomToken(roomId, item);
       const syntheticDeliveryID = `recovery-${roomId}-${item.next_turn ?? "unknown"}`;
       await this.enqueueWakeJob({
@@ -565,6 +757,12 @@ class BridgeDaemon {
     const roomId = String(payload.room_id || "").trim();
     if (!deliveryId || !roomId) {
       throw new Error("room.turn_ready missing delivery_id or room_id");
+    }
+    const wakeKey = this.normalizeTurnReadyWakeKey(payload);
+    if (wakeKey && this.hasCompletedWakeKey(wakeKey)) {
+      await this.ackDelivery(deliveryId);
+      this.logger.info(`delivery deduped delivery_id=${deliveryId} room_id=${roomId} event_type=room.turn_ready`);
+      return payload;
     }
     const token = String(payload.room_token || "").trim();
     let tokenPayload = payload;
@@ -597,6 +795,9 @@ class BridgeDaemon {
     const roomId = String(payload.room_id || "").trim();
     if (roomId) {
       await this.deleteRoomToken(roomId);
+      await this.dropWakeJobsForRoom(roomId);
+      this.forgetCompletedWakeKeysForRoom(roomId);
+      await this.saveState();
     }
     if (deliveryId) {
       await this.ackDelivery(deliveryId);
