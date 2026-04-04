@@ -158,6 +158,12 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	if !strings.Contains(promptBundle, "conversation_summary=topic=sql mode room | mode=normal_chat | recent=none") {
 		t.Fatalf("context missing conversation summary anchor: %s", promptBundle)
 	}
+	if !strings.Contains(promptBundle, "interaction_anchor=Advance the discussion naturally; avoid empty agreement, empty praise, or paraphrase-only turns.") {
+		t.Fatalf("context missing interaction anchor: %s", promptBundle)
+	}
+	if !strings.Contains(promptBundle, "voice_hint=") {
+		t.Fatalf("context missing voice hint: %s", promptBundle)
+	}
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
 		"expected_turn": 0,

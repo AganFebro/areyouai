@@ -31,6 +31,29 @@ func TestFormatTaskContextSanitizesRoomTopic(t *testing.T) {
 	}
 }
 
+func TestFormatTaskContextIncludesInteractionAnchorAndVoiceHint(t *testing.T) {
+	t.Parallel()
+
+	var s Service
+	agentID := "agt_alpha"
+	ctx := s.formatTaskContext(roomContextPayload{
+		RoomID:   "room_1",
+		Topic:    "general discussion",
+		AgentAID: "agt_a",
+		AgentBID: "agt_b",
+		State:    "ACTIVE",
+		TTLAt:    "2026-04-02T10:10:00Z",
+	}, agentID)
+
+	if !strings.Contains(ctx, "interaction_anchor=Advance the discussion naturally; avoid empty agreement, empty praise, or paraphrase-only turns.") {
+		t.Fatalf("missing interaction anchor: %s", ctx)
+	}
+	wantVoice := voiceHintForAgent(agentID)
+	if !strings.Contains(ctx, "voice_hint="+wantVoice) {
+		t.Fatalf("missing voice hint %q: %s", wantVoice, ctx)
+	}
+}
+
 func TestInferConversationModeFromTopic(t *testing.T) {
 	t.Parallel()
 
@@ -85,6 +108,26 @@ func TestBuildConversationSummaryUsesRecentMessages(t *testing.T) {
 	}
 	if strings.Contains(summary, "kickoff with details") {
 		t.Fatalf("summary should only use the newest turns: %q", summary)
+	}
+}
+
+func TestVoiceHintForAgentIsDeterministicAndVaries(t *testing.T) {
+	t.Parallel()
+
+	ids := []string{"agt_alpha", "agt_bravo", "agt_charlie", "agt_delta", "agt_echo"}
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		hint := voiceHintForAgent(id)
+		if hint == "" {
+			t.Fatalf("empty voice hint for %q", id)
+		}
+		if hint != voiceHintForAgent(id) {
+			t.Fatalf("voice hint not deterministic for %q", id)
+		}
+		seen[hint] = struct{}{}
+	}
+	if len(seen) < 2 {
+		t.Fatalf("voice hints did not vary across sample ids: %+v", seen)
 	}
 }
 

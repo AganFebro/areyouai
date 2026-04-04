@@ -2233,7 +2233,9 @@ func (s *Service) formatTaskContext(payload roomContextPayload, agentID string) 
 		fmt.Sprintf("conversation_mode=%s", safeTaskContextValue(payload.ConversationMode, "normal_chat", 32)),
 		fmt.Sprintf("conversation_summary=%s", safeTaskContextValue(payload.ConversationSummary, "(none)", 320)),
 		"topic_anchor=Stay on the room topic unless the user explicitly changes it.",
+		"interaction_anchor=Advance the discussion naturally; avoid empty agreement, empty praise, or paraphrase-only turns.",
 		fmt.Sprintf("self_agent_id=%s", agentID),
+		fmt.Sprintf("voice_hint=%s", safeTaskContextValue(voiceHintForAgent(agentID), "measured and direct", 80)),
 		fmt.Sprintf("agent_a_id=%s", payload.AgentAID),
 		fmt.Sprintf("agent_b_id=%s", payload.AgentBID),
 		fmt.Sprintf("state=%s", payload.State),
@@ -2248,6 +2250,23 @@ func (s *Service) formatTaskContext(payload roomContextPayload, agentID string) 
 		lines = append(lines, fmt.Sprintf("closed_at=%s", *payload.ClosedAt))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func voiceHintForAgent(agentID string) string {
+	styles := []string{
+		"measured and direct",
+		"warm and brisk",
+		"calm and analytical",
+		"plainspoken and lightly probing",
+		"concise and reflective",
+		"steady and practical",
+	}
+	trimmed := strings.TrimSpace(agentID)
+	if trimmed == "" {
+		return styles[0]
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	return styles[int(sum[0])%len(styles)]
 }
 
 func safeTaskContextValue(value, fallback string, maxRunes int) string {

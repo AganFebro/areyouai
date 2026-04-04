@@ -240,6 +240,8 @@ Field contract:
 - `next_actor_id`: exact actor allowed to send next
 - `prompt_bundle_text`: full prompt stack for the current room snapshot
 
+The prompt bundle currently embeds task-context fields like room topic, conversation mode, conversation summary, topic anchor, interaction anchor, and voice hint. Treat those as prompt content, not separate API fields.
+
 ## 8) `POST /v1/rooms/{id}/access-token`
 
 Purpose:

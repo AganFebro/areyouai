@@ -13,7 +13,7 @@ func TestBuildIncludesCanonicalIdentityStack(t *testing.T) {
 		t.Fatalf("new builder: %v", err)
 	}
 	out := b.Build(BuildInput{
-		TaskContext: "room_id=room_1\nroom_topic=sql mode room\nconversation_mode=normal_chat\nconversation_summary=topic=sql mode room | mode=normal_chat | recent=none\ntopic_anchor=Stay on the room topic unless the user explicitly changes it.",
+		TaskContext: "room_id=room_1\nroom_topic=sql mode room\nconversation_mode=normal_chat\nconversation_summary=topic=sql mode room | mode=normal_chat | recent=none\ntopic_anchor=Stay on the room topic unless the user explicitly changes it.\ninteraction_anchor=Advance the discussion naturally; avoid empty agreement, empty praise, or paraphrase-only turns.\nself_agent_id=agt_a\nvoice_hint=measured and direct",
 		RecentMessages: []RecentMessage{
 			{Turn: 0, SenderID: "agt_a", Ciphertext: "hello"},
 		},
@@ -56,7 +56,7 @@ func TestBuildIncludesCanonicalIdentityStack(t *testing.T) {
 			t.Fatalf("ordered stack[%d]=%q want=%q", i, out.OrderedStack[i], want)
 		}
 	}
-	if got := b.composePrompt("room_id=room_1\nroom_topic=sql mode room\nconversation_mode=normal_chat\nconversation_summary=topic=sql mode room | mode=normal_chat | recent=none\ntopic_anchor=Stay on the room topic unless the user explicitly changes it.", []RecentMessage{{Turn: 0, SenderID: "agt_a", Ciphertext: "hello"}}); got != out.Prompt {
+	if got := b.composePrompt("room_id=room_1\nroom_topic=sql mode room\nconversation_mode=normal_chat\nconversation_summary=topic=sql mode room | mode=normal_chat | recent=none\ntopic_anchor=Stay on the room topic unless the user explicitly changes it.\ninteraction_anchor=Advance the discussion naturally; avoid empty agreement, empty praise, or paraphrase-only turns.\nself_agent_id=agt_a\nvoice_hint=measured and direct", []RecentMessage{{Turn: 0, SenderID: "agt_a", Ciphertext: "hello"}}); got != out.Prompt {
 		t.Fatal("composePrompt and Build diverged for topic-anchored context")
 	}
 	if !strings.Contains(out.Prompt, "room_topic=sql mode room") {
@@ -70,5 +70,11 @@ func TestBuildIncludesCanonicalIdentityStack(t *testing.T) {
 	}
 	if !strings.Contains(out.Prompt, "topic_anchor=Stay on the room topic") {
 		t.Fatalf("missing topic anchor in prompt: %s", out.Prompt)
+	}
+	if !strings.Contains(out.Prompt, "interaction_anchor=Advance the discussion naturally") {
+		t.Fatalf("missing interaction anchor in prompt: %s", out.Prompt)
+	}
+	if !strings.Contains(out.Prompt, "voice_hint=measured and direct") {
+		t.Fatalf("missing voice hint in prompt: %s", out.Prompt)
 	}
 }

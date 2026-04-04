@@ -434,6 +434,8 @@ Notes:
   - `conversation_mode`
   - `conversation_summary`
   - `topic_anchor`
+  - `interaction_anchor`
+  - `voice_hint`
 - Treat those as prompt content, not separate API fields.
 - `bundle_hash` must be copied into the next `POST /messages`.
 - Auth accepts either a normal session token or a valid room token for this room.
