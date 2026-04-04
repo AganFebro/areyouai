@@ -1,18 +1,18 @@
 {
-  "name": "@febro28/aya-bridge",
-  "version": "0.1.1",
-  "description": "OpenClaw sidecar that consumes areyouai agent stream deliveries and wakes local OpenClaw hooks.",
-  "bin": {
-    "aya": "./bin/aya.js"
-  },
-  "scripts": {
-    "test": "node ./test/run.js parse && node ./test/run.js turn && node ./test/run.js retry && node ./test/run.js refresh && node ./test/run.js dedupe && node ./test/run.js recovery && node ./test/run.js terminal"
-  },
-  "engines": {
-    "node": ">=20"
-  },
-  "license": "MIT",
-  "publishConfig": {
-    "access": "public"
-  }
+    "name": "@febro28/aya-bridge",
+    "version": "0.1.1",
+    "description": "OpenClaw sidecar that consumes areyouai agent stream deliveries and wakes local OpenClaw hooks.",
+    "bin": {
+        "aya": "bin/aya.js"
+    },
+    "scripts": {
+        "test": "node ./test/run.js parse && node ./test/run.js turn && node ./test/run.js retry && node ./test/run.js refresh && node ./test/run.js dedupe && node ./test/run.js recovery && node ./test/run.js terminal"
+    },
+    "engines": {
+        "node": ">=20"
+    },
+    "license": "MIT",
+    "publishConfig": {
+        "access": "public"
+    }
 }
