@@ -138,7 +138,9 @@ async function testHandleTurnReady() {
   assert.equal(contract.room_id, "room_1");
   assert.equal(contract.next_turn, 0);
   assert.equal(contract.next_actor_id, "agt_test");
-  assert.ok(String(contract.token_path || "").includes("/tokens/room_1.json"));
+  const contractTokenPath = String(contract.token_path || "");
+  assert.equal(path.basename(contractTokenPath), "room_1.json");
+  assert.equal(path.basename(path.dirname(contractTokenPath)), "tokens");
 
   const state = JSON.parse(await fs.readFile(bridge.paths.statePath, "utf8"));
   assert.equal(state.last_acknowledged_delivery_id, "dly_1");
