@@ -13,7 +13,7 @@ func TestBuildIncludesCanonicalIdentityStack(t *testing.T) {
 		t.Fatalf("new builder: %v", err)
 	}
 	out := b.Build(BuildInput{
-		TaskContext: "room_id=room_1",
+		TaskContext: "room_id=room_1\nroom_topic=sql mode room\nconversation_mode=normal_chat\nconversation_summary=topic=sql mode room | mode=normal_chat | recent=none\ntopic_anchor=Stay on the room topic unless the user explicitly changes it.",
 		RecentMessages: []RecentMessage{
 			{Turn: 0, SenderID: "agt_a", Ciphertext: "hello"},
 		},
@@ -56,7 +56,19 @@ func TestBuildIncludesCanonicalIdentityStack(t *testing.T) {
 			t.Fatalf("ordered stack[%d]=%q want=%q", i, out.OrderedStack[i], want)
 		}
 	}
-	if got := b.composePrompt("room_id=room_1", []RecentMessage{{Turn: 0, SenderID: "agt_a", Ciphertext: "hello"}}); got != out.Prompt {
-		t.Fatal("composePrompt and Build diverged")
+	if got := b.composePrompt("room_id=room_1\nroom_topic=sql mode room\nconversation_mode=normal_chat\nconversation_summary=topic=sql mode room | mode=normal_chat | recent=none\ntopic_anchor=Stay on the room topic unless the user explicitly changes it.", []RecentMessage{{Turn: 0, SenderID: "agt_a", Ciphertext: "hello"}}); got != out.Prompt {
+		t.Fatal("composePrompt and Build diverged for topic-anchored context")
+	}
+	if !strings.Contains(out.Prompt, "room_topic=sql mode room") {
+		t.Fatalf("missing room topic anchor in prompt: %s", out.Prompt)
+	}
+	if !strings.Contains(out.Prompt, "conversation_mode=normal_chat") {
+		t.Fatalf("missing conversation mode anchor in prompt: %s", out.Prompt)
+	}
+	if !strings.Contains(out.Prompt, "conversation_summary=topic=sql mode room | mode=normal_chat | recent=none") {
+		t.Fatalf("missing conversation summary anchor in prompt: %s", out.Prompt)
+	}
+	if !strings.Contains(out.Prompt, "topic_anchor=Stay on the room topic") {
+		t.Fatalf("missing topic anchor in prompt: %s", out.Prompt)
 	}
 }

@@ -165,6 +165,7 @@ type Listing struct {
 
 type Room struct {
 	ID                   string           `json:"id"`
+	Topic                string           `json:"topic,omitempty"`
 	AgentAID             string           `json:"agent_a_id"`
 	AgentBID             string           `json:"agent_b_id"`
 	State                domain.RoomState `json:"state"`
@@ -370,6 +371,7 @@ type CreateListingInput struct {
 
 type CreateRoomInput struct {
 	ID                   string
+	Topic                string
 	AgentAID             string
 	AgentBID             string
 	State                domain.RoomState
@@ -383,6 +385,7 @@ type CreateRoomInput struct {
 
 type UpdateRoomInput struct {
 	ID                   string
+	Topic                *string
 	AgentBID             *string
 	State                *domain.RoomState
 	TurnIndex            *int

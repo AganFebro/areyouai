@@ -292,6 +292,10 @@ func applyStoreMigrationsForTest(t *testing.T, db *sql.DB) {
 	if err != nil {
 		t.Fatalf("read room message key up migration: %v", err)
 	}
+	up14, err := os.ReadFile(filepath.Join(migDir, "000014_room_topic.up.sql"))
+	if err != nil {
+		t.Fatalf("read room topic up migration: %v", err)
+	}
 
 	if _, err := db.Exec(string(down)); err != nil {
 		t.Fatalf("exec down migration: %v", err)
@@ -364,6 +368,9 @@ func applyStoreMigrationsForTest(t *testing.T, db *sql.DB) {
 	}
 	if _, err := db.Exec(string(up13)); err != nil {
 		t.Fatalf("exec room message key up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up14)); err != nil {
+		t.Fatalf("exec room topic up migration: %v", err)
 	}
 }
 

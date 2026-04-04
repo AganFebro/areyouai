@@ -267,7 +267,7 @@ WHERE connected = FALSE`
 
 func (s *Store) ListRecoverableRoomsForAgent(ctx context.Context, agentID string, since time.Time) ([]repository.Room, error) {
 	const q = `
-SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext
+SELECT id, topic, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext
 FROM rooms
 WHERE (agent_a_id = $1 OR agent_b_id = $1)
   AND (
@@ -298,17 +298,17 @@ ORDER BY
 
 func (s *Store) CreateRoom(ctx context.Context, in repository.CreateRoomInput) (repository.Room, error) {
 	const q = `
-	INSERT INTO rooms (id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, human_code_hash, human_code_expires_at, message_key_ciphertext)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext`
+	INSERT INTO rooms (id, topic, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, human_code_hash, human_code_expires_at, message_key_ciphertext)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	RETURNING id, topic, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext`
 	return scanRoom(
-		s.db.QueryRowContext(ctx, q, in.ID, in.AgentAID, nullableText(in.AgentBID), string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash, nullableTime(in.HumanCodeExpiresAt), nullableText(in.MessageKeyCiphertext)),
+		s.db.QueryRowContext(ctx, q, in.ID, in.Topic, in.AgentAID, nullableText(in.AgentBID), string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash, nullableTime(in.HumanCodeExpiresAt), nullableText(in.MessageKeyCiphertext)),
 	)
 }
 
 func (s *Store) GetRoom(ctx context.Context, roomID string) (repository.Room, error) {
 	const q = `
-SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext
+SELECT id, topic, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext
 FROM rooms
 WHERE id = $1`
 	return scanRoom(s.db.QueryRowContext(ctx, q, roomID))
@@ -337,21 +337,26 @@ func (s *Store) UpdateRoom(ctx context.Context, in repository.UpdateRoomInput) (
 	if in.MessageKeyCiphertext != nil {
 		current.MessageKeyCiphertext = *in.MessageKeyCiphertext
 	}
+	if in.Topic != nil {
+		current.Topic = *in.Topic
+	}
 
 	const q = `
 UPDATE rooms
-SET agent_b_id = $2,
-    state = $3,
-    turn_index = $4,
-    closed_at = $5,
-    purged_at = $6,
-    message_key_ciphertext = $7
+SET topic = COALESCE($2, topic),
+    agent_b_id = $3,
+    state = $4,
+    turn_index = $5,
+    closed_at = $6,
+    purged_at = $7,
+    message_key_ciphertext = $8
 WHERE id = $1
-RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext`
+RETURNING id, topic, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext`
 	return scanRoom(s.db.QueryRowContext(
 		ctx,
 		q,
 		current.ID,
+		nullableText(current.Topic),
 		nullableText(current.AgentBID),
 		string(current.State),
 		current.TurnIndex,
@@ -798,7 +803,7 @@ func (s *Store) ListRoomsForLifecycleSweep(ctx context.Context, now time.Time, l
 		limit = 200
 	}
 	const q = `
-SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext
+SELECT id, topic, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext
 FROM rooms
 WHERE state = $1
    OR (state IN ($2, $3) AND ttl_at <= $4)
@@ -984,17 +989,17 @@ func (s *txStore) MarkListingConnected(ctx context.Context, listingID string) er
 
 func (s *txStore) CreateRoom(ctx context.Context, in repository.CreateRoomInput) (repository.Room, error) {
 	const q = `
-	INSERT INTO rooms (id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, human_code_hash, human_code_expires_at, message_key_ciphertext)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext`
+	INSERT INTO rooms (id, topic, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, human_code_hash, human_code_expires_at, message_key_ciphertext)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	RETURNING id, topic, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext`
 	return scanRoom(
-		s.tx.QueryRowContext(ctx, q, in.ID, in.AgentAID, nullableText(in.AgentBID), string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash, nullableTime(in.HumanCodeExpiresAt), nullableText(in.MessageKeyCiphertext)),
+		s.tx.QueryRowContext(ctx, q, in.ID, in.Topic, in.AgentAID, nullableText(in.AgentBID), string(in.State), in.TurnIndex, in.MaxTurns, in.TTLAt, in.HumanCodeHash, nullableTime(in.HumanCodeExpiresAt), nullableText(in.MessageKeyCiphertext)),
 	)
 }
 
 func (s *txStore) GetRoom(ctx context.Context, roomID string) (repository.Room, error) {
 	const q = `
-SELECT id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext
+SELECT id, topic, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext
 FROM rooms
 WHERE id = $1`
 	return scanRoom(s.tx.QueryRowContext(ctx, q, roomID))
@@ -1023,21 +1028,26 @@ func (s *txStore) UpdateRoom(ctx context.Context, in repository.UpdateRoomInput)
 	if in.MessageKeyCiphertext != nil {
 		current.MessageKeyCiphertext = *in.MessageKeyCiphertext
 	}
+	if in.Topic != nil {
+		current.Topic = *in.Topic
+	}
 
 	const q = `
 UPDATE rooms
-SET agent_b_id = $2,
-    state = $3,
-    turn_index = $4,
-    closed_at = $5,
-    purged_at = $6,
-    message_key_ciphertext = $7
+SET topic = COALESCE($2, topic),
+    agent_b_id = $3,
+    state = $4,
+    turn_index = $5,
+    closed_at = $6,
+    purged_at = $7,
+    message_key_ciphertext = $8
 WHERE id = $1
-RETURNING id, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext`
+RETURNING id, topic, agent_a_id, agent_b_id, state, turn_index, max_turns, ttl_at, created_at, closed_at, purged_at, human_code_hash, human_code_expires_at, message_key_ciphertext`
 	return scanRoom(s.tx.QueryRowContext(
 		ctx,
 		q,
 		current.ID,
+		nullableText(current.Topic),
 		nullableText(current.AgentBID),
 		string(current.State),
 		current.TurnIndex,
@@ -1292,10 +1302,12 @@ func scanListingRows(rows *sql.Rows) (repository.Listing, error) {
 func scanRoom(row interface{ Scan(dest ...any) error }) (repository.Room, error) {
 	var r repository.Room
 	var state string
+	var topic sql.NullString
 	var agentBID sql.NullString
 	var messageKeyCiphertext sql.NullString
 	err := row.Scan(
 		&r.ID,
+		&topic,
 		&r.AgentAID,
 		&agentBID,
 		&state,
@@ -1314,6 +1326,9 @@ func scanRoom(row interface{ Scan(dest ...any) error }) (repository.Room, error)
 	}
 	if agentBID.Valid {
 		r.AgentBID = agentBID.String
+	}
+	if topic.Valid {
+		r.Topic = topic.String
 	}
 	r.State = domain.RoomState(state)
 	if messageKeyCiphertext.Valid {

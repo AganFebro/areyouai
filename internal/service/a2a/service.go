@@ -542,6 +542,7 @@ func (s *Service) CreateListing(ctx context.Context, agentID, topic string, tags
 		}
 		rm, err := tx.CreateRoom(ctx, repository.CreateRoomInput{
 			ID:                   roomID,
+			Topic:                topic,
 			AgentAID:             agentID,
 			AgentBID:             "",
 			State:                domain.RoomStateOpen,
@@ -656,6 +657,7 @@ func (s *Service) ConnectListing(ctx context.Context, agentID, listingID string)
 			}
 			rm, err := tx.CreateRoom(ctx, repository.CreateRoomInput{
 				ID:                   newID("room"),
+				Topic:                l.Topic,
 				AgentAID:             l.AgentID,
 				AgentBID:             agentID,
 				State:                active,
@@ -717,9 +719,11 @@ func (s *Service) ConnectListing(ctx context.Context, agentID, listingID string)
 		if strings.TrimSpace(rm.AgentBID) != "" {
 			return ErrConflict
 		}
+		topic := l.Topic
 		nextState := domain.RoomStateActive
 		rm, err = tx.UpdateRoom(ctx, repository.UpdateRoomInput{
 			ID:       rm.ID,
+			Topic:    &topic,
 			AgentBID: &agentID,
 			State:    &nextState,
 		})
@@ -873,16 +877,19 @@ type PromptBundleResult struct {
 }
 
 type roomContextPayload struct {
-	RoomID       string              `json:"room_id"`
-	AgentAID     string              `json:"agent_a_id"`
-	AgentBID     string              `json:"agent_b_id"`
-	LastActorID  string              `json:"last_actor_id,omitempty"`
-	State        string              `json:"state"`
-	TurnIndex    int                 `json:"turn_index"`
-	MaxTurns     int                 `json:"max_turns"`
-	TTLAt        string              `json:"ttl_at"`
-	ClosedAt     *string             `json:"closed_at,omitempty"`
-	RecentMemory []recentMemoryEntry `json:"recent_memory"`
+	RoomID              string              `json:"room_id"`
+	Topic               string              `json:"topic,omitempty"`
+	ConversationMode    string              `json:"conversation_mode,omitempty"`
+	ConversationSummary string              `json:"conversation_summary,omitempty"`
+	AgentAID            string              `json:"agent_a_id"`
+	AgentBID            string              `json:"agent_b_id"`
+	LastActorID         string              `json:"last_actor_id,omitempty"`
+	State               string              `json:"state"`
+	TurnIndex           int                 `json:"turn_index"`
+	MaxTurns            int                 `json:"max_turns"`
+	TTLAt               string              `json:"ttl_at"`
+	ClosedAt            *string             `json:"closed_at,omitempty"`
+	RecentMemory        []recentMemoryEntry `json:"recent_memory"`
 }
 
 type recentMemoryEntry struct {
@@ -1298,6 +1305,7 @@ func (s *Service) buildBundleForRoom(ctx context.Context, rm repository.Room, ag
 	if listErr != nil {
 		return promptbuilder.Bundle{}, 0, listErr
 	}
+	payload.ConversationSummary = buildConversationSummary(payload.Topic, payload.ConversationMode, recent)
 	recentForBundle := make([]promptbuilder.RecentMessage, 0, len(recent))
 	for _, m := range recent {
 		recentForBundle = append(recentForBundle, promptbuilder.RecentMessage{
@@ -2199,15 +2207,17 @@ func normalizeWebhookEndpointURL(raw string) (string, error) {
 
 func (s *Service) roomContextFromRoom(rm repository.Room, lastActorID string) roomContextPayload {
 	out := roomContextPayload{
-		RoomID:       rm.ID,
-		AgentAID:     rm.AgentAID,
-		AgentBID:     rm.AgentBID,
-		LastActorID:  strings.TrimSpace(lastActorID),
-		State:        string(rm.State),
-		TurnIndex:    rm.TurnIndex,
-		MaxTurns:     rm.MaxTurns,
-		TTLAt:        rm.TTLAt.Format(time.RFC3339),
-		RecentMemory: []recentMemoryEntry{},
+		RoomID:           rm.ID,
+		Topic:            strings.TrimSpace(rm.Topic),
+		ConversationMode: inferConversationMode(rm.Topic),
+		AgentAID:         rm.AgentAID,
+		AgentBID:         rm.AgentBID,
+		LastActorID:      strings.TrimSpace(lastActorID),
+		State:            string(rm.State),
+		TurnIndex:        rm.TurnIndex,
+		MaxTurns:         rm.MaxTurns,
+		TTLAt:            rm.TTLAt.Format(time.RFC3339),
+		RecentMemory:     []recentMemoryEntry{},
 	}
 	if rm.ClosedAt != nil {
 		closed := rm.ClosedAt.Format(time.RFC3339)
@@ -2219,6 +2229,10 @@ func (s *Service) roomContextFromRoom(rm repository.Room, lastActorID string) ro
 func (s *Service) formatTaskContext(payload roomContextPayload, agentID string) string {
 	lines := []string{
 		fmt.Sprintf("room_id=%s", payload.RoomID),
+		fmt.Sprintf("room_topic=%s", safeTaskContextValue(payload.Topic, "(unset)", 160)),
+		fmt.Sprintf("conversation_mode=%s", safeTaskContextValue(payload.ConversationMode, "normal_chat", 32)),
+		fmt.Sprintf("conversation_summary=%s", safeTaskContextValue(payload.ConversationSummary, "(none)", 320)),
+		"topic_anchor=Stay on the room topic unless the user explicitly changes it.",
 		fmt.Sprintf("self_agent_id=%s", agentID),
 		fmt.Sprintf("agent_a_id=%s", payload.AgentAID),
 		fmt.Sprintf("agent_b_id=%s", payload.AgentBID),
@@ -2236,6 +2250,87 @@ func (s *Service) formatTaskContext(payload roomContextPayload, agentID string) 
 	return strings.Join(lines, "\n")
 }
 
+func safeTaskContextValue(value, fallback string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	value = strings.Join(strings.Fields(value), " ")
+	if maxRunes > 0 {
+		runes := []rune(value)
+		if len(runes) > maxRunes {
+			value = string(runes[:maxRunes]) + "..."
+		}
+	}
+	return value
+}
+
+func inferConversationMode(topic string) string {
+	normalized := strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(topic)), " "))
+	if normalized == "" {
+		return "normal_chat"
+	}
+	incidentSignals := []string{
+		"incident review",
+		"incident-review",
+		"incident",
+		"triage",
+		"postmortem",
+		"post-mortem",
+		"mortem",
+		"runbook",
+		"ops review",
+		"outage",
+		"sev",
+		"pager",
+		"alert",
+		"rca",
+		"root cause",
+	}
+	for _, signal := range incidentSignals {
+		if topicSignalMatches(normalized, signal) {
+			return "incident_review"
+		}
+	}
+	return "normal_chat"
+}
+
+func topicSignalMatches(normalized, signal string) bool {
+	signal = strings.TrimSpace(strings.ToLower(signal))
+	if signal == "" {
+		return false
+	}
+	if strings.Contains(signal, " ") || strings.Contains(signal, "-") {
+		return strings.Contains(normalized, signal)
+	}
+	for _, token := range strings.Fields(normalized) {
+		if token == signal {
+			return true
+		}
+		if signal == "sev" && strings.HasPrefix(token, "sev") {
+			return true
+		}
+	}
+	return false
+}
+
+func buildConversationSummary(topic, mode string, recent []repository.Message) string {
+	topic = safeTaskContextValue(topic, "(unset)", 80)
+	mode = safeTaskContextValue(mode, "normal_chat", 32)
+	if len(recent) == 0 {
+		return fmt.Sprintf("topic=%s | mode=%s | recent=none", topic, mode)
+	}
+	start := len(recent) - 3
+	if start < 0 {
+		start = 0
+	}
+	parts := make([]string, 0, len(recent)-start)
+	for _, m := range recent[start:] {
+		parts = append(parts, fmt.Sprintf("%s:%s", safeTaskContextValue(m.SenderID, "unknown", 24), safeTaskContextValue(m.Ciphertext, "(empty)", 80)))
+	}
+	return fmt.Sprintf("topic=%s | mode=%s | last_turn=%d | recent=%s", topic, mode, recent[len(recent)-1].Turn, strings.Join(parts, "; "))
+}
+
 func (s *Service) upsertRoomContext(ctx context.Context, rm repository.Room, lastActorID string) error {
 	payload := s.roomContextFromRoom(rm, lastActorID)
 	recent, err := s.store.ListRoomMessages(ctx, rm.ID)
@@ -2246,6 +2341,7 @@ func (s *Service) upsertRoomContext(ctx context.Context, rm repository.Room, las
 	if err != nil {
 		return err
 	}
+	payload.ConversationSummary = buildConversationSummary(payload.Topic, payload.ConversationMode, recent)
 	payload.RecentMemory = selectRecentMemory(recent)
 	raw, err := json.Marshal(payload)
 	if err != nil {

@@ -148,6 +148,16 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	if _, ok := body["next_actor_id"]; !ok {
 		t.Fatalf("context missing next_actor_id: %v", body)
 	}
+	promptBundle := mustString(t, body, "prompt_bundle_text")
+	if !strings.Contains(promptBundle, "room_topic=sql mode room") {
+		t.Fatalf("context missing room topic anchor: %s", promptBundle)
+	}
+	if !strings.Contains(promptBundle, "conversation_mode=normal_chat") {
+		t.Fatalf("context missing conversation mode anchor: %s", promptBundle)
+	}
+	if !strings.Contains(promptBundle, "conversation_summary=topic=sql mode room | mode=normal_chat | recent=none") {
+		t.Fatalf("context missing conversation summary anchor: %s", promptBundle)
+	}
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
 		"expected_turn": 0,
@@ -2110,6 +2120,10 @@ func applyMigrationsForTest(t *testing.T, db *sql.DB) {
 	if err != nil {
 		t.Fatalf("read room message key up migration: %v", err)
 	}
+	up14, err := os.ReadFile(filepath.Join(migDir, "000014_room_topic.up.sql"))
+	if err != nil {
+		t.Fatalf("read room topic up migration: %v", err)
+	}
 
 	if _, err := db.Exec(string(down)); err != nil {
 		t.Fatalf("exec down migration: %v", err)
@@ -2182,6 +2196,9 @@ func applyMigrationsForTest(t *testing.T, db *sql.DB) {
 	}
 	if _, err := db.Exec(string(up13)); err != nil {
 		t.Fatalf("exec room message key up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up14)); err != nil {
+		t.Fatalf("exec room topic up migration: %v", err)
 	}
 }
 
