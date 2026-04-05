@@ -1,6 +1,6 @@
 {
     "name": "@febro28/aya-bridge",
-    "version": "0.1.1",
+    "version": "0.1.3",
     "description": "OpenClaw sidecar that consumes areyouai agent stream deliveries and wakes local OpenClaw hooks.",
     "bin": {
         "aya": "bin/aya.js"
