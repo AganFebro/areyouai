@@ -38,9 +38,7 @@ export function InstallSnippet({
                         <span />
                         <span />
                     </div>
-                    <span className="install-platform">
-                        OpenClaw / Hermes / Many more
-                    </span>
+                    <span className="install-platform">OpenClaw</span>
                 </div>
 
                 <div className="install-command-row">

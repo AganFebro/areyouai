@@ -202,6 +202,21 @@ func TestListingConnectAndSequentialMessagingFlow(t *testing.T) {
 	if !ok || len(msgs) != 2 {
 		t.Fatalf("unexpected transcript messages=%v", body["messages"])
 	}
+	if got, _ := body["room_topic"].(string); got != "go test room" {
+		t.Fatalf("room_topic=%q want=%q body=%v", got, "go test room", body)
+	}
+	if got, _ := body["agent_a_id"].(string); got == "" {
+		t.Fatalf("agent_a_id missing in transcript body=%v", body)
+	}
+	if got, _ := body["agent_b_id"].(string); got == "" {
+		t.Fatalf("agent_b_id missing in transcript body=%v", body)
+	}
+	if got, _ := body["turn_index"].(float64); got != 2 {
+		t.Fatalf("turn_index=%v want=2 body=%v", got, body)
+	}
+	if _, ok := body["next_actor_id"]; !ok {
+		t.Fatalf("next_actor_id missing in transcript body=%v", body)
+	}
 	first, ok := msgs[0].(map[string]any)
 	if !ok {
 		t.Fatalf("unexpected first message payload=%v", msgs[0])

@@ -295,6 +295,7 @@ func (a *app) handleListings(w http.ResponseWriter, r *http.Request) {
 	}
 	rm := room{
 		ID:                 roomID,
+		Topic:              strings.TrimSpace(req.Topic),
 		AgentAID:           agentID,
 		AgentBID:           "",
 		State:              domain.RoomStateOpen,
@@ -418,6 +419,7 @@ func (a *app) handleListingByID(w http.ResponseWriter, r *http.Request) {
 		now := a.now()
 		rm = room{
 			ID:                 newID("room"),
+			Topic:              strings.TrimSpace(l.Topic),
 			AgentAID:           l.AgentID,
 			AgentBID:           agentID,
 			State:              domain.RoomStateActive,
@@ -803,11 +805,16 @@ func (a *app) handleTranscript(w http.ResponseWriter, r *http.Request, roomID st
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"room_id":   roomID,
-		"state":     rm.State,
-		"messages":  rm.Messages,
-		"closed_at": rm.ClosedAt,
-		"purged_at": rm.PurgedAt,
+		"room_id":       roomID,
+		"room_topic":    strings.TrimSpace(rm.Topic),
+		"agent_a_id":    rm.AgentAID,
+		"agent_b_id":    rm.AgentBID,
+		"turn_index":    rm.TurnIndex,
+		"next_actor_id": nextActorID(rm),
+		"state":         rm.State,
+		"messages":      rm.Messages,
+		"closed_at":     rm.ClosedAt,
+		"purged_at":     rm.PurgedAt,
 	})
 }
 

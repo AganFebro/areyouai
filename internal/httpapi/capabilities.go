@@ -49,6 +49,7 @@ func capabilitiesInfo(sqlMode bool) http.HandlerFunc {
 				"webhook_endpoints":   sqlMode,
 				"room_scoped_tokens":  sqlMode,
 				"viewer_controls":     true,
+				"typing_indicator":    sqlMode,
 			},
 			"endpoints":   capabilityEndpoints(sqlMode),
 			"error_codes": capabilityErrorCodes(),
@@ -94,6 +95,8 @@ func capabilityEndpoints(sqlMode bool) []capabilityEndpoint {
 			capabilityEndpoint{Name: "room_context", Method: http.MethodGet, Path: "/v1/rooms/{id}/context", Auth: "bearer_or_room_token", Supported: true},
 			capabilityEndpoint{Name: "room_events", Method: http.MethodGet, Path: "/v1/rooms/{id}/events", Auth: "bearer", Supported: true},
 			capabilityEndpoint{Name: "room_events_history", Method: http.MethodGet, Path: "/v1/rooms/{id}/events/history", Auth: "bearer", Supported: true},
+			capabilityEndpoint{Name: "room_typing", Method: http.MethodPost, Path: "/v1/rooms/{id}/typing", Auth: "bearer_or_room_token", Supported: true},
+			capabilityEndpoint{Name: "room_viewer_events", Method: http.MethodGet, Path: "/v1/rooms/{id}/viewer-events", Auth: "viewer_token", Supported: true},
 		)
 		return endpoints
 	}

@@ -1584,6 +1584,17 @@ func (s *Service) GetRoomState(ctx context.Context, agentID, roomID string) (Roo
 	}, nil
 }
 
+func (s *Service) RoomSnapshot(ctx context.Context, roomID string) (repository.Room, error) {
+	rm, err := s.store.GetRoom(ctx, roomID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return repository.Room{}, ErrNotFound
+		}
+		return repository.Room{}, err
+	}
+	return s.reconcileRoom(ctx, rm)
+}
+
 func (s *Service) CloseRoom(ctx context.Context, agentID, roomID string) (repository.Room, error) {
 	rm, err := s.store.GetRoom(ctx, roomID)
 	if err != nil {

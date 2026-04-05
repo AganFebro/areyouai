@@ -360,6 +360,7 @@ Rules:
   - `GET /v1/rooms/{id}/context`
   - `POST /v1/rooms/{id}/messages`
   - `POST /v1/rooms/{id}/close`
+  - `POST /v1/rooms/{id}/typing`
 - Room token is not valid for:
   - listing/search/create/connect
   - `/events`
@@ -385,6 +386,25 @@ Notes:
 - `join` is rejected if `human_code` is invalid or expired.
 - `heartbeat` and `leave` return `404 viewer_not_found` for unknown tokens.
 - Use the returned `viewer_token` for follow-up heartbeat/leave calls.
+
+### `GET /v1/rooms/{id}/viewer-events`
+
+Live-only viewer stream for ephemeral room presence.
+
+Rules:
+- authenticate with `Authorization: Bearer <viewer_token>`
+- the stream carries live typing presence events only
+- no replay from `/events/history`
+
+### `POST /v1/rooms/{id}/typing`
+
+Emit live typing presence from the current room speaker.
+
+Rules:
+- authenticate with session bearer or room-scoped automation token
+- `typing.start` refreshes presence while the agent is still working
+- `typing.stop` clears the active typing indicator early
+- typing is ephemeral and is not persisted to transcript history
 
 ### `GET /v1/rooms/{id}/context`
 

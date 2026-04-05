@@ -273,6 +273,21 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	if !ok || len(msgs) != 3 {
 		t.Fatalf("unexpected transcript messages=%v", body["messages"])
 	}
+	if got, _ := body["room_topic"].(string); got != "sql mode room" {
+		t.Fatalf("room_topic=%q want=%q body=%v", got, "sql mode room", body)
+	}
+	if got, _ := body["agent_a_id"].(string); got == "" {
+		t.Fatalf("agent_a_id missing in transcript body=%v", body)
+	}
+	if got, _ := body["agent_b_id"].(string); got == "" {
+		t.Fatalf("agent_b_id missing in transcript body=%v", body)
+	}
+	if got, _ := body["turn_index"].(float64); got != 3 {
+		t.Fatalf("turn_index=%v want=3 body=%v", got, body)
+	}
+	if _, ok := body["next_actor_id"]; !ok {
+		t.Fatalf("next_actor_id missing in transcript body=%v", body)
+	}
 	first, ok := msgs[0].(map[string]any)
 	if !ok {
 		t.Fatalf("unexpected first message payload=%v", msgs[0])
@@ -1092,6 +1107,140 @@ func TestSQLModeLegacyListingConnectEmitsLifecycleEvents(t *testing.T) {
 	}
 	if outboxCount != 1 {
 		t.Fatalf("owner legacy outbox count=%d want=1", outboxCount)
+	}
+}
+
+func TestSQLModeTypingIndicatorViewerStream(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+	store := postgres.NewStore(db)
+	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	_, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "typing-a"}, "")
+	apiA := mustString(t, body, "api_key")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "typing-b"}, "")
+	apiB := mustString(t, body, "api_key")
+
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	tokenA := mustString(t, body, "session_token")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	tokenB := mustString(t, body, "session_token")
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "typing indicator",
+		"max_turns":   1,
+		"ttl_seconds": 600,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	listingID := mustString(t, body, "id")
+	humanCode := mustString(t, body, "human_code")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
+	}
+	roomID := mustString(t, body, "room_id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/viewers", map[string]any{
+		"op":         "join",
+		"human_code": humanCode,
+	}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("viewer join status=%d body=%v", resp.StatusCode, body)
+	}
+	viewerToken := mustString(t, body, "viewer_token")
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/context", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("context status=%d body=%v", resp.StatusCode, body)
+	}
+	bundleHash := mustString(t, body, "bundle_hash")
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/rooms/"+roomID+"/viewer-events", nil)
+	if err != nil {
+		t.Fatalf("new viewer stream request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+viewerToken)
+	sseResp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("open viewer stream: %v", err)
+	}
+	defer sseResp.Body.Close()
+	if sseResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(sseResp.Body)
+		t.Fatalf("viewer stream status=%d body=%s", sseResp.StatusCode, string(body))
+	}
+	if got := sseResp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Fatalf("viewer stream content-type=%q", got)
+	}
+
+	reader := bufio.NewReader(sseResp.Body)
+	eventCh, errCh := startGenericSSEStream(reader)
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/typing", map[string]any{
+		"state":  "start",
+		"ttl_ms": 2000,
+	}, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("typing start status=%d body=%v", resp.StatusCode, body)
+	}
+	startEvent := waitForGenericSSEEventType(t, eventCh, errCh, "agent.typing", 5*time.Second)
+	if got, _ := startEvent.Payload["state"].(string); got != "start" {
+		t.Fatalf("typing start state=%v payload=%v", startEvent.Payload["state"], startEvent.Payload)
+	}
+	if got, _ := startEvent.Payload["actor_id"].(string); got != mustString(t, body, "actor_id") {
+		t.Fatalf("typing start actor_id=%v payload=%v", startEvent.Payload["actor_id"], startEvent.Payload)
+	}
+	if _, ok := startEvent.Payload["expires_at"]; !ok {
+		t.Fatalf("typing start missing expires_at payload=%v", startEvent.Payload)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/typing", map[string]any{
+		"state": "start",
+	}, tokenB)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("typing wrong actor status=%d body=%v", resp.StatusCode, body)
+	}
+	if got, _ := body["error"].(string); got != "turn_mismatch" {
+		t.Fatalf("typing wrong actor error=%v body=%v", body["error"], body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 0,
+		"ciphertext":    "typing clears on message",
+		"bundle_hash":   bundleHash,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("message status=%d body=%v", resp.StatusCode, body)
+	}
+	stopEvent := waitForGenericSSEEventType(t, eventCh, errCh, "agent.typing", 5*time.Second)
+	if got, _ := stopEvent.Payload["state"].(string); got != "stop" {
+		t.Fatalf("typing stop state=%v payload=%v", stopEvent.Payload["state"], stopEvent.Payload)
+	}
+	if got, _ := stopEvent.Payload["actor_id"].(string); got != startEvent.Payload["actor_id"] {
+		t.Fatalf("typing stop actor_id=%v start=%v", stopEvent.Payload["actor_id"], startEvent.Payload["actor_id"])
 	}
 }
 

@@ -52,6 +52,9 @@ func TestCapabilitiesEndpointInMemory(t *testing.T) {
 	if got, _ := features["events_webhook"].(bool); got {
 		t.Fatalf("events_webhook=%v want=false in polling mode", got)
 	}
+	if got, _ := features["typing_indicator"].(bool); got {
+		t.Fatalf("typing_indicator=%v want=false in polling mode", got)
+	}
 	endpoints, ok := body["endpoints"].([]any)
 	if !ok {
 		t.Fatalf("endpoints payload invalid: %v", body["endpoints"])
@@ -117,5 +120,14 @@ func TestCapabilitiesEndpointSQL(t *testing.T) {
 	}
 	if !capabilityEndpointSupported(t, endpoints, "room_access_token") {
 		t.Fatal("room_access_token should be supported in SQL mode")
+	}
+	if !capabilityEndpointSupported(t, endpoints, "room_typing") {
+		t.Fatal("room_typing should be supported in SQL mode")
+	}
+	if !capabilityEndpointSupported(t, endpoints, "room_viewer_events") {
+		t.Fatal("room_viewer_events should be supported in SQL mode")
+	}
+	if got, _ := features["typing_indicator"].(bool); !got {
+		t.Fatalf("typing_indicator=%v want=true in SQL mode", got)
 	}
 }

@@ -10,6 +10,7 @@ import {
     IconRss,
 } from "@tabler/icons-react";
 import { config } from "@/lib/config";
+import { MarkdownMessage } from "@/components/markdown-message";
 
 type TranscriptMessage = {
     id: string;
@@ -25,6 +26,10 @@ export function HumanRoomTester() {
     const [humanCode, setHumanCode] = useState("");
     const [viewerToken, setViewerToken] = useState("");
     const [status, setStatus] = useState("idle");
+    const [roomTopic, setRoomTopic] = useState("");
+    const [agentAID, setAgentAID] = useState("");
+    const [agentBID, setAgentBID] = useState("");
+    const [roomTurnIndex, setRoomTurnIndex] = useState(0);
     const [messages, setMessages] = useState<TranscriptMessage[]>([]);
     const [autoRefresh, setAutoRefresh] = useState(false);
 
@@ -99,6 +104,18 @@ export function HumanRoomTester() {
                     setAutoRefresh(false);
                 }
                 return;
+            }
+            if (typeof data.room_topic === "string") {
+                setRoomTopic(data.room_topic);
+            }
+            if (typeof data.agent_a_id === "string") {
+                setAgentAID(data.agent_a_id);
+            }
+            if (typeof data.agent_b_id === "string") {
+                setAgentBID(data.agent_b_id);
+            }
+            if (typeof data.turn_index === "number") {
+                setRoomTurnIndex(data.turn_index);
             }
             const raw = Array.isArray(data.messages) ? data.messages : [];
             const normalized = raw
@@ -204,6 +221,9 @@ export function HumanRoomTester() {
                     </div>
                     <div className="transcript-meta">
                         <span className="chip">room: {roomID || "-"}</span>
+                        <span className="chip topic-chip">
+                            topic: {roomTopic || "-"}
+                        </span>
                         <span className="chip">
                             messages: {messages.length}
                         </span>
@@ -223,18 +243,55 @@ export function HumanRoomTester() {
                     )}
 
                     {messages.map((m) => (
-                        <article key={m.id} className="message-row">
-                            <div className="message-head">
-                                turn {m.turn} | sender{" "}
-                                {m.sender_name || m.sender_id}
+                        <article
+                            key={m.id}
+                            className={`message-row ${getSenderRole(
+                                m.sender_id,
+                                agentAID,
+                                agentBID,
+                            )}`}
+                        >
+                            <div className="message-head message-head-row">
+                                <span>
+                                    turn {m.turn} | {getSenderLabel(m, agentAID, agentBID)}
+                                </span>
+                                <span className={`message-status ${getMessageStatus(m.turn, roomTurnIndex)}`}>
+                                    {getMessageStatus(m.turn, roomTurnIndex).toUpperCase()}
+                                </span>
                             </div>
-                            <div className="message-body">{m.ciphertext}</div>
+                            <MarkdownMessage content={m.ciphertext} />
                         </article>
                     ))}
                 </div>
             </section>
         </section>
     );
+}
+
+function getMessageStatus(turn: number, roomTurnIndex: number): "sent" | "read" {
+    if (turn < roomTurnIndex - 1) return "read";
+    return "sent";
+}
+
+function getSenderRole(
+    senderID: string,
+    agentAID: string,
+    agentBID: string,
+): "agent-a" | "agent-b" | "unknown" {
+    if (senderID && agentAID && senderID === agentAID) return "agent-a";
+    if (senderID && agentBID && senderID === agentBID) return "agent-b";
+    return "unknown";
+}
+
+function getSenderLabel(
+    msg: TranscriptMessage,
+    agentAID: string,
+    agentBID: string,
+): string {
+    const role = getSenderRole(msg.sender_id, agentAID, agentBID);
+    if (role === "agent-a") return `agent A · ${msg.sender_name || msg.sender_id}`;
+    if (role === "agent-b") return `agent B · ${msg.sender_name || msg.sender_id}`;
+    return msg.sender_name || msg.sender_id;
 }
 
 function normalizeMessage(raw: unknown): TranscriptMessage | null {

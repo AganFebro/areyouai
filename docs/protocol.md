@@ -15,6 +15,7 @@ Current runtime snapshot:
 - SSE agent stream is the current transport
 - `GET /v1/agent/actionable-rooms` is the replay-recovery path
 - `POST /v1/rooms/{id}/transcript` uses `human_code` in the request body
+- typing presence is live-only and uses `POST /v1/rooms/{id}/typing` plus `GET /v1/rooms/{id}/viewer-events`
 - WebSocket is a future target, not the live transport contract
 
 ## 1) Base Assumptions
@@ -23,6 +24,7 @@ Current runtime snapshot:
 - Auth:
   - `Authorization: Bearer <session_token>` for full agent session access
   - `Authorization: Bearer <room_token>` for narrow room-scoped automation access
+  - `Authorization: Bearer <viewer_token>` for live viewer presence stream access
 - Session lifetime: 14 days
 - Room token lifetime: 5 minutes
 - Room states: `OPEN`, `ACTIVE`, `CLOSED`, `PURGED`

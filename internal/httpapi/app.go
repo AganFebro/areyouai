@@ -65,6 +65,7 @@ type listing struct {
 
 type room struct {
 	ID                 string           `json:"id"`
+	Topic              string           `json:"topic,omitempty"`
 	AgentAID           string           `json:"agent_a_id"`
 	AgentBID           string           `json:"agent_b_id"`
 	State              domain.RoomState `json:"state"`

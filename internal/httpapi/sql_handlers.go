@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/febrian/areyouai/internal/domain"
 	"github.com/febrian/areyouai/internal/repository"
 	"github.com/febrian/areyouai/internal/service/a2a"
 )
@@ -25,8 +26,10 @@ const (
 )
 
 type sqlHTTP struct {
-	svc *a2a.Service
-	hub *roomEventHub
+	store     repository.Store
+	svc       *a2a.Service
+	hub       *roomEventHub
+	typingHub *typingHub
 	// Optional distributed stream coordination (implemented by Postgres store).
 	streamLeaseStore repository.RoomEventStreamLeaseStore
 
@@ -40,11 +43,13 @@ type sqlHTTP struct {
 
 func newSQLHTTP(store repository.Store, opts options) *sqlHTTP {
 	hub := newRoomEventHub(64)
+	typingHub := newTypingHub(64)
 	var streamLeaseStore repository.RoomEventStreamLeaseStore
 	if leaseStore, ok := store.(repository.RoomEventStreamLeaseStore); ok {
 		streamLeaseStore = leaseStore
 	}
 	return &sqlHTTP{
+		store: store,
 		svc: a2a.New(store, a2a.Options{
 			ViewerHeartbeatTimeout: opts.ViewerHeartbeatTimeout,
 			ClosedRoomGraceDelay:   opts.ClosedRoomGraceDelay,
@@ -56,6 +61,7 @@ func newSQLHTTP(store repository.Store, opts options) *sqlHTTP {
 			RoomDEKKeyset:          opts.RoomDEKKeyset,
 		}),
 		hub:               hub,
+		typingHub:         typingHub,
 		streamLeaseStore:  streamLeaseStore,
 		ipWindows:         make(map[string][]time.Time),
 		streamCounts:      make(map[string]int),
@@ -434,8 +440,12 @@ func (s *sqlHTTP) handleRoomByID(w http.ResponseWriter, r *http.Request) {
 			s.handleRoomState(w, r, roomID)
 		case "context":
 			s.handleRoomContext(w, r, roomID)
+		case "typing":
+			s.handleRoomTyping(w, r, roomID)
 		case "events":
 			s.handleRoomEvents(w, r, roomID)
+		case "viewer-events":
+			s.handleRoomViewerEvents(w, r, roomID)
 		case "leave":
 			s.handleRoomLeave(w, r, roomID)
 		case "close":
@@ -730,6 +740,12 @@ func (s *sqlHTTP) handleRoomMessage(w http.ResponseWriter, r *http.Request, room
 		writeRoomServiceErr(w, err)
 		return
 	}
+	if s.typingHub != nil {
+		s.typingHub.Stop(roomID, agentID, time.Now().UTC())
+		if out.RoomState != domain.RoomStateActive {
+			s.typingHub.ClearRoom(roomID, time.Now().UTC())
+		}
+	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"message_id":  out.Message.ID,
 		"turn":        out.Message.Turn,
@@ -786,6 +802,9 @@ func (s *sqlHTTP) handleRoomClose(w http.ResponseWriter, r *http.Request, roomID
 		writeRoomServiceErr(w, err)
 		return
 	}
+	if s.typingHub != nil {
+		s.typingHub.ClearRoom(roomID, time.Now().UTC())
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"room_id": rm.ID,
 		"state":   rm.State,
@@ -822,11 +841,16 @@ func (s *sqlHTTP) handleTranscript(w http.ResponseWriter, r *http.Request, roomI
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"room_id":   roomID,
-		"state":     out.Room.State,
-		"messages":  out.Messages,
-		"closed_at": out.Room.ClosedAt,
-		"purged_at": out.Room.PurgedAt,
+		"room_id":       roomID,
+		"room_topic":    strings.TrimSpace(out.Room.Topic),
+		"agent_a_id":    out.Room.AgentAID,
+		"agent_b_id":    out.Room.AgentBID,
+		"turn_index":    out.Room.TurnIndex,
+		"next_actor_id": nextActorIDForTranscript(out.Room),
+		"state":         out.Room.State,
+		"messages":      out.Messages,
+		"closed_at":     out.Room.ClosedAt,
+		"purged_at":     out.Room.PurgedAt,
 	})
 }
 
@@ -1079,6 +1103,196 @@ func (s *sqlHTTP) handleRoomEventsHistory(w http.ResponseWriter, r *http.Request
 	})
 }
 
+type roomTypingRequest struct {
+	State string `json:"state"`
+	TTLMs *int   `json:"ttl_ms,omitempty"`
+}
+
+func (s *sqlHTTP) handleRoomTyping(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	agentID, err := s.authRoomAccess(r.Context(), r, roomID, "room:typing")
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	var req roomTypingRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	state := strings.TrimSpace(req.State)
+	if state != "start" && state != "stop" {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", errorOptions{
+			Hint: "state must be start or stop.",
+		})
+		return
+	}
+
+	room, err := s.svc.GetRoomState(r.Context(), agentID, roomID)
+	if err != nil {
+		writeRoomServiceErr(w, err)
+		return
+	}
+
+	now := time.Now().UTC()
+	if state == "start" {
+		if room.Room.State != domain.RoomStateActive {
+			writeAPIError(w, http.StatusConflict, "room_not_active", errorOptions{
+				Recoverable: true,
+				Hint:        "Wait until the room becomes ACTIVE before sending typing updates.",
+			})
+			return
+		}
+		if room.NextActorID != agentID {
+			writeAPIError(w, http.StatusConflict, "turn_mismatch", errorOptions{
+				Recoverable: true,
+				Hint:        "Only the current speaker may emit typing.start.",
+			})
+			return
+		}
+		ttl := defaultTypingTTL
+		if req.TTLMs != nil {
+			if *req.TTLMs <= 0 {
+				writeAPIError(w, http.StatusBadRequest, "invalid_request", errorOptions{
+					Hint: "ttl_ms must be greater than 0 when provided.",
+				})
+				return
+			}
+			ttl = time.Duration(*req.TTLMs) * time.Millisecond
+			if ttl < minTypingTTL {
+				ttl = minTypingTTL
+			}
+			if ttl > maxTypingTTL {
+				ttl = maxTypingTTL
+			}
+		}
+		event := roomTypingEvent{}
+		if s.typingHub != nil {
+			event = s.typingHub.Start(roomID, agentID, now, ttl)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"room_id":    roomID,
+			"actor_id":   agentID,
+			"state":      "start",
+			"ttl_ms":     int(ttl / time.Millisecond),
+			"expires_at": event.ExpiresAt,
+		})
+		return
+	}
+
+	var event roomTypingEvent
+	cleared := false
+	if s.typingHub != nil {
+		event, cleared = s.typingHub.Stop(roomID, agentID, now)
+	}
+	_ = event
+	writeJSON(w, http.StatusOK, map[string]any{
+		"room_id":  roomID,
+		"actor_id": agentID,
+		"state":    "stop",
+		"cleared":  cleared,
+	})
+}
+
+func (s *sqlHTTP) handleRoomViewerEvents(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	token := bearerTokenFromRequest(r)
+	if token == "" {
+		writeError(w, http.StatusUnauthorized, "missing or invalid token")
+		return
+	}
+	viewer, err := s.store.GetViewer(r.Context(), token)
+	if err != nil {
+		writeRoomOrViewerServiceErr(w, err)
+		return
+	}
+	if viewer.RoomID != roomID {
+		writeAPIError(w, http.StatusNotFound, "viewer_not_found", errorOptions{})
+		return
+	}
+	if viewer.LeftAt != nil {
+		writeAPIError(w, http.StatusGone, "gone", errorOptions{})
+		return
+	}
+	room, err := s.svc.RoomSnapshot(r.Context(), roomID)
+	if err != nil {
+		writeRoomServiceErr(w, err)
+		return
+	}
+	if room.State != domain.RoomStateActive {
+		writeAPIError(w, http.StatusGone, "gone", errorOptions{})
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "stream unsupported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.WriteString(w, "retry: 3000\n\n"); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	if s.typingHub != nil {
+		sub := s.typingHub.Subscribe(roomID)
+		defer sub.Close()
+		for _, ev := range s.typingHub.Snapshot(roomID, time.Now().UTC()) {
+			if err := writeTypingSSEEvent(w, flusher, ev); err != nil {
+				return
+			}
+		}
+
+		keepAliveTicker := time.NewTicker(20 * time.Second)
+		reauthTicker := time.NewTicker(10 * time.Second)
+		defer keepAliveTicker.Stop()
+		defer reauthTicker.Stop()
+
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case ev, ok := <-sub.Events():
+				if !ok {
+					return
+				}
+				if ev.RoomID != roomID {
+					continue
+				}
+				if err := writeTypingSSEEvent(w, flusher, ev); err != nil {
+					return
+				}
+			case <-reauthTicker.C:
+				currentViewer, authErr := s.store.GetViewer(r.Context(), token)
+				if authErr != nil || currentViewer.RoomID != roomID || currentViewer.LeftAt != nil {
+					return
+				}
+				currentRoom, roomErr := s.svc.RoomSnapshot(r.Context(), roomID)
+				if roomErr != nil || currentRoom.State != domain.RoomStateActive {
+					return
+				}
+			case <-keepAliveTicker.C:
+				if _, writeErr := io.WriteString(w, ": keepalive\n\n"); writeErr != nil {
+					return
+				}
+				flusher.Flush()
+			}
+		}
+	}
+}
+
 func parseEventStreamQuery(r *http.Request) (int64, int, error) {
 	sinceID, limit, err := parseEventHistoryQuery(r)
 	if err != nil {
@@ -1126,6 +1340,16 @@ func parseEventHistoryQuery(r *http.Request) (int64, int, error) {
 	return since, limit, nil
 }
 
+func nextActorIDForTranscript(rm repository.Room) string {
+	if rm.State != domain.RoomStateOpen && rm.State != domain.RoomStateActive {
+		return ""
+	}
+	if rm.TurnIndex%2 == 0 {
+		return rm.AgentAID
+	}
+	return rm.AgentBID
+}
+
 func roomEventPayload(item repository.RoomEvent) map[string]any {
 	payload := map[string]any{
 		"event_id":   item.ID,
@@ -1157,6 +1381,27 @@ func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, item repository.
 		return err
 	}
 	if _, err := io.WriteString(w, fmt.Sprintf("event: %s\n", item.EventType)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "data: "); err != nil {
+		return err
+	}
+	if _, err := w.Write(payload); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "\n\n"); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func writeTypingSSEEvent(w http.ResponseWriter, flusher http.Flusher, item roomTypingEvent) error {
+	payload, err := json.Marshal(item)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("event: %s\n", strings.TrimSpace(item.Type))); err != nil {
 		return err
 	}
 	if _, err := io.WriteString(w, "data: "); err != nil {
