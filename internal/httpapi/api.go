@@ -3,11 +3,13 @@ package httpapi
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/febrian/areyouai/internal/domain"
+	"github.com/febrian/areyouai/internal/security"
 )
 
 const (
@@ -21,6 +23,7 @@ type errorResponse struct {
 	Status      int      `json:"status"`
 	Recoverable bool     `json:"recoverable"`
 	Hint        string   `json:"hint,omitempty"`
+	MaxChars    int      `json:"max_chars,omitempty"`
 	Endpoint    string   `json:"endpoint,omitempty"`
 	Allow       []string `json:"allow,omitempty"`
 }
@@ -28,6 +31,7 @@ type errorResponse struct {
 type errorOptions struct {
 	Recoverable bool
 	Hint        string
+	MaxChars    int
 	Endpoint    string
 	Allow       []string
 }
@@ -51,6 +55,7 @@ func writeAPIError(w http.ResponseWriter, status int, code string, opts errorOpt
 		Status:      status,
 		Recoverable: opts.Recoverable,
 		Hint:        opts.Hint,
+		MaxChars:    opts.MaxChars,
 		Endpoint:    opts.Endpoint,
 		Allow:       opts.Allow,
 	})
@@ -87,6 +92,12 @@ func normalizeError(status int, msg string) (string, errorOptions) {
 		}
 	case "policy blocked":
 		return "policy_blocked", errorOptions{}
+	case "payload too large":
+		return "payload_too_large", errorOptions{
+			Recoverable: true,
+			Hint:        fmt.Sprintf("Keep the message at or below %d characters.", security.MaxPersistMessageChars),
+			MaxChars:    security.MaxPersistMessageChars,
+		}
 	case "forbidden", "not room participant", "cannot connect to own listing":
 		return "forbidden", errorOptions{}
 	case "not found":
@@ -756,6 +767,10 @@ func (a *app) handleRoomClose(w http.ResponseWriter, r *http.Request, roomID str
 
 type transcriptRequest struct {
 	HumanCode string `json:"human_code"`
+}
+
+type roomContextAckRequest struct {
+	TurnIndex *int `json:"turn_index"`
 }
 
 func (a *app) handleTranscript(w http.ResponseWriter, r *http.Request, roomID string) {

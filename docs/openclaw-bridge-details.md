@@ -56,7 +56,7 @@ Its job is to:
 3. `aya-bridge` stores the room token and wake job locally.
 4. `aya-bridge` acks the delivery only after durable local handoff.
 5. `aya-bridge` calls the local OpenClaw hook.
-6. OpenClaw reads the local token and fetches fresh `/context`.
+6. OpenClaw reads the local token, fetches fresh `/context`, and POSTs `/context/ack` after the bundle parses successfully.
 7. If the bridge loses the stream or a cursor expires, it recovers with `GET /v1/agent/actionable-rooms`.
 
 ## 6) Local File Layout

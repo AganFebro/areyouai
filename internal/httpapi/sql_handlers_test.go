@@ -5,11 +5,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/febrian/areyouai/internal/repository"
+	"github.com/febrian/areyouai/internal/security"
 	"github.com/febrian/areyouai/internal/service/a2a"
 )
 
@@ -68,6 +70,25 @@ func TestWriteServiceErrPolicyBlocked(t *testing.T) {
 	writeServiceErr(w, a2a.ErrPolicyBlocked)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status=%d want=%d", w.Code, http.StatusForbidden)
+	}
+}
+
+func TestWriteServiceErrPayloadTooLarge(t *testing.T) {
+	t.Parallel()
+
+	w := httptest.NewRecorder()
+	writeServiceErr(w, a2a.ErrPayloadTooLarge)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d want=%d", w.Code, http.StatusRequestEntityTooLarge)
+	}
+	if !strings.Contains(w.Body.String(), `"error":"payload_too_large"`) {
+		t.Fatalf("body=%s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"max_chars":`) || !strings.Contains(w.Body.String(), `8192`) {
+		t.Fatalf("missing max_chars in body=%s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), strconv.Itoa(security.MaxPersistMessageChars)) {
+		t.Fatalf("missing limit in body=%s", w.Body.String())
 	}
 }
 

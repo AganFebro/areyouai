@@ -16,6 +16,7 @@ import (
 
 	"github.com/febrian/areyouai/internal/domain"
 	"github.com/febrian/areyouai/internal/repository"
+	"github.com/febrian/areyouai/internal/security"
 	"github.com/febrian/areyouai/internal/service/a2a"
 )
 
@@ -26,10 +27,11 @@ const (
 )
 
 type sqlHTTP struct {
-	store     repository.Store
-	svc       *a2a.Service
-	hub       *roomEventHub
-	typingHub *typingHub
+	store                  repository.Store
+	svc                    *a2a.Service
+	hub                    *roomEventHub
+	typingHub              *typingHub
+	viewerHeartbeatTimeout time.Duration
 	// Optional distributed stream coordination (implemented by Postgres store).
 	streamLeaseStore repository.RoomEventStreamLeaseStore
 
@@ -44,6 +46,10 @@ type sqlHTTP struct {
 func newSQLHTTP(store repository.Store, opts options) *sqlHTTP {
 	hub := newRoomEventHub(64)
 	typingHub := newTypingHub(64)
+	viewerHeartbeatTimeout := opts.ViewerHeartbeatTimeout
+	if viewerHeartbeatTimeout <= 0 {
+		viewerHeartbeatTimeout = 45 * time.Second
+	}
 	var streamLeaseStore repository.RoomEventStreamLeaseStore
 	if leaseStore, ok := store.(repository.RoomEventStreamLeaseStore); ok {
 		streamLeaseStore = leaseStore
@@ -60,14 +66,15 @@ func newSQLHTTP(store repository.Store, opts options) *sqlHTTP {
 			RoomDEKKey:             opts.RoomDEKKey,
 			RoomDEKKeyset:          opts.RoomDEKKeyset,
 		}),
-		hub:               hub,
-		typingHub:         typingHub,
-		streamLeaseStore:  streamLeaseStore,
-		ipWindows:         make(map[string][]time.Time),
-		streamCounts:      make(map[string]int),
-		streamOpenWindows: make(map[string][]time.Time),
-		streamIPWindows:   make(map[string][]time.Time),
-		adminToken:        strings.TrimSpace(opts.AdminToken),
+		hub:                    hub,
+		typingHub:              typingHub,
+		viewerHeartbeatTimeout: viewerHeartbeatTimeout,
+		streamLeaseStore:       streamLeaseStore,
+		ipWindows:              make(map[string][]time.Time),
+		streamCounts:           make(map[string]int),
+		streamOpenWindows:      make(map[string][]time.Time),
+		streamIPWindows:        make(map[string][]time.Time),
+		adminToken:             strings.TrimSpace(opts.AdminToken),
 	}
 }
 
@@ -459,6 +466,10 @@ func (s *sqlHTTP) handleRoomByID(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if len(parts) == 5 && parts[3] == "context" && parts[4] == "ack" {
+		s.handleRoomContextAck(w, r, roomID)
+		return
+	}
 	if len(parts) == 5 && parts[3] == "events" && parts[4] == "history" {
 		s.handleRoomEventsHistory(w, r, roomID)
 		return
@@ -636,20 +647,49 @@ func (s *sqlHTTP) handleRoomContext(w http.ResponseWriter, r *http.Request, room
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"room_id":            roomID,
-		"bundle_hash":        out.BundleHash,
-		"system_core_hash":   out.SystemCoreHash,
-		"global_rules_hash":  out.GlobalRulesHash,
-		"agent_rules_hash":   out.AgentRulesHash,
-		"identity_hash":      out.IdentityHash,
-		"soul_hash":          out.SoulHash,
-		"user_hash":          out.UserHash,
-		"next_turn":          out.NextTurn,
-		"next_actor_id":      out.NextActorID,
-		"mode":               "sse",
-		"poll_interval_ms":   5000,
-		"ordered_stack":      out.OrderedStack,
-		"prompt_bundle_text": out.Prompt,
+		"room_id":              roomID,
+		"bundle_hash":          out.BundleHash,
+		"system_core_hash":     out.SystemCoreHash,
+		"global_rules_hash":    out.GlobalRulesHash,
+		"agent_rules_hash":     out.AgentRulesHash,
+		"identity_hash":        out.IdentityHash,
+		"soul_hash":            out.SoulHash,
+		"user_hash":            out.UserHash,
+		"turn_index":           out.NextTurn,
+		"next_turn":            out.NextTurn,
+		"next_actor_id":        out.NextActorID,
+		"context_ack_required": true,
+		"context_ack_path":     "/v1/rooms/{id}/context/ack",
+		"mode":                 "sse",
+		"poll_interval_ms":     5000,
+		"ordered_stack":        out.OrderedStack,
+		"prompt_bundle_text":   out.Prompt,
+	})
+}
+
+func (s *sqlHTTP) handleRoomContextAck(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	agentID, err := s.authRoomAccess(r.Context(), r, roomID, "room:context")
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	var req roomContextAckRequest
+	if err := decodeJSON(w, r, &req); err != nil || req.TurnIndex == nil || *req.TurnIndex < 0 {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if err := s.svc.RecordRoomContextFetch(r.Context(), agentID, roomID, *req.TurnIndex); err != nil {
+		writeRoomServiceErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"room_id":    roomID,
+		"agent_id":   agentID,
+		"turn_index": *req.TurnIndex,
 	})
 }
 
@@ -840,17 +880,43 @@ func (s *sqlHTTP) handleTranscript(w http.ResponseWriter, r *http.Request, roomI
 		writeRoomServiceErr(w, err)
 		return
 	}
+	messages := make([]map[string]any, 0, len(out.Messages))
+	for _, msg := range out.Messages {
+		readByOpponent := false
+		opponentID := ""
+		switch msg.SenderID {
+		case out.Room.AgentAID:
+			opponentID = out.Room.AgentBID
+		case out.Room.AgentBID:
+			opponentID = out.Room.AgentAID
+		}
+		if opponentID != "" {
+			if fetchTurn, ok := out.LastContextFetchByAgent[opponentID]; ok && msg.Turn < fetchTurn {
+				readByOpponent = true
+			}
+		}
+		messages = append(messages, map[string]any{
+			"id":               msg.ID,
+			"sender_id":        msg.SenderID,
+			"sender_name":      msg.SenderName,
+			"turn":             msg.Turn,
+			"ciphertext":       msg.Ciphertext,
+			"created_at":       msg.CreatedAt,
+			"read_by_opponent": readByOpponent,
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"room_id":       roomID,
-		"room_topic":    strings.TrimSpace(out.Room.Topic),
-		"agent_a_id":    out.Room.AgentAID,
-		"agent_b_id":    out.Room.AgentBID,
-		"turn_index":    out.Room.TurnIndex,
-		"next_actor_id": nextActorIDForTranscript(out.Room),
-		"state":         out.Room.State,
-		"messages":      out.Messages,
-		"closed_at":     out.Room.ClosedAt,
-		"purged_at":     out.Room.PurgedAt,
+		"room_id":                          roomID,
+		"room_topic":                       strings.TrimSpace(out.Room.Topic),
+		"agent_a_id":                       out.Room.AgentAID,
+		"agent_b_id":                       out.Room.AgentBID,
+		"turn_index":                       out.Room.TurnIndex,
+		"next_actor_id":                    nextActorIDForTranscript(out.Room),
+		"state":                            out.Room.State,
+		"messages":                         messages,
+		"closed_at":                        out.Room.ClosedAt,
+		"purged_at":                        out.Room.PurgedAt,
+		"last_context_fetch_turn_by_agent": out.LastContextFetchByAgent,
 	})
 }
 
@@ -1220,6 +1286,10 @@ func (s *sqlHTTP) handleRoomViewerEvents(w http.ResponseWriter, r *http.Request,
 		writeAPIError(w, http.StatusGone, "gone", errorOptions{})
 		return
 	}
+	if viewerHeartbeatExpired(viewer.LastHeartbeatAt, time.Now().UTC(), s.viewerHeartbeatTimeout) {
+		writeAPIError(w, http.StatusNotFound, "viewer_not_found", errorOptions{})
+		return
+	}
 	room, err := s.svc.RoomSnapshot(r.Context(), roomID)
 	if err != nil {
 		writeRoomServiceErr(w, err)
@@ -1247,16 +1317,16 @@ func (s *sqlHTTP) handleRoomViewerEvents(w http.ResponseWriter, r *http.Request,
 	flusher.Flush()
 
 	if s.typingHub != nil {
-		sub := s.typingHub.Subscribe(roomID)
+		sub, snapshot := s.typingHub.SubscribeWithSnapshot(roomID, time.Now().UTC())
 		defer sub.Close()
-		for _, ev := range s.typingHub.Snapshot(roomID, time.Now().UTC()) {
+		for _, ev := range snapshot {
 			if err := writeTypingSSEEvent(w, flusher, ev); err != nil {
 				return
 			}
 		}
 
 		keepAliveTicker := time.NewTicker(20 * time.Second)
-		reauthTicker := time.NewTicker(10 * time.Second)
+		reauthTicker := time.NewTicker(viewerStreamReauthInterval(s.viewerHeartbeatTimeout))
 		defer keepAliveTicker.Stop()
 		defer reauthTicker.Stop()
 
@@ -1275,8 +1345,9 @@ func (s *sqlHTTP) handleRoomViewerEvents(w http.ResponseWriter, r *http.Request,
 					return
 				}
 			case <-reauthTicker.C:
+				now := time.Now().UTC()
 				currentViewer, authErr := s.store.GetViewer(r.Context(), token)
-				if authErr != nil || currentViewer.RoomID != roomID || currentViewer.LeftAt != nil {
+				if authErr != nil || currentViewer.RoomID != roomID || currentViewer.LeftAt != nil || viewerHeartbeatExpired(currentViewer.LastHeartbeatAt, now, s.viewerHeartbeatTimeout) {
 					return
 				}
 				currentRoom, roomErr := s.svc.RoomSnapshot(r.Context(), roomID)
@@ -1417,6 +1488,30 @@ func writeTypingSSEEvent(w http.ResponseWriter, flusher http.Flusher, item roomT
 	return nil
 }
 
+func viewerHeartbeatExpired(lastHeartbeatAt, now time.Time, timeout time.Duration) bool {
+	if lastHeartbeatAt.IsZero() {
+		return true
+	}
+	if timeout <= 0 {
+		timeout = 45 * time.Second
+	}
+	return now.Sub(lastHeartbeatAt) > timeout
+}
+
+func viewerStreamReauthInterval(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		timeout = 45 * time.Second
+	}
+	interval := timeout / 2
+	if interval < 500*time.Millisecond {
+		return 500 * time.Millisecond
+	}
+	if interval > 10*time.Second {
+		return 10 * time.Second
+	}
+	return interval
+}
+
 func writeAgentStreamControlEvent(w http.ResponseWriter, flusher http.Flusher, eventType string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -1524,6 +1619,12 @@ func writeServiceErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusUnauthorized, "missing or invalid token")
 	case errors.Is(err, a2a.ErrPolicyBlocked):
 		writeError(w, http.StatusForbidden, "policy blocked")
+	case errors.Is(err, a2a.ErrPayloadTooLarge):
+		writeAPIError(w, http.StatusRequestEntityTooLarge, "payload_too_large", errorOptions{
+			Recoverable: true,
+			Hint:        fmt.Sprintf("Keep the message at or below %d characters.", security.MaxPersistMessageChars),
+			MaxChars:    security.MaxPersistMessageChars,
+		})
 	case errors.Is(err, a2a.ErrForbidden):
 		writeError(w, http.StatusForbidden, "forbidden")
 	case errors.Is(err, a2a.ErrNotFound):

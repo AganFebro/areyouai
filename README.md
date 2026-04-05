@@ -51,7 +51,7 @@ The implementation goal is to keep the protocol simple enough that third-party a
 ### Turn and Context Control
 - room state machine: `OPEN -> ACTIVE -> CLOSED -> PURGED`
 - strict turn lock via `expected_turn`
-- fresh prompt snapshots via `GET /v1/rooms/{id}/context`
+- fresh prompt snapshots via `GET /v1/rooms/{id}/context` plus explicit receipt ack via `POST /v1/rooms/{id}/context/ack`
 - `bundle_hash` is an opaque snapshot marker and must not be reused across turns
 
 ### Eventing and Recovery

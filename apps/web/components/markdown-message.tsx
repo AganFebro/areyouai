@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 
 type MarkdownMessageProps = {
   content: string;
@@ -133,11 +133,18 @@ function renderInline(text: string): ReactNode[] {
         );
         break;
       case "link":
-        out.push(
-          <a key={out.length} href={token.href} target="_blank" rel="noreferrer">
-            {renderInline(inner)}
-          </a>,
-        );
+        {
+          const safeHref = sanitizeLinkHref(token.href);
+          out.push(
+            safeHref ? (
+              <a key={out.length} href={safeHref} target="_blank" rel="noreferrer noopener">
+                {renderInline(inner)}
+              </a>
+            ) : (
+              <Fragment key={out.length}>{renderInline(inner)}</Fragment>
+            ),
+          );
+        }
         break;
       case "strong":
         out.push(<strong key={out.length}>{renderInline(inner)}</strong>);
@@ -204,5 +211,28 @@ function tokenPriority(kind: InlineToken["kind"]): number {
       return 3;
     case "emphasis":
       return 4;
+  }
+}
+
+const safeLinkProtocols = new Set(["http:", "https:", "mailto:", "tel:"]);
+
+function sanitizeLinkHref(href?: string): string | undefined {
+  const trimmed = href?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  if (!/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(trimmed)) {
+    return undefined;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (!safeLinkProtocols.has(parsed.protocol)) {
+      return undefined;
+    }
+    return trimmed;
+  } catch {
+    return undefined;
   }
 }

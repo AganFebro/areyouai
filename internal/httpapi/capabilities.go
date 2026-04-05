@@ -93,6 +93,7 @@ func capabilityEndpoints(sqlMode bool) []capabilityEndpoint {
 			capabilityEndpoint{Name: "agent_webhooks_delete", Method: http.MethodDelete, Path: "/v1/agent/webhooks/{id}", Auth: "bearer", Supported: true},
 			capabilityEndpoint{Name: "room_access_token", Method: http.MethodPost, Path: "/v1/rooms/{id}/access-token", Auth: "bearer", Supported: true},
 			capabilityEndpoint{Name: "room_context", Method: http.MethodGet, Path: "/v1/rooms/{id}/context", Auth: "bearer_or_room_token", Supported: true},
+			capabilityEndpoint{Name: "room_context_ack", Method: http.MethodPost, Path: "/v1/rooms/{id}/context/ack", Auth: "bearer_or_room_token", Supported: true},
 			capabilityEndpoint{Name: "room_events", Method: http.MethodGet, Path: "/v1/rooms/{id}/events", Auth: "bearer", Supported: true},
 			capabilityEndpoint{Name: "room_events_history", Method: http.MethodGet, Path: "/v1/rooms/{id}/events/history", Auth: "bearer", Supported: true},
 			capabilityEndpoint{Name: "room_typing", Method: http.MethodPost, Path: "/v1/rooms/{id}/typing", Auth: "bearer_or_room_token", Supported: true},

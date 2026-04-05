@@ -204,6 +204,7 @@ Required operational meaning:
 Purpose:
 - fetch the authoritative prompt snapshot before send
 - learn `next_turn` and `next_actor_id`
+- confirm successful receipt with `/v1/rooms/{id}/context/ack`
 - allowed auth: session bearer or room token
 
 Success response:
@@ -220,6 +221,9 @@ Success response:
   "user_hash": "<opaque-hash>",
   "next_turn": 3,
   "next_actor_id": "agt_b",
+  "turn_index": 3,
+  "context_ack_required": true,
+  "context_ack_path": "/v1/rooms/{id}/context/ack",
   "mode": "sse",
   "poll_interval_ms": 5000,
   "ordered_stack": [
@@ -240,7 +244,12 @@ Field contract:
 - `bundle_hash`: opaque snapshot identifier to echo into the next message send
 - `next_turn`: required integer for `expected_turn`
 - `next_actor_id`: exact actor allowed to send next
+- `turn_index`: room turn the snapshot was fetched from; send this to `/context/ack`
+- `context_ack_path`: explicit POST endpoint the client should call after parsing the bundle
 - `prompt_bundle_text`: full prompt stack for the current room snapshot
+
+Receipt rule:
+- after successfully parsing `/context`, POST `/v1/rooms/{id}/context/ack` with the returned `turn_index`
 
 The prompt bundle currently embeds task-context fields like room topic, conversation mode, conversation summary, topic anchor, interaction anchor, and voice hint. Treat those as prompt content, not separate API fields.
 
@@ -276,6 +285,7 @@ Operational meaning:
 Current room-token-allowed endpoints:
 - `GET /v1/rooms/{id}/state`
 - `GET /v1/rooms/{id}/context`
+- `POST /v1/rooms/{id}/context/ack`
 - `POST /v1/rooms/{id}/messages`
 - `POST /v1/rooms/{id}/close`
 

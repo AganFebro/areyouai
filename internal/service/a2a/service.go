@@ -31,6 +31,7 @@ const (
 	maxPolicyViolationsWindow = 3
 	maxRecentMemoryEntries    = 6
 	maxRoomEventHistoryLimit  = 200
+	maxRoomContextUpdateTries = 5
 	sessionTTL                = 14 * 24 * time.Hour
 	roomScopedTokenTTL        = 5 * time.Minute
 	agentStreamReplayWindow   = 30 * time.Minute
@@ -51,6 +52,7 @@ var (
 	ErrGone            = errors.New("gone")
 	ErrRateLimit       = errors.New("rate limit")
 	ErrPolicyBlocked   = errors.New("policy blocked")
+	ErrPayloadTooLarge = errors.New("payload too large")
 )
 
 type Service struct {
@@ -877,19 +879,20 @@ type PromptBundleResult struct {
 }
 
 type roomContextPayload struct {
-	RoomID              string              `json:"room_id"`
-	Topic               string              `json:"topic,omitempty"`
-	ConversationMode    string              `json:"conversation_mode,omitempty"`
-	ConversationSummary string              `json:"conversation_summary,omitempty"`
-	AgentAID            string              `json:"agent_a_id"`
-	AgentBID            string              `json:"agent_b_id"`
-	LastActorID         string              `json:"last_actor_id,omitempty"`
-	State               string              `json:"state"`
-	TurnIndex           int                 `json:"turn_index"`
-	MaxTurns            int                 `json:"max_turns"`
-	TTLAt               string              `json:"ttl_at"`
-	ClosedAt            *string             `json:"closed_at,omitempty"`
-	RecentMemory        []recentMemoryEntry `json:"recent_memory"`
+	RoomID                      string              `json:"room_id"`
+	Topic                       string              `json:"topic,omitempty"`
+	ConversationMode            string              `json:"conversation_mode,omitempty"`
+	ConversationSummary         string              `json:"conversation_summary,omitempty"`
+	AgentAID                    string              `json:"agent_a_id"`
+	AgentBID                    string              `json:"agent_b_id"`
+	LastActorID                 string              `json:"last_actor_id,omitempty"`
+	LastContextFetchTurnByAgent map[string]int      `json:"last_context_fetch_turn_by_agent,omitempty"`
+	State                       string              `json:"state"`
+	TurnIndex                   int                 `json:"turn_index"`
+	MaxTurns                    int                 `json:"max_turns"`
+	TTLAt                       string              `json:"ttl_at"`
+	ClosedAt                    *string             `json:"closed_at,omitempty"`
+	RecentMemory                []recentMemoryEntry `json:"recent_memory"`
 }
 
 type recentMemoryEntry struct {
@@ -976,6 +979,18 @@ func (s *Service) SendMessage(ctx context.Context, agentID, roomID string, expec
 	}
 
 	decision := security.EvaluateMessageForPersist(ciphertext)
+	if !decision.Allowed && decision.Code == "payload_too_large" {
+		s.appendAuditEventBestEffort(ctx, roomID, "message_policy_blocked", map[string]any{
+			"room_id":     roomID,
+			"agent_id":    agentID,
+			"code":        decision.Code,
+			"reason":      decision.Reason,
+			"max_chars":   security.MaxPersistMessageChars,
+			"turn_index":  rm.TurnIndex,
+			"bundle_hash": providedBundleHash,
+		}, 0)
+		return SendMessageResult{}, ErrPayloadTooLarge
+	}
 
 	bundle, recentCount, err := s.buildBundleForRoom(ctx, rm, agentID)
 	if err != nil {
@@ -1693,8 +1708,9 @@ func (s *Service) CloseRoom(ctx context.Context, agentID, roomID string) (reposi
 }
 
 type TranscriptResult struct {
-	Room     repository.Room
-	Messages []repository.Message
+	Room                    repository.Room
+	Messages                []repository.Message
+	LastContextFetchByAgent map[string]int
 }
 
 func (s *Service) Transcript(ctx context.Context, roomID, humanCode string) (TranscriptResult, error) {
@@ -1732,7 +1748,32 @@ func (s *Service) Transcript(ctx context.Context, roomID, humanCode string) (Tra
 	if err != nil {
 		return TranscriptResult{}, err
 	}
-	return TranscriptResult{Room: rm, Messages: msgs}, nil
+	result := TranscriptResult{Room: rm, Messages: msgs}
+	if contextState, err := s.store.GetRoomContext(ctx, roomID); err == nil {
+		var persisted roomContextPayload
+		if unmarshalErr := json.Unmarshal(contextState.Context, &persisted); unmarshalErr == nil {
+			result.LastContextFetchByAgent = cloneIntMap(persisted.LastContextFetchTurnByAgent)
+		}
+	}
+	return result, nil
+}
+
+func (s *Service) RecordRoomContextFetch(ctx context.Context, agentID, roomID string, turnIndex int) error {
+	if turnIndex < 0 {
+		return ErrBadRequest
+	}
+	return s.updateRoomContext(ctx, roomID, "", func(rm repository.Room, payload roomContextPayload) (roomContextPayload, error) {
+		if rm.AgentAID != agentID && rm.AgentBID != agentID {
+			return roomContextPayload{}, ErrForbidden
+		}
+		if payload.LastContextFetchTurnByAgent == nil {
+			payload.LastContextFetchTurnByAgent = make(map[string]int)
+		}
+		if current, ok := payload.LastContextFetchTurnByAgent[agentID]; !ok || turnIndex > current {
+			payload.LastContextFetchTurnByAgent[agentID] = turnIndex
+		}
+		return payload, nil
+	})
 }
 
 type ViewerResult struct {
@@ -2218,21 +2259,111 @@ func normalizeWebhookEndpointURL(raw string) (string, error) {
 
 func (s *Service) roomContextFromRoom(rm repository.Room, lastActorID string) roomContextPayload {
 	out := roomContextPayload{
-		RoomID:           rm.ID,
-		Topic:            strings.TrimSpace(rm.Topic),
-		ConversationMode: inferConversationMode(rm.Topic),
-		AgentAID:         rm.AgentAID,
-		AgentBID:         rm.AgentBID,
-		LastActorID:      strings.TrimSpace(lastActorID),
-		State:            string(rm.State),
-		TurnIndex:        rm.TurnIndex,
-		MaxTurns:         rm.MaxTurns,
-		TTLAt:            rm.TTLAt.Format(time.RFC3339),
-		RecentMemory:     []recentMemoryEntry{},
+		RoomID:                      rm.ID,
+		Topic:                       strings.TrimSpace(rm.Topic),
+		ConversationMode:            inferConversationMode(rm.Topic),
+		AgentAID:                    rm.AgentAID,
+		AgentBID:                    rm.AgentBID,
+		LastActorID:                 strings.TrimSpace(lastActorID),
+		LastContextFetchTurnByAgent: make(map[string]int),
+		State:                       string(rm.State),
+		TurnIndex:                   rm.TurnIndex,
+		MaxTurns:                    rm.MaxTurns,
+		TTLAt:                       rm.TTLAt.Format(time.RFC3339),
+		RecentMemory:                []recentMemoryEntry{},
 	}
 	if rm.ClosedAt != nil {
 		closed := rm.ClosedAt.Format(time.RFC3339)
 		out.ClosedAt = &closed
+	}
+	return out
+}
+
+func (s *Service) roomContextPayloadForUpdate(ctx context.Context, rm repository.Room, lastActorID string) (roomContextPayload, int, error) {
+	payload := s.roomContextFromRoom(rm, lastActorID)
+	version := 1
+	current, err := s.store.GetRoomContext(ctx, rm.ID)
+	if err == nil {
+		version = current.Version + 1
+		var persisted roomContextPayload
+		if unmarshalErr := json.Unmarshal(current.Context, &persisted); unmarshalErr == nil {
+			if strings.TrimSpace(lastActorID) == "" && (persisted.LastActorID == rm.AgentAID || persisted.LastActorID == rm.AgentBID) {
+				payload.LastActorID = persisted.LastActorID
+			}
+			payload.LastContextFetchTurnByAgent = cloneIntMap(persisted.LastContextFetchTurnByAgent)
+		}
+	} else if !errors.Is(err, repository.ErrNotFound) {
+		return roomContextPayload{}, 0, err
+	}
+	if payload.LastContextFetchTurnByAgent == nil {
+		payload.LastContextFetchTurnByAgent = make(map[string]int)
+	}
+	return payload, version, nil
+}
+
+func (s *Service) loadRoomForContextUpdate(ctx context.Context, roomID string) (repository.Room, error) {
+	rm, err := s.store.GetRoom(ctx, roomID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return repository.Room{}, ErrNotFound
+		}
+		return repository.Room{}, err
+	}
+	rm, err = s.reconcileRoom(ctx, rm)
+	if err != nil {
+		return repository.Room{}, err
+	}
+	return rm, nil
+}
+
+func (s *Service) updateRoomContext(
+	ctx context.Context,
+	roomID string,
+	lastActorID string,
+	mutate func(repository.Room, roomContextPayload) (roomContextPayload, error),
+) error {
+	var lastErr error
+	for attempt := 0; attempt < maxRoomContextUpdateTries; attempt++ {
+		rm, err := s.loadRoomForContextUpdate(ctx, roomID)
+		if err != nil {
+			return err
+		}
+		payload, version, err := s.roomContextPayloadForUpdate(ctx, rm, lastActorID)
+		if err != nil {
+			return err
+		}
+		payload, err = mutate(rm, payload)
+		if err != nil {
+			return err
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal room context: %w", err)
+		}
+		_, err = s.store.UpsertRoomContext(ctx, repository.UpsertRoomContextInput{
+			RoomID:  rm.ID,
+			Context: raw,
+			Version: version,
+		})
+		if errors.Is(err, repository.ErrConflict) {
+			lastErr = err
+			continue
+		}
+		return err
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return repository.ErrConflict
+}
+
+func cloneIntMap(src map[string]int) map[string]int {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(src))
+	for key, value := range src {
+		out[key] = value
 	}
 	return out
 }
@@ -2362,36 +2493,19 @@ func buildConversationSummary(topic, mode string, recent []repository.Message) s
 }
 
 func (s *Service) upsertRoomContext(ctx context.Context, rm repository.Room, lastActorID string) error {
-	payload := s.roomContextFromRoom(rm, lastActorID)
-	recent, err := s.store.ListRoomMessages(ctx, rm.ID)
-	if err != nil {
-		return err
-	}
-	recent, err = s.decryptRoomMessages(rm, recent)
-	if err != nil {
-		return err
-	}
-	payload.ConversationSummary = buildConversationSummary(payload.Topic, payload.ConversationMode, recent)
-	payload.RecentMemory = selectRecentMemory(recent)
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal room context: %w", err)
-	}
-
-	version := 1
-	current, err := s.store.GetRoomContext(ctx, rm.ID)
-	if err == nil {
-		version = current.Version + 1
-	} else if !errors.Is(err, repository.ErrNotFound) {
-		return err
-	}
-
-	_, err = s.store.UpsertRoomContext(ctx, repository.UpsertRoomContextInput{
-		RoomID:  rm.ID,
-		Context: raw,
-		Version: version,
+	return s.updateRoomContext(ctx, rm.ID, lastActorID, func(current repository.Room, payload roomContextPayload) (roomContextPayload, error) {
+		recent, err := s.store.ListRoomMessages(ctx, current.ID)
+		if err != nil {
+			return roomContextPayload{}, err
+		}
+		recent, err = s.decryptRoomMessages(current, recent)
+		if err != nil {
+			return roomContextPayload{}, err
+		}
+		payload.ConversationSummary = buildConversationSummary(payload.Topic, payload.ConversationMode, recent)
+		payload.RecentMemory = selectRecentMemory(recent)
+		return payload, nil
 	})
-	return err
 }
 
 func (s *Service) syncRoomContextBestEffort(ctx context.Context, rm repository.Room, source string, recentCount int) {

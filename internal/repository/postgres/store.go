@@ -414,8 +414,13 @@ ON CONFLICT (room_id) DO UPDATE
 SET context = EXCLUDED.context,
     version = EXCLUDED.version,
     updated_at = NOW()
+WHERE room_context_state.version = EXCLUDED.version - 1
 RETURNING room_id, context, version, updated_at, created_at`
-	return scanRoomContext(s.db.QueryRowContext(ctx, q, in.RoomID, in.Context, in.Version))
+	out, err := scanRoomContext(s.db.QueryRowContext(ctx, q, in.RoomID, in.Context, in.Version))
+	if errors.Is(err, repository.ErrNotFound) {
+		return repository.RoomContextState{}, repository.ErrConflict
+	}
+	return out, err
 }
 
 func (s *Store) UpsertViewer(ctx context.Context, in repository.UpsertViewerInput) (repository.Viewer, error) {

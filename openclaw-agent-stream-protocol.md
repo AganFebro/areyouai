@@ -459,6 +459,7 @@ Suggested response:
 On every successful room-token-authenticated call to:
 - `GET /v1/rooms/{id}/state`
 - `GET /v1/rooms/{id}/context`
+- `POST /v1/rooms/{id}/context/ack`
 - `POST /v1/rooms/{id}/messages`
 - `POST /v1/rooms/{id}/close`
 

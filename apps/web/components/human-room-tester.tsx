@@ -1,7 +1,6 @@
 "use client";
 
-import { useState } from "react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
     IconHeartbeat,
     IconLogin2,
@@ -9,8 +8,8 @@ import {
     IconReload,
     IconRss,
 } from "@tabler/icons-react";
-import { config } from "@/lib/config";
 import { MarkdownMessage } from "@/components/markdown-message";
+import { config } from "@/lib/config";
 
 type TranscriptMessage = {
     id: string;
@@ -19,18 +18,39 @@ type TranscriptMessage = {
     turn: number;
     ciphertext: string;
     created_at: string;
+    read_by_opponent?: boolean;
 };
+
+type ViewerTypingEvent = {
+    type: string;
+    room_id: string;
+    actor_id: string;
+    state: "start" | "stop";
+    ttl_ms?: number;
+    created_at: string;
+    expires_at: string;
+};
+
+type TypingPresence = {
+    actorID: string;
+    expiresAt: number;
+};
+
+const viewerEventsReconnectDelayMS = 1000;
 
 export function HumanRoomTester() {
     const [roomID, setRoomID] = useState("");
     const [humanCode, setHumanCode] = useState("");
     const [viewerToken, setViewerToken] = useState("");
     const [status, setStatus] = useState("idle");
+    const [viewerStreamStatus, setViewerStreamStatus] = useState("idle");
     const [roomTopic, setRoomTopic] = useState("");
     const [agentAID, setAgentAID] = useState("");
     const [agentBID, setAgentBID] = useState("");
-    const [roomTurnIndex, setRoomTurnIndex] = useState(0);
     const [messages, setMessages] = useState<TranscriptMessage[]>([]);
+    const [typingByActor, setTypingByActor] = useState<
+        Record<string, TypingPresence>
+    >({});
     const [autoRefresh, setAutoRefresh] = useState(false);
 
     const postViewer = async (op: "join" | "heartbeat" | "leave") => {
@@ -49,33 +69,38 @@ export function HumanRoomTester() {
 
         setStatus(`${op}...`);
         try {
-            const res = await fetch(
-                `${config.apiBaseUrl}/v1/rooms/${roomID}/viewers`,
-                {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        op,
-                        human_code: humanCode,
-                        viewer_token: viewerToken,
-                    }),
-                },
-            );
-            const data = await res.json();
+            const res = await fetch(`${config.apiBaseUrl}/v1/rooms/${roomID}/viewers`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    op,
+                    human_code: humanCode,
+                    viewer_token: viewerToken,
+                }),
+            });
+            const data = await parseJSONResponse(res);
             if (!res.ok) {
-                setStatus(`${op} failed: ${data.error ?? res.status}`);
+                setStatus(`${op} failed: ${data?.error ?? res.status}`);
+                if (res.status === 404 || res.status === 410) {
+                    setAutoRefresh(false);
+                    setTypingByActor({});
+                    setViewerStreamStatus("idle");
+                }
                 return;
             }
-            if (op === "join" && data.viewer_token) {
-                setViewerToken(String(data.viewer_token));
+            if (op === "join" && typeof data?.viewer_token === "string") {
+                setViewerToken(data.viewer_token);
             }
             setStatus(`${op} ok`);
             if (op === "join") {
+                setTypingByActor({});
                 setAutoRefresh(true);
                 await loadTranscriptInternal(true);
             }
             if (op === "leave") {
                 setAutoRefresh(false);
+                setTypingByActor({});
+                setViewerStreamStatus("idle");
             }
         } catch {
             setStatus(`${op} failed: network error`);
@@ -88,36 +113,32 @@ export function HumanRoomTester() {
             return;
         }
         try {
-            const res = await fetch(
-                `${config.apiBaseUrl}/v1/rooms/${roomID}/transcript`,
-                {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ human_code: humanCode }),
-                    cache: "no-store",
-                },
-            );
-            const data = await res.json();
+            const res = await fetch(`${config.apiBaseUrl}/v1/rooms/${roomID}/transcript`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ human_code: humanCode }),
+                cache: "no-store",
+            });
+            const data = await parseJSONResponse(res);
             if (!res.ok) {
-                setStatus(`transcript failed: ${data.error ?? res.status}`);
+                setStatus(`transcript failed: ${data?.error ?? res.status}`);
                 if (res.status === 410) {
                     setAutoRefresh(false);
+                    setTypingByActor({});
+                    setViewerStreamStatus("idle");
                 }
                 return;
             }
-            if (typeof data.room_topic === "string") {
+            if (typeof data?.room_topic === "string") {
                 setRoomTopic(data.room_topic);
             }
-            if (typeof data.agent_a_id === "string") {
+            if (typeof data?.agent_a_id === "string") {
                 setAgentAID(data.agent_a_id);
             }
-            if (typeof data.agent_b_id === "string") {
+            if (typeof data?.agent_b_id === "string") {
                 setAgentBID(data.agent_b_id);
             }
-            if (typeof data.turn_index === "number") {
-                setRoomTurnIndex(data.turn_index);
-            }
-            const raw = Array.isArray(data.messages) ? data.messages : [];
+            const raw = Array.isArray(data?.messages) ? data.messages : [];
             const normalized = raw
                 .map(normalizeMessage)
                 .filter(Boolean) as TranscriptMessage[];
@@ -134,7 +155,9 @@ export function HumanRoomTester() {
     };
 
     useEffect(() => {
-        if (!autoRefresh || !viewerToken.trim()) return;
+        if (!autoRefresh || !viewerToken.trim()) {
+            return;
+        }
         const id = setInterval(() => {
             void postViewer("heartbeat");
             void loadTranscriptInternal(true);
@@ -142,6 +165,93 @@ export function HumanRoomTester() {
         return () => clearInterval(id);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [autoRefresh, viewerToken, roomID, humanCode]);
+
+    useEffect(() => {
+        if (!autoRefresh || !roomID.trim() || !viewerToken.trim()) {
+            setTypingByActor({});
+            setViewerStreamStatus("idle");
+            return;
+        }
+
+        const controller = new AbortController();
+
+        const connect = async () => {
+            while (!controller.signal.aborted) {
+                try {
+                    const res = await fetch(
+                        `${config.apiBaseUrl}/v1/rooms/${roomID}/viewer-events`,
+                        {
+                            method: "GET",
+                            headers: {
+                                Authorization: `Bearer ${viewerToken}`,
+                            },
+                            cache: "no-store",
+                            signal: controller.signal,
+                        },
+                    );
+
+                    if (!res.ok) {
+                        const error = await readAPIError(res);
+                        setTypingByActor({});
+                        setViewerStreamStatus(`viewer events failed: ${error}`);
+                        if (res.status === 404 || res.status === 410) {
+                            setAutoRefresh(false);
+                            return;
+                        }
+                    } else if (!res.body) {
+                        setTypingByActor({});
+                        setViewerStreamStatus("viewer events failed: no stream body");
+                    } else {
+                        setViewerStreamStatus("viewer events connected");
+                        await readViewerEventsStream(
+                            res.body,
+                            (event) => {
+                                if (event.room_id !== roomID) {
+                                    return;
+                                }
+                                setTypingByActor((current) =>
+                                    applyTypingEvent(current, event),
+                                );
+                            },
+                            controller.signal,
+                        );
+                        if (controller.signal.aborted) {
+                            return;
+                        }
+                        setTypingByActor({});
+                        setViewerStreamStatus("viewer events reconnecting");
+                    }
+                } catch {
+                    if (controller.signal.aborted) {
+                        return;
+                    }
+                    setTypingByActor({});
+                    setViewerStreamStatus("viewer events reconnecting");
+                }
+
+                await sleep(viewerEventsReconnectDelayMS);
+            }
+        };
+
+        void connect();
+        return () => controller.abort();
+    }, [autoRefresh, roomID, viewerToken]);
+
+    useEffect(() => {
+        if (Object.keys(typingByActor).length === 0) {
+            return;
+        }
+        const id = window.setInterval(() => {
+            setTypingByActor((current) => pruneExpiredTyping(current, Date.now()));
+        }, 500);
+        return () => window.clearInterval(id);
+    }, [typingByActor]);
+
+    const typingLabels = Object.keys(typingByActor)
+        .sort()
+        .map((actorID) =>
+            getTypingLabel(actorID, agentAID, agentBID, messages),
+        );
 
     const statusClass =
         status.includes("failed") || status.includes("required")
@@ -227,11 +337,28 @@ export function HumanRoomTester() {
                         <span className="chip">
                             messages: {messages.length}
                         </span>
+                        <span
+                            className={`chip viewer-stream-chip ${getViewerStreamTone(viewerStreamStatus)}`}
+                        >
+                            stream: {viewerStreamStatus}
+                        </span>
                     </div>
                 </header>
 
                 <div className="transcript-status">
                     status: <strong className={statusClass}>{status}</strong>
+                </div>
+
+                <div
+                    className={`typing-banner ${typingLabels.length > 0 ? "active" : "idle"}`}
+                >
+                    <span className="typing-pulse" />
+                    <span className="typing-label">LIVE_TYPING</span>
+                    <strong>
+                        {typingLabels.length > 0
+                            ? formatTypingSummary(typingLabels)
+                            : "No active typing signals."}
+                    </strong>
                 </div>
 
                 <div className="transcript-list">
@@ -242,24 +369,31 @@ export function HumanRoomTester() {
                         </div>
                     )}
 
-                    {messages.map((m) => (
+                    {messages.map((message) => (
                         <article
-                            key={m.id}
+                            key={message.id}
                             className={`message-row ${getSenderRole(
-                                m.sender_id,
+                                message.sender_id,
                                 agentAID,
                                 agentBID,
                             )}`}
                         >
                             <div className="message-head message-head-row">
                                 <span>
-                                    turn {m.turn} | {getSenderLabel(m, agentAID, agentBID)}
+                                    turn {message.turn} |{" "}
+                                    {getSenderLabel(message, agentAID, agentBID)}
                                 </span>
-                                <span className={`message-status ${getMessageStatus(m.turn, roomTurnIndex)}`}>
-                                    {getMessageStatus(m.turn, roomTurnIndex).toUpperCase()}
+                                <span
+                                    className={`message-status ${getMessageStatus(
+                                        message,
+                                    )}`}
+                                >
+                                    {getMessageStatus(
+                                        message,
+                                    ).toUpperCase()}
                                 </span>
                             </div>
-                            <MarkdownMessage content={m.ciphertext} />
+                            <MarkdownMessage content={message.ciphertext} />
                         </article>
                     ))}
                 </div>
@@ -268,8 +402,10 @@ export function HumanRoomTester() {
     );
 }
 
-function getMessageStatus(turn: number, roomTurnIndex: number): "sent" | "read" {
-    if (turn < roomTurnIndex - 1) return "read";
+function getMessageStatus(message: TranscriptMessage): "sent" | "read" {
+    if (message.read_by_opponent) {
+        return "read";
+    }
     return "sent";
 }
 
@@ -278,31 +414,267 @@ function getSenderRole(
     agentAID: string,
     agentBID: string,
 ): "agent-a" | "agent-b" | "unknown" {
-    if (senderID && agentAID && senderID === agentAID) return "agent-a";
-    if (senderID && agentBID && senderID === agentBID) return "agent-b";
+    if (senderID && agentAID && senderID === agentAID) {
+        return "agent-a";
+    }
+    if (senderID && agentBID && senderID === agentBID) {
+        return "agent-b";
+    }
     return "unknown";
 }
 
 function getSenderLabel(
-    msg: TranscriptMessage,
+    message: TranscriptMessage,
     agentAID: string,
     agentBID: string,
 ): string {
-    const role = getSenderRole(msg.sender_id, agentAID, agentBID);
-    if (role === "agent-a") return `agent A · ${msg.sender_name || msg.sender_id}`;
-    if (role === "agent-b") return `agent B · ${msg.sender_name || msg.sender_id}`;
-    return msg.sender_name || msg.sender_id;
+    const role = getSenderRole(message.sender_id, agentAID, agentBID);
+    if (role === "agent-a") {
+        return `agent A · ${message.sender_name || message.sender_id}`;
+    }
+    if (role === "agent-b") {
+        return `agent B · ${message.sender_name || message.sender_id}`;
+    }
+    return message.sender_name || message.sender_id;
+}
+
+function getTypingLabel(
+    actorID: string,
+    agentAID: string,
+    agentBID: string,
+    messages: TranscriptMessage[],
+): string {
+    const senderName = messages.find(
+        (message) => message.sender_id === actorID && message.sender_name,
+    )?.sender_name;
+
+    if (actorID && agentAID && actorID === agentAID) {
+        return senderName ? `agent A · ${senderName}` : "agent A";
+    }
+    if (actorID && agentBID && actorID === agentBID) {
+        return senderName ? `agent B · ${senderName}` : "agent B";
+    }
+    return senderName || actorID;
 }
 
 function normalizeMessage(raw: unknown): TranscriptMessage | null {
-    if (!raw || typeof raw !== "object") return null;
-    const msg = raw as Record<string, unknown>;
+    if (!raw || typeof raw !== "object") {
+        return null;
+    }
+    const message = raw as Record<string, unknown>;
     return {
-        id: String(msg.id ?? msg.ID ?? ""),
-        sender_id: String(msg.sender_id ?? msg.SenderID ?? ""),
-        sender_name: String(msg.sender_name ?? msg.SenderName ?? ""),
-        turn: Number(msg.turn ?? msg.Turn ?? 0),
-        ciphertext: String(msg.ciphertext ?? msg.Ciphertext ?? ""),
-        created_at: String(msg.created_at ?? msg.CreatedAt ?? ""),
+        id: String(message.id ?? message.ID ?? ""),
+        sender_id: String(message.sender_id ?? message.SenderID ?? ""),
+        sender_name: String(message.sender_name ?? message.SenderName ?? ""),
+        turn: Number(message.turn ?? message.Turn ?? 0),
+        ciphertext: String(message.ciphertext ?? message.Ciphertext ?? ""),
+        created_at: String(message.created_at ?? message.CreatedAt ?? ""),
+        read_by_opponent:
+            typeof message.read_by_opponent === "boolean"
+                ? message.read_by_opponent
+                : typeof message.read_by_opponent === "string"
+                  ? message.read_by_opponent === "true"
+                  : undefined,
     };
+}
+
+async function parseJSONResponse(
+    res: Response,
+): Promise<Record<string, unknown> | null> {
+    try {
+        return (await res.json()) as Record<string, unknown>;
+    } catch {
+        return null;
+    }
+}
+
+async function readAPIError(res: Response): Promise<string> {
+    const data = await parseJSONResponse(res);
+    if (typeof data?.error === "string" && data.error.trim()) {
+        return data.error;
+    }
+    return String(res.status);
+}
+
+async function readViewerEventsStream(
+    stream: ReadableStream<Uint8Array>,
+    onEvent: (event: ViewerTypingEvent) => void,
+    signal: AbortSignal,
+): Promise<void> {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    try {
+        while (!signal.aborted) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            buffer += decoder.decode(value, { stream: true }).replace(/\r/g, "");
+
+            const frames = buffer.split("\n\n");
+            buffer = frames.pop() ?? "";
+            for (const frame of frames) {
+                const parsed = parseSSEFrame(frame);
+                if (!parsed || parsed.eventType !== "agent.typing") {
+                    continue;
+                }
+                const event = parseViewerTypingEvent(parsed.data);
+                if (event) {
+                    onEvent(event);
+                }
+            }
+        }
+
+        buffer += decoder.decode();
+        const trailing = parseSSEFrame(buffer.replace(/\r/g, ""));
+        if (!signal.aborted && trailing?.eventType === "agent.typing") {
+            const event = parseViewerTypingEvent(trailing.data);
+            if (event) {
+                onEvent(event);
+            }
+        }
+    } finally {
+        reader.releaseLock();
+    }
+}
+
+function parseSSEFrame(
+    frame: string,
+): { eventType: string; data: string } | null {
+    const lines = frame.split("\n");
+    let eventType = "message";
+    const dataLines: string[] = [];
+
+    for (const line of lines) {
+        if (!line || line.startsWith(":")) {
+            continue;
+        }
+        if (line.startsWith("event:")) {
+            eventType = line.slice("event:".length).trim();
+            continue;
+        }
+        if (line.startsWith("data:")) {
+            dataLines.push(line.slice("data:".length).trimStart());
+        }
+    }
+
+    if (dataLines.length === 0) {
+        return null;
+    }
+
+    return {
+        eventType,
+        data: dataLines.join("\n"),
+    };
+}
+
+function parseViewerTypingEvent(data: string): ViewerTypingEvent | null {
+    try {
+        const raw = JSON.parse(data) as Record<string, unknown>;
+        if (
+            typeof raw.type !== "string" ||
+            typeof raw.room_id !== "string" ||
+            typeof raw.actor_id !== "string" ||
+            (raw.state !== "start" && raw.state !== "stop") ||
+            typeof raw.expires_at !== "string"
+        ) {
+            return null;
+        }
+        return {
+            type: raw.type,
+            room_id: raw.room_id,
+            actor_id: raw.actor_id,
+            state: raw.state,
+            ttl_ms:
+                typeof raw.ttl_ms === "number" ? raw.ttl_ms : undefined,
+            created_at:
+                typeof raw.created_at === "string" ? raw.created_at : "",
+            expires_at: raw.expires_at,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function applyTypingEvent(
+    current: Record<string, TypingPresence>,
+    event: ViewerTypingEvent,
+): Record<string, TypingPresence> {
+    if (event.state === "stop") {
+        return removeTypingPresence(current, event.actor_id);
+    }
+
+    const expiresAt = Date.parse(event.expires_at);
+    if (Number.isNaN(expiresAt)) {
+        return current;
+    }
+
+    const existing = current[event.actor_id];
+    if (existing && existing.expiresAt === expiresAt) {
+        return current;
+    }
+
+    return {
+        ...current,
+        [event.actor_id]: {
+            actorID: event.actor_id,
+            expiresAt,
+        },
+    };
+}
+
+function removeTypingPresence(
+    current: Record<string, TypingPresence>,
+    actorID: string,
+): Record<string, TypingPresence> {
+    if (!current[actorID]) {
+        return current;
+    }
+
+    const next = { ...current };
+    delete next[actorID];
+    return next;
+}
+
+function pruneExpiredTyping(
+    current: Record<string, TypingPresence>,
+    now: number,
+): Record<string, TypingPresence> {
+    let changed = false;
+    const next: Record<string, TypingPresence> = {};
+
+    for (const [actorID, presence] of Object.entries(current)) {
+        if (presence.expiresAt <= now) {
+            changed = true;
+            continue;
+        }
+        next[actorID] = presence;
+    }
+
+    return changed ? next : current;
+}
+
+function formatTypingSummary(labels: string[]): string {
+    if (labels.length === 1) {
+        return `${labels[0]} is typing...`;
+    }
+    return `${labels.join(", ")} are typing...`;
+}
+
+function getViewerStreamTone(status: string): string {
+    if (status.includes("connected")) {
+        return "viewer-stream-good";
+    }
+    if (status.includes("failed")) {
+        return "viewer-stream-bad";
+    }
+    return "viewer-stream-muted";
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+        window.setTimeout(resolve, ms);
+    });
 }

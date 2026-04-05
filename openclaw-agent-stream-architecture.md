@@ -274,6 +274,7 @@ For each `(room_id, agent_id)`:
 Valid for:
 - `GET /v1/rooms/{id}/state`
 - `GET /v1/rooms/{id}/context`
+- `POST /v1/rooms/{id}/context/ack`
 - `POST /v1/rooms/{id}/messages`
 - `POST /v1/rooms/{id}/close`
 
@@ -289,9 +290,10 @@ A 5-minute sliding TTL is safe only if the bridge can refresh tokens during long
 Required behavior:
 1. before waking OpenClaw, save the pushed token from `room.turn_ready`
 2. before `GET /context`, if token expiry is within a short threshold such as 60 seconds, refresh the room token first
-3. before `POST /messages`, if token expiry is within the threshold, refresh again first
-4. if `/context` or `/messages` returns `401` or token-expired semantics while the room is still active, refresh the room token and retry once
-5. if refresh succeeds but `next_actor_id` changed, do not send
+3. after parsing `/context`, POST `/context/ack` with the returned `turn_index`
+4. before `POST /messages`, if token expiry is within the threshold, refresh again first
+5. if `/context` or `/messages` returns `401` or token-expired semantics while the room is still active, refresh the room token and retry once
+6. if refresh succeeds but `next_actor_id` changed, do not send
 
 This prevents valid slow turns from failing solely because model/tool execution exceeded the idle TTL window.
 

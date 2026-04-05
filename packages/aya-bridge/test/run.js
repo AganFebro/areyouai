@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
+const { setTimeout: sleep } = require("node:timers/promises");
 
 const {
   BridgeDaemon,
@@ -279,6 +280,137 @@ async function testWakeRefreshesNearExpiryRoomToken() {
   assert.equal(stored.token, "rat_refreshed");
 }
 
+async function testServeDowngradesExpectedDisconnectLogs() {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "aya-bridge-disconnect-"));
+  const logs = { info: [], warn: [] };
+  const config = defaultConfig(tmpDir);
+  config.aya.api_base_url = "https://api.example.test";
+  config.aya.reconnect.base_delay_ms = 1;
+  config.aya.reconnect.max_delay_ms = 1;
+  config.aya.reconnect.jitter_ms = 0;
+
+  const fetchImpl = async (input, options = {}) => {
+    const url = String(input);
+    if (url === "https://api.example.test/v1/agent/stream" && options.method === "GET") {
+      async function* body() {
+        yield Buffer.from("event: stream.hello\n");
+        yield Buffer.from("data: {\"type\":\"stream.hello\",\"resume_status\":\"fresh\"}\n\n");
+        throw new Error("terminated");
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map([["content-type", "text/event-stream"]]),
+        body: body(),
+        async text() {
+          return "";
+        }
+      };
+    }
+    throw new Error(`unexpected fetch ${options.method || "GET"} ${url}`);
+  };
+
+  const bridge = new BridgeDaemon({
+    config,
+    fetchImpl,
+    logger: {
+      debug: (...args) => logs.info.push(args.join(" ")),
+      info: (...args) => logs.info.push(args.join(" ")),
+      warn: (...args) => logs.warn.push(args.join(" ")),
+      error: (...args) => logs.warn.push(args.join(" "))
+    },
+    session: {
+      api_key: "aya_api_test",
+      session_token: "as_test",
+      agent_id: "agt_test"
+    },
+    state: {
+      last_acknowledged_delivery_id: "",
+      last_connected_at: null,
+      last_stream_status: "idle"
+    }
+  });
+  await bridge.ensureLayout();
+
+  const controller = new AbortController();
+  const servePromise = bridge.serve(controller.signal);
+  await sleep(20);
+  controller.abort();
+  await servePromise;
+
+  assert.ok(logs.info.some((line) => line.includes("stream disconnected error=terminated")));
+  assert.ok(!logs.warn.some((line) => line.includes("stream disconnected error=terminated")));
+}
+
+async function testWakeEmitsTypingPulse() {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "aya-bridge-typing-"));
+  const markers = [];
+  let hookPayload = null;
+  const config = defaultConfig(tmpDir);
+  config.aya.api_base_url = "https://api.example.test";
+  config.openclaw.hook_url = "http://127.0.0.1:18789/hooks/agent";
+  config.openclaw.hook_token = "oc_hook_test";
+
+  const fetchImpl = async (input, options = {}) => {
+    const url = String(input);
+    if (url === "https://api.example.test/v1/rooms/room_typing/access-token" && options.method === "POST") {
+      markers.push("token");
+      return jsonResponse(201, {
+        room_id: "room_typing",
+        agent_id: "agt_test",
+        token: "rat_typing",
+        scope: "room:automation",
+        expires_at: new Date(Date.now() + 300000).toISOString()
+      });
+    }
+    if (url === "https://api.example.test/v1/rooms/room_typing/typing" && options.method === "POST") {
+      const payload = JSON.parse(String(options.body || "{}"));
+      markers.push(payload.state === "start" ? "typing-start" : "typing-stop");
+      assert.equal(String(options.headers?.Authorization || ""), "Bearer rat_typing");
+      if (payload.state === "start") {
+        assert.equal(payload.ttl_ms, 30000);
+      }
+      return jsonResponse(200, { ok: true });
+    }
+    if (url === "http://127.0.0.1:18789/hooks/agent" && options.method === "POST") {
+      markers.push("wake");
+      hookPayload = JSON.parse(String(options.body || "{}"));
+      return jsonResponse(200, { ok: true });
+    }
+    throw new Error(`unexpected fetch ${options.method || "GET"} ${url}`);
+  };
+
+  const bridge = new BridgeDaemon({
+    config,
+    fetchImpl,
+    logger: createLogger("error"),
+    session: {
+      api_key: "aya_api_test",
+      session_token: "as_test",
+      agent_id: "agt_test"
+    },
+    state: {
+      last_acknowledged_delivery_id: "",
+      last_connected_at: null,
+      last_stream_status: "idle"
+    }
+  });
+  await bridge.ensureLayout();
+
+  await bridge.wakeOpenClaw({
+    delivery_id: "dly_typing",
+    type: "room.turn_ready",
+    room_id: "room_typing",
+    next_turn: 4,
+    next_actor_id: "agt_test"
+  });
+
+  assert.deepEqual(markers, ["token", "typing-start", "wake", "typing-stop"]);
+  assert.ok(hookPayload, "wake payload should be present");
+  const contract = JSON.parse(String(hookPayload.message).split("\n").slice(1).join("\n"));
+  assert.equal(contract.room_id, "room_typing");
+}
+
 async function testEnqueueWakeJobDedupesEquivalentTurnReady() {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "aya-bridge-dedupe-"));
   const bridge = new BridgeDaemon({
@@ -385,6 +517,7 @@ async function testProcessRecoveryClearsTerminalWakeJobs() {
   await bridge.processRecovery();
 
   assert.deepEqual(markers, ["recovery"]);
+  assert.equal(bridge.state.last_acknowledged_delivery_id, "");
   const tokenPath = path.join(bridge.paths.tokenDir, "room_terminal.json");
   const tokenExists = await fs.access(tokenPath).then(() => true).catch(() => false);
   assert.equal(tokenExists, false);
@@ -392,6 +525,71 @@ async function testProcessRecoveryClearsTerminalWakeJobs() {
   assert.equal(wakeFiles.length, 0);
   const state = JSON.parse(await fs.readFile(bridge.paths.statePath, "utf8"));
   assert.ok(!state.completed_wake_keys.includes("room_terminal|9|agt_test"));
+}
+
+async function testProcessRecoveryRetainsCursorOnFailure() {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "aya-bridge-recovery-fail-"));
+  const markers = [];
+  let streamURL = null;
+  const config = defaultConfig(tmpDir);
+  config.aya.api_base_url = "https://api.example.test";
+  const fetchImpl = async (input, options = {}) => {
+    const url = String(input);
+    if (url === "https://api.example.test/v1/agent/actionable-rooms") {
+      markers.push("recovery-fail");
+      return jsonResponse(500, { error: "temporary" });
+    }
+    if (url.startsWith("https://api.example.test/v1/agent/stream") && options.method === "GET") {
+      streamURL = url;
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map([[
+          "content-type",
+          "text/event-stream"
+        ]]),
+        body: {
+          async getReader() {
+            return {
+              async read() {
+                return { done: true, value: undefined };
+              },
+              releaseLock() {}
+            };
+          }
+        },
+        async text() {
+          return "";
+        }
+      };
+    }
+    throw new Error(`unexpected fetch ${options.method || "GET"} ${url}`);
+  };
+
+  const bridge = new BridgeDaemon({
+    config,
+    fetchImpl,
+    logger: createLogger("error"),
+    session: {
+      api_key: "aya_api_test",
+      session_token: "as_test",
+      agent_id: "agt_test"
+    },
+    state: {
+      last_acknowledged_delivery_id: "dly_old",
+      last_connected_at: null,
+      last_stream_status: "connected"
+    }
+  });
+  await bridge.ensureLayout();
+
+  await assert.rejects(() => bridge.processRecovery(), /500/);
+  assert.deepEqual(markers, ["recovery-fail"]);
+  assert.equal(bridge.state.last_acknowledged_delivery_id, "dly_old");
+
+  await bridge.openStream(new AbortController().signal);
+  assert.ok(streamURL, "stream URL should be captured");
+  assert.ok(streamURL.includes("last_delivery_id=dly_old"), streamURL);
 }
 
 async function testHandleTerminalClearsPendingWakeJobs() {
@@ -467,11 +665,20 @@ async function main() {
   if (mode === "refresh" || mode === "all") {
     await runTest("wake refreshes near-expiry room token", testWakeRefreshesNearExpiryRoomToken);
   }
+  if (mode === "disconnect" || mode === "all") {
+    await runTest("serve downgrades expected disconnect logs", testServeDowngradesExpectedDisconnectLogs);
+  }
+  if (mode === "typing" || mode === "all") {
+    await runTest("wake emits typing pulse around hook execution", testWakeEmitsTypingPulse);
+  }
   if (mode === "dedupe" || mode === "all") {
     await runTest("enqueueWakeJob dedupes equivalent room.turn_ready jobs", testEnqueueWakeJobDedupesEquivalentTurnReady);
   }
   if (mode === "recovery" || mode === "all") {
     await runTest("processRecovery clears terminal room wake jobs", testProcessRecoveryClearsTerminalWakeJobs);
+  }
+  if (mode === "recovery-failure" || mode === "all") {
+    await runTest("processRecovery retains cursor on failure", testProcessRecoveryRetainsCursorOnFailure);
   }
   if (mode === "terminal" || mode === "all") {
     await runTest("handleTerminal clears pending wake jobs", testHandleTerminalClearsPendingWakeJobs);

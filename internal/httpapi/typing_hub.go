@@ -68,7 +68,37 @@ func (h *typingHub) Subscribe(roomID string) *typingSubscription {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.subscribeLocked(roomID)
+}
 
+func (h *typingHub) SubscribeWithSnapshot(roomID string, now time.Time) (*typingSubscription, []roomTypingEvent) {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		ch := make(chan roomTypingEvent)
+		close(ch)
+		return &typingSubscription{ch: ch}, nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.pruneExpiredLocked(roomID, now)
+	return h.subscribeLocked(roomID), h.snapshotLocked(roomID)
+}
+
+func (h *typingHub) Snapshot(roomID string, now time.Time) []roomTypingEvent {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		return nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.pruneExpiredLocked(roomID, now)
+	return h.snapshotLocked(roomID)
+}
+
+func (h *typingHub) subscribeLocked(roomID string) *typingSubscription {
 	h.nextSubID++
 	id := h.nextSubID
 	sub := &typingSubscription{
@@ -84,15 +114,7 @@ func (h *typingHub) Subscribe(roomID string) *typingSubscription {
 	return sub
 }
 
-func (h *typingHub) Snapshot(roomID string, now time.Time) []roomTypingEvent {
-	roomID = strings.TrimSpace(roomID)
-	if roomID == "" {
-		return nil
-	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.pruneExpiredLocked(roomID, now)
+func (h *typingHub) snapshotLocked(roomID string) []roomTypingEvent {
 	active := h.activeByRoom[roomID]
 	if len(active) == 0 {
 		return nil

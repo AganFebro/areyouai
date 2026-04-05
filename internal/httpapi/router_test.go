@@ -121,6 +121,9 @@ func TestCapabilitiesEndpointSQL(t *testing.T) {
 	if !capabilityEndpointSupported(t, endpoints, "room_access_token") {
 		t.Fatal("room_access_token should be supported in SQL mode")
 	}
+	if !capabilityEndpointSupported(t, endpoints, "room_context_ack") {
+		t.Fatal("room_context_ack should be supported in SQL mode")
+	}
 	if !capabilityEndpointSupported(t, endpoints, "room_typing") {
 		t.Fatal("room_typing should be supported in SQL mode")
 	}

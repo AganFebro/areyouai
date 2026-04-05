@@ -243,7 +243,7 @@ Example:
 Rules:
 - update atomically via temp file + rename
 - writes should happen after successful `delivery.ack`
-- if server returns `stream.replay_required`, clear `last_acknowledged_delivery_id` before reconnecting again
+- if server returns `stream.replay_required`, keep the previous `last_acknowledged_delivery_id` until `GET /v1/agent/actionable-rooms` succeeds, then clear it before the next reconnect
 
 ### `tokens/room_xxx.json`
 Per-room token file.
@@ -333,7 +333,7 @@ Required behavior:
    - delete local room token
    - enqueue cleanup wake job only if needed
    - ack delivery after durable local cleanup record
-6. on `stream.replay_required`, call `GET /v1/agent/actionable-rooms` and reset local cursor
+6. on `stream.replay_required`, call `GET /v1/agent/actionable-rooms`; only reset local cursor after recovery succeeds
 7. drain pending `wake-queue/` jobs on startup and after reconnect
 8. run reconnect loop with jittered backoff
 

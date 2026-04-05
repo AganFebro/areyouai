@@ -7,6 +7,7 @@ const os = require("node:os");
 const { setTimeout: sleep } = require("node:timers/promises");
 
 const DEFAULT_BASE_DIR = path.join(os.homedir(), ".areyouai");
+const DEFAULT_TYPING_TTL_MS = 30_000;
 
 class HTTPError extends Error {
   constructor(status, body, message) {
@@ -194,6 +195,20 @@ function computeBackoffMs(reconnect, attempt) {
   const growth = Math.min(max, base * Math.pow(2, Math.max(0, attempt)));
   const jitterAdd = jitter > 0 ? Math.floor(Math.random() * (jitter + 1)) : 0;
   return growth + jitterAdd;
+}
+
+function isExpectedStreamDisconnectError(err) {
+  if (!err) {
+    return false;
+  }
+  if (err.name === "AbortError") {
+    return true;
+  }
+  const message = String(err.message || "").trim().toLowerCase();
+  if (!message) {
+    return false;
+  }
+  return ["terminated", "eof", "end of file", "premature close", "socket closed", "connection closed"].some((needle) => message.includes(needle));
 }
 
 async function* parseSSE(body) {
@@ -480,6 +495,29 @@ class BridgeDaemon {
     return payload;
   }
 
+  async sendRoomTypingSignal(roomId, token, state, ttlMs) {
+    const cleanRoomId = String(roomId || "").trim();
+    const cleanToken = String(token || "").trim();
+    const cleanState = String(state || "").trim();
+    if (!cleanRoomId || !cleanToken || (cleanState !== "start" && cleanState !== "stop")) {
+      return false;
+    }
+    try {
+      await this.requestJSON(`/v1/rooms/${encodeURIComponent(cleanRoomId)}/typing`, {
+        method: "POST",
+        auth: "none",
+        headers: {
+          Authorization: `Bearer ${cleanToken}`
+        },
+        body: cleanState === "start" ? { state: cleanState, ttl_ms: ttlMs } : { state: cleanState }
+      });
+      return true;
+    } catch (err) {
+      this.logger.warn(`typing signal failed room_id=${cleanRoomId} state=${cleanState} error=${err.message}`);
+      return false;
+    }
+  }
+
   async readRoomToken(roomId) {
     return readJSON(path.join(this.paths.tokenDir, `${roomId}.json`), null);
   }
@@ -628,6 +666,11 @@ class BridgeDaemon {
     const tokenState = await this.ensureFreshRoomTokenForJob(job);
     const tokenExpiresAt = tokenState?.expires_at || job.token_expires_at || null;
     const tokenPath = path.join(this.paths.tokenDir, `${roomId}.json`);
+    const typingToken = String(tokenState?.token || job.room_token || "").trim();
+    let typingStarted = false;
+    if (typingToken) {
+      typingStarted = await this.sendRoomTypingSignal(roomId, typingToken, "start", DEFAULT_TYPING_TTL_MS);
+    }
     const contract = {
       contract: "aya.wake.v1",
       delivery_id: deliveryId,
@@ -642,7 +685,7 @@ class BridgeDaemon {
       token_path: tokenPath,
       token_expires_at: tokenExpiresAt,
       instructions: [
-        "Read token_path and fetch fresh /v1/rooms/{id}/context before deciding.",
+        "Read token_path, fetch fresh /v1/rooms/{id}/context, then POST /v1/rooms/{id}/context/ack with the returned turn_index after the response parses successfully.",
         "Reply exactly once only if next_actor_id in fresh context equals your agent_id.",
         "If token missing/expired or API returns 401, refresh with POST /v1/rooms/{id}/access-token and retry once.",
         "If API returns 409 turn_mismatch or stale_bundle_hash, stop and wait for next wake."
@@ -660,19 +703,25 @@ class BridgeDaemon {
       deliver: false,
       timeoutSeconds: 120
     };
-    const response = await this.fetch(hookURL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${hookToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload)
-    });
-    const text = await response.text();
-    if (!response.ok) {
-      throw new HTTPError(response.status, parseJSONText(text), `OpenClaw wake failed ${response.status}`);
+    try {
+      const response = await this.fetch(hookURL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${hookToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        throw new HTTPError(response.status, parseJSONText(text), `OpenClaw wake failed ${response.status}`);
+      }
+      return parseJSONText(text);
+    } finally {
+      if (typingStarted) {
+        await this.sendRoomTypingSignal(roomId, typingToken, "stop");
+      }
     }
-    return parseJSONText(text);
   }
 
   async drainWakeQueue() {
@@ -709,7 +758,6 @@ class BridgeDaemon {
   }
 
   async processRecovery() {
-    this.state.last_acknowledged_delivery_id = "";
     this.state.last_stream_status = "recovery";
     await this.saveState();
     const payload = await this.requestJSON("/v1/agent/actionable-rooms");
@@ -750,6 +798,10 @@ class BridgeDaemon {
       });
     }
     await this.drainWakeQueue();
+    if (String(this.state.last_acknowledged_delivery_id || "").trim()) {
+      this.state.last_acknowledged_delivery_id = "";
+      await this.saveState();
+    }
   }
 
   async handleTurnReady(payload) {
@@ -907,7 +959,8 @@ class BridgeDaemon {
           }
           this.state.last_stream_status = "disconnected";
           await this.saveState();
-          this.logger.warn(`stream disconnected error=${err.message}`);
+          const log = isExpectedStreamDisconnectError(err) ? this.logger.info : this.logger.warn;
+          log(`stream disconnected error=${err.message}`);
         }
         if (signal?.aborted) {
           break;

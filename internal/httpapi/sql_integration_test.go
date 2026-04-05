@@ -19,6 +19,7 @@ import (
 
 	"github.com/febrian/areyouai/internal/repository"
 	"github.com/febrian/areyouai/internal/repository/postgres"
+	"github.com/febrian/areyouai/internal/security"
 	_ "github.com/lib/pq"
 )
 
@@ -28,6 +29,22 @@ type failingRoomContextStore struct {
 
 func (s failingRoomContextStore) UpsertRoomContext(ctx context.Context, in repository.UpsertRoomContextInput) (repository.RoomContextState, error) {
 	return repository.RoomContextState{}, fmt.Errorf("forced room context failure for test")
+}
+
+type alwaysFailRoomContextStore struct {
+	repository.Store
+}
+
+func (s alwaysFailRoomContextStore) UpsertRoomContext(ctx context.Context, in repository.UpsertRoomContextInput) (repository.RoomContextState, error) {
+	return repository.RoomContextState{}, fmt.Errorf("forced room context ack failure for test")
+}
+
+type failingRoomContextReadStore struct {
+	repository.Store
+}
+
+func (s failingRoomContextReadStore) GetRoomContext(ctx context.Context, roomID string) (repository.RoomContextState, error) {
+	return repository.RoomContextState{}, fmt.Errorf("forced room context read failure for test")
 }
 
 func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
@@ -54,7 +71,7 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	applyMigrationsForTest(t, db)
 
 	store := postgres.NewStore(db)
-	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	ts := httptest.NewServer(NewRouterWithStore(store, 3*time.Second, 2*time.Minute, 24*time.Hour))
 	defer ts.Close()
 
 	resp, body := doJSON(t, ts, http.MethodGet, "/v1/mode", nil, "")
@@ -141,14 +158,23 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("context a status=%d body=%v", resp.StatusCode, body)
 	}
-	bundleA := mustString(t, body, "bundle_hash")
-	if _, ok := body["next_turn"]; !ok {
-		t.Fatalf("context missing next_turn: %v", body)
+	contextA := body
+	bundleA := mustString(t, contextA, "bundle_hash")
+	turnIndexA, ok := contextA["turn_index"].(float64)
+	if !ok {
+		t.Fatalf("context missing turn_index: %v", contextA)
 	}
-	if _, ok := body["next_actor_id"]; !ok {
-		t.Fatalf("context missing next_actor_id: %v", body)
+	if _, ok := contextA["next_turn"]; !ok {
+		t.Fatalf("context missing next_turn: %v", contextA)
 	}
-	promptBundle := mustString(t, body, "prompt_bundle_text")
+	if _, ok := contextA["next_actor_id"]; !ok {
+		t.Fatalf("context missing next_actor_id: %v", contextA)
+	}
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/context/ack", map[string]any{"turn_index": turnIndexA}, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("context ack a status=%d body=%v", resp.StatusCode, body)
+	}
+	promptBundle := mustString(t, contextA, "prompt_bundle_text")
 	if !strings.Contains(promptBundle, "room_topic=sql mode room") {
 		t.Fatalf("context missing room topic anchor: %s", promptBundle)
 	}
@@ -163,6 +189,22 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	}
 	if !strings.Contains(promptBundle, "voice_hint=") {
 		t.Fatalf("context missing voice hint: %s", promptBundle)
+	}
+
+	overSizedCipher := strings.Repeat("x", security.MaxPersistMessageChars+1)
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
+		"expected_turn": 0,
+		"ciphertext":    overSizedCipher,
+		"bundle_hash":   bundleA,
+	}, tokenA)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized message status=%d body=%v", resp.StatusCode, body)
+	}
+	if got, _ := body["error"].(string); got != "payload_too_large" {
+		t.Fatalf("oversized message error=%v body=%v", body["error"], body)
+	}
+	if got, _ := body["max_chars"].(float64); got != security.MaxPersistMessageChars {
+		t.Fatalf("oversized message max_chars=%v body=%v", got, body)
 	}
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
@@ -208,6 +250,14 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 		t.Fatalf("context b status=%d body=%v", resp.StatusCode, body)
 	}
 	bundleB := mustString(t, body, "bundle_hash")
+	turnIndexB, ok := body["turn_index"].(float64)
+	if !ok {
+		t.Fatalf("context missing turn_index: %v", body)
+	}
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/context/ack", map[string]any{"turn_index": turnIndexB}, tokenB)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("context ack b status=%d body=%v", resp.StatusCode, body)
+	}
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
 		"expected_turn": 1,
@@ -246,6 +296,14 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 		t.Fatalf("context a refresh status=%d body=%v", resp.StatusCode, body)
 	}
 	bundleA2 := mustString(t, body, "bundle_hash")
+	turnIndexA2, ok := body["turn_index"].(float64)
+	if !ok {
+		t.Fatalf("context missing turn_index: %v", body)
+	}
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/context/ack", map[string]any{"turn_index": turnIndexA2}, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("context ack a2 status=%d body=%v", resp.StatusCode, body)
+	}
 
 	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/messages", map[string]any{
 		"expected_turn": 2,
@@ -288,12 +346,25 @@ func TestSQLModeListingConnectAndTranscriptFlow(t *testing.T) {
 	if _, ok := body["next_actor_id"]; !ok {
 		t.Fatalf("next_actor_id missing in transcript body=%v", body)
 	}
+	if fetchMap, ok := body["last_context_fetch_turn_by_agent"].(map[string]any); !ok || len(fetchMap) == 0 {
+		t.Fatalf("missing context fetch map in transcript body=%v", body)
+	}
 	first, ok := msgs[0].(map[string]any)
 	if !ok {
 		t.Fatalf("unexpected first message payload=%v", msgs[0])
 	}
 	if _, ok := first["sender_name"].(string); !ok {
 		t.Fatalf("sender_name missing in transcript message=%v", first)
+	}
+	if got, _ := first["read_by_opponent"].(bool); !got {
+		t.Fatalf("first message should be read by opponent: %v", first)
+	}
+	second, ok := msgs[1].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected second message payload=%v", msgs[1])
+	}
+	if got, _ := second["read_by_opponent"].(bool); !got {
+		t.Fatalf("second message should be read by opponent: %v", second)
 	}
 
 	rows, err := db.Query(`SELECT event_type FROM room_events WHERE room_id = $1 ORDER BY id ASC`, roomID)
@@ -386,7 +457,7 @@ func TestSQLModeRoomEventsHistoryEndpoint(t *testing.T) {
 	applyMigrationsForTest(t, db)
 
 	store := postgres.NewStore(db)
-	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	ts := httptest.NewServer(NewRouterWithStore(store, 3*time.Second, 2*time.Minute, 24*time.Hour))
 	defer ts.Close()
 
 	_, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "events-a"}, "")
@@ -636,6 +707,164 @@ func TestSQLModeCreateAndConnectSucceedWhenRoomContextSyncFails(t *testing.T) {
 	}
 	if !connected {
 		t.Fatalf("listing %s should be connected after successful /connect", listingID)
+	}
+}
+
+func TestSQLModeContextReturnsPromptBundleWhenContextAckFails(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+
+	store := alwaysFailRoomContextStore{Store: postgres.NewStore(db)}
+	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	_, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "context-failing-a"}, "")
+	apiA := mustString(t, body, "api_key")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "context-failing-b"}, "")
+	apiB := mustString(t, body, "api_key")
+
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	tokenA := mustString(t, body, "session_token")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	tokenB := mustString(t, body, "session_token")
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "context best effort",
+		"max_turns":   4,
+		"ttl_seconds": 300,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	roomID := mustString(t, body, "room_id")
+	humanCode := mustString(t, body, "human_code")
+	listingID := mustString(t, body, "id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/rooms/"+roomID+"/context", nil, tokenA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("context status=%d body=%v", resp.StatusCode, body)
+	}
+	if got := mustString(t, body, "room_id"); got != roomID {
+		t.Fatalf("context room_id=%s want=%s", got, roomID)
+	}
+	if mustString(t, body, "bundle_hash") == "" {
+		t.Fatal("context returned empty bundle_hash")
+	}
+	if got := mustString(t, body, "next_actor_id"); got == "" {
+		t.Fatalf("context returned empty next_actor_id body=%v", body)
+	}
+	turnIndex, ok := body["turn_index"].(float64)
+	if !ok {
+		t.Fatalf("context missing turn_index: %v", body)
+	}
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/context/ack", map[string]any{"turn_index": turnIndex}, tokenA)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("context ack status=%d body=%v", resp.StatusCode, body)
+	}
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/transcript", map[string]any{"human_code": humanCode}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("transcript after failed ack status=%d body=%v", resp.StatusCode, body)
+	}
+	fetchMap, ok := body["last_context_fetch_turn_by_agent"].(map[string]any)
+	if !ok && body["last_context_fetch_turn_by_agent"] != nil {
+		t.Fatalf("unexpected fetch map payload=%v", body["last_context_fetch_turn_by_agent"])
+	}
+	if ok && len(fetchMap) != 0 {
+		t.Fatalf("expected empty fetch map after failed ack: %v", fetchMap)
+	}
+}
+
+func TestSQLModeTranscriptSurvivesRoomContextReadFailure(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+
+	store := failingRoomContextReadStore{Store: postgres.NewStore(db)}
+	ts := httptest.NewServer(NewRouterWithStore(store, 45*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	_, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "transcript-failing-a"}, "")
+	apiA := mustString(t, body, "api_key")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "transcript-failing-b"}, "")
+	apiB := mustString(t, body, "api_key")
+
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	tokenA := mustString(t, body, "session_token")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	tokenB := mustString(t, body, "session_token")
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "transcript best effort",
+		"max_turns":   2,
+		"ttl_seconds": 300,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	roomID := mustString(t, body, "room_id")
+	humanCode := mustString(t, body, "human_code")
+	listingID := mustString(t, body, "id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/transcript", map[string]any{"human_code": humanCode}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("transcript status=%d body=%v", resp.StatusCode, body)
+	}
+	if got := mustString(t, body, "room_id"); got != roomID {
+		t.Fatalf("transcript room_id=%s want=%s", got, roomID)
+	}
+	fetchMap, ok := body["last_context_fetch_turn_by_agent"].(map[string]any)
+	if !ok && body["last_context_fetch_turn_by_agent"] != nil {
+		t.Fatalf("unexpected fetch map payload=%v", body["last_context_fetch_turn_by_agent"])
+	}
+	if ok && len(fetchMap) != 0 {
+		t.Fatalf("expected empty fetch map when room context read fails: %v", fetchMap)
 	}
 }
 
@@ -1241,6 +1470,105 @@ func TestSQLModeTypingIndicatorViewerStream(t *testing.T) {
 	}
 	if got, _ := stopEvent.Payload["actor_id"].(string); got != startEvent.Payload["actor_id"] {
 		t.Fatalf("typing stop actor_id=%v start=%v", stopEvent.Payload["actor_id"], startEvent.Payload["actor_id"])
+	}
+
+	staleAt := time.Now().UTC().Add(-30 * time.Second)
+	if _, err := db.ExecContext(context.Background(), `UPDATE room_viewers SET last_heartbeat_at = $1 WHERE viewer_token = $2`, staleAt, viewerToken); err != nil {
+		t.Fatalf("stale viewer heartbeat: %v", err)
+	}
+	waitForGenericSSEStreamClose(t, eventCh, errCh, 3*time.Second)
+}
+
+func TestSQLModeViewerEventsRejectExpiredViewerOnOpen(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+	store := postgres.NewStore(db)
+	ts := httptest.NewServer(NewRouterWithStore(store, 3*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	_, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "typing-a"}, "")
+	apiA := mustString(t, body, "api_key")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "typing-b"}, "")
+	apiB := mustString(t, body, "api_key")
+
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiA}, "")
+	tokenA := mustString(t, body, "session_token")
+	_, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": apiB}, "")
+	tokenB := mustString(t, body, "session_token")
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "typing indicator",
+		"max_turns":   1,
+		"ttl_seconds": 600,
+	}, tokenA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	listingID := mustString(t, body, "id")
+	humanCode := mustString(t, body, "human_code")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings/"+listingID+"/connect", nil, tokenB)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("connect status=%d body=%v", resp.StatusCode, body)
+	}
+	roomID := mustString(t, body, "room_id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/rooms/"+roomID+"/viewers", map[string]any{
+		"op":         "join",
+		"human_code": humanCode,
+	}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("viewer join status=%d body=%v", resp.StatusCode, body)
+	}
+	viewerToken := mustString(t, body, "viewer_token")
+
+	staleAt := time.Now().UTC().Add(-30 * time.Second)
+	if _, err := db.ExecContext(context.Background(), `UPDATE room_viewers SET last_heartbeat_at = $1 WHERE viewer_token = $2`, staleAt, viewerToken); err != nil {
+		t.Fatalf("stale viewer heartbeat: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/rooms/"+roomID+"/viewer-events", nil)
+	if err != nil {
+		t.Fatalf("new viewer stream request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+viewerToken)
+
+	sseResp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("open viewer stream: %v", err)
+	}
+	defer sseResp.Body.Close()
+
+	if sseResp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(sseResp.Body)
+		t.Fatalf("viewer stream status=%d body=%s", sseResp.StatusCode, string(body))
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(sseResp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode viewer stream error payload: %v", err)
+	}
+	if got, _ := payload["error"].(string); got != "viewer_not_found" {
+		t.Fatalf("viewer stream error=%v body=%v", payload["error"], payload)
 	}
 }
 
@@ -1890,6 +2218,24 @@ func expectNoGenericSSEEvent(t *testing.T, eventCh <-chan genericSSEEnvelope, er
 		}
 		t.Fatalf("unexpected agent stream event type=%q id=%s", ev.Type, ev.EventID)
 	case <-timer.C:
+	}
+}
+
+func waitForGenericSSEStreamClose(t *testing.T, eventCh <-chan genericSSEEnvelope, errCh <-chan error, timeout time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case err := <-errCh:
+			t.Fatalf("agent stream error while waiting for close: %v", err)
+		case _, ok := <-eventCh:
+			if !ok {
+				return
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for agent stream to close")
+		}
 	}
 }
 
