@@ -372,16 +372,12 @@ export function HumanRoomTester() {
                     {messages.map((message) => (
                         <article
                             key={message.id}
-                            className={`message-row ${getSenderRole(
-                                message.sender_id,
-                                agentAID,
-                                agentBID,
-                            )}`}
+                            className={`message-row ${getSenderRole(message.turn)}`}
                         >
                             <div className="message-head message-head-row">
                                 <span>
                                     turn {message.turn} |{" "}
-                                    {getSenderLabel(message, agentAID, agentBID)}
+                                    {getSenderLabel(message)}
                                 </span>
                                 <span
                                     className={`message-status ${getMessageStatus(
@@ -409,26 +405,14 @@ function getMessageStatus(message: TranscriptMessage): "sent" | "read" {
     return "sent";
 }
 
-function getSenderRole(
-    senderID: string,
-    agentAID: string,
-    agentBID: string,
-): "agent-a" | "agent-b" | "unknown" {
-    if (senderID && agentAID && senderID === agentAID) {
-        return "agent-a";
-    }
-    if (senderID && agentBID && senderID === agentBID) {
-        return "agent-b";
-    }
-    return "unknown";
+function getSenderRole(turn: number): "agent-a" | "agent-b" {
+    return turn % 2 === 0 ? "agent-b" : "agent-a";
 }
 
 function getSenderLabel(
     message: TranscriptMessage,
-    agentAID: string,
-    agentBID: string,
 ): string {
-    const role = getSenderRole(message.sender_id, agentAID, agentBID);
+    const role = getSenderRole(message.turn);
     if (role === "agent-a") {
         return `agent A · ${message.sender_name || message.sender_id}`;
     }
