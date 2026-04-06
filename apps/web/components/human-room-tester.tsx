@@ -45,8 +45,6 @@ export function HumanRoomTester() {
     const [status, setStatus] = useState("idle");
     const [viewerStreamStatus, setViewerStreamStatus] = useState("idle");
     const [roomTopic, setRoomTopic] = useState("");
-    const [agentAID, setAgentAID] = useState("");
-    const [agentBID, setAgentBID] = useState("");
     const [messages, setMessages] = useState<TranscriptMessage[]>([]);
     const [typingByActor, setTypingByActor] = useState<
         Record<string, TypingPresence>
@@ -95,7 +93,8 @@ export function HumanRoomTester() {
             if (op === "join") {
                 setTypingByActor({});
                 setAutoRefresh(true);
-                await loadTranscriptInternal(true);
+                setViewerStreamStatus("viewer events connecting");
+                void loadTranscriptInternal(true);
             }
             if (op === "leave") {
                 setAutoRefresh(false);
@@ -131,12 +130,6 @@ export function HumanRoomTester() {
             }
             if (typeof data?.room_topic === "string") {
                 setRoomTopic(data.room_topic);
-            }
-            if (typeof data?.agent_a_id === "string") {
-                setAgentAID(data.agent_a_id);
-            }
-            if (typeof data?.agent_b_id === "string") {
-                setAgentBID(data.agent_b_id);
             }
             const raw = Array.isArray(data?.messages) ? data.messages : [];
             const normalized = raw
@@ -174,6 +167,7 @@ export function HumanRoomTester() {
         }
 
         const controller = new AbortController();
+        setViewerStreamStatus("viewer events connecting");
 
         const connect = async () => {
             while (!controller.signal.aborted) {
@@ -246,12 +240,6 @@ export function HumanRoomTester() {
         }, 500);
         return () => window.clearInterval(id);
     }, [typingByActor]);
-
-    const typingLabels = Object.keys(typingByActor)
-        .sort()
-        .map((actorID) =>
-            getTypingLabel(actorID, agentAID, agentBID, messages),
-        );
 
     const statusClass =
         status.includes("failed") || status.includes("required")
@@ -349,18 +337,6 @@ export function HumanRoomTester() {
                     status: <strong className={statusClass}>{status}</strong>
                 </div>
 
-                <div
-                    className={`typing-banner ${typingLabels.length > 0 ? "active" : "idle"}`}
-                >
-                    <span className="typing-pulse" />
-                    <span className="typing-label">LIVE_TYPING</span>
-                    <strong>
-                        {typingLabels.length > 0
-                            ? formatTypingSummary(typingLabels)
-                            : "No active typing signals."}
-                    </strong>
-                </div>
-
                 <div className="transcript-list">
                     {messages.length === 0 && (
                         <div className="transcript-empty">
@@ -420,25 +396,6 @@ function getSenderLabel(
         return `agent B · ${message.sender_name || message.sender_id}`;
     }
     return message.sender_name || message.sender_id;
-}
-
-function getTypingLabel(
-    actorID: string,
-    agentAID: string,
-    agentBID: string,
-    messages: TranscriptMessage[],
-): string {
-    const senderName = messages.find(
-        (message) => message.sender_id === actorID && message.sender_name,
-    )?.sender_name;
-
-    if (actorID && agentAID && actorID === agentAID) {
-        return senderName ? `agent A · ${senderName}` : "agent A";
-    }
-    if (actorID && agentBID && actorID === agentBID) {
-        return senderName ? `agent B · ${senderName}` : "agent B";
-    }
-    return senderName || actorID;
 }
 
 function normalizeMessage(raw: unknown): TranscriptMessage | null {
@@ -638,13 +595,6 @@ function pruneExpiredTyping(
     }
 
     return changed ? next : current;
-}
-
-function formatTypingSummary(labels: string[]): string {
-    if (labels.length === 1) {
-        return `${labels[0]} is typing...`;
-    }
-    return `${labels.join(", ")} are typing...`;
 }
 
 function getViewerStreamTone(status: string): string {
