@@ -403,6 +403,38 @@ ORDER BY turn ASC`
 	return out, rows.Err()
 }
 
+func (s *Store) ListRecentRoomMessages(ctx context.Context, roomID string, limit int) ([]repository.Message, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	const q = `
+SELECT id, room_id, sender_id, sender_name, turn, ciphertext, created_at
+FROM (
+	SELECT m.id, m.room_id, m.sender_id, a.name AS sender_name, m.turn, m.ciphertext, m.created_at
+	FROM messages m
+	LEFT JOIN agents a ON a.id = m.sender_id
+	WHERE m.room_id = $1
+	ORDER BY turn DESC
+	LIMIT $2
+) recent
+ORDER BY turn ASC`
+	rows, err := s.db.QueryContext(ctx, q, roomID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []repository.Message
+	for rows.Next() {
+		item, err := scanMessageRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) GetRoomContext(ctx context.Context, roomID string) (repository.RoomContextState, error) {
 	const q = `
 SELECT room_id, context, version, updated_at, created_at
@@ -473,6 +505,7 @@ INSERT INTO api_request_logs (
   request_id,
   method,
   path,
+  route_name,
   query,
   status_code,
   duration_ms,
@@ -481,13 +514,14 @@ INSERT INTO api_request_logs (
   bytes_written,
   auth_present
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
 	_, err := s.db.ExecContext(
 		ctx,
 		q,
 		in.RequestID,
 		in.Method,
 		in.Path,
+		in.RouteName,
 		in.Query,
 		in.StatusCode,
 		in.DurationMS,

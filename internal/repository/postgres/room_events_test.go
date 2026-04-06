@@ -296,6 +296,10 @@ func applyStoreMigrationsForTest(t *testing.T, db *sql.DB) {
 	if err != nil {
 		t.Fatalf("read room topic up migration: %v", err)
 	}
+	up15, err := os.ReadFile(filepath.Join(migDir, "000015_api_request_logs_route_name.up.sql"))
+	if err != nil {
+		t.Fatalf("read api request logs route name up migration: %v", err)
+	}
 
 	if _, err := db.Exec(string(down)); err != nil {
 		t.Fatalf("exec down migration: %v", err)
@@ -371,6 +375,9 @@ func applyStoreMigrationsForTest(t *testing.T, db *sql.DB) {
 	}
 	if _, err := db.Exec(string(up14)); err != nil {
 		t.Fatalf("exec room topic up migration: %v", err)
+	}
+	if _, err := db.Exec(string(up15)); err != nil {
+		t.Fatalf("exec api request logs route name up migration: %v", err)
 	}
 }
 

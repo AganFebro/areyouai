@@ -24,20 +24,22 @@ import (
 )
 
 const (
-	maxMessagesPerMinuteAgent = 30
-	maxMessagesPerMinuteRoom  = 60
-	policyViolationWindow     = 5 * time.Minute
-	policyBlockDuration       = 15 * time.Minute
-	maxPolicyViolationsWindow = 3
-	maxRecentMemoryEntries    = 6
-	maxRoomEventHistoryLimit  = 200
-	maxRoomContextUpdateTries = 5
-	sessionTTL                = 14 * 24 * time.Hour
-	roomScopedTokenTTL        = 5 * time.Minute
-	agentStreamReplayWindow   = 30 * time.Minute
-	roomScopeAutomation       = "room:automation"
-	roomScopeReadOnly         = "room:read_only"
-	humanCodeTTL              = 24 * time.Hour
+	maxMessagesPerMinuteAgent       = 30
+	maxMessagesPerMinuteRoom        = 60
+	policyViolationWindow           = 5 * time.Minute
+	policyBlockDuration             = 15 * time.Minute
+	maxPolicyViolationsWindow       = 3
+	maxRecentMemoryEntries          = 6
+	maxContextRecentMessages        = 6
+	maxRoomEventHistoryLimit        = 200
+	maxRoomContextUpdateTries       = 5
+	roomScopedTokenRefreshThreshold = 60 * time.Second
+	sessionTTL                      = 14 * 24 * time.Hour
+	roomScopedTokenTTL              = 5 * time.Minute
+	agentStreamReplayWindow         = 30 * time.Minute
+	roomScopeAutomation             = "room:automation"
+	roomScopeReadOnly               = "room:read_only"
+	humanCodeTTL                    = 24 * time.Hour
 )
 
 var (
@@ -63,6 +65,8 @@ type Service struct {
 	roomSeal *secretcipher.Cipher
 
 	mu             sync.Mutex
+	reconcileMu    sync.Mutex
+	reconcileLocks map[string]*sync.Mutex
 	joined         map[string]map[string]bool
 	messageWindows map[string][]time.Time
 	roomWindows    map[string][]time.Time
@@ -166,6 +170,7 @@ func New(store repository.Store, opts Options) *Service {
 		emit:                   func(repository.RoomEvent) {},
 		seal:                   secretcipher.NewWithKeyset(opts.WebhookSecretKey, opts.WebhookSecretKeyset),
 		roomSeal:               secretcipher.NewWithKeyset(opts.RoomDEKKey, opts.RoomDEKKeyset),
+		reconcileLocks:         make(map[string]*sync.Mutex),
 		joined:                 make(map[string]map[string]bool),
 		messageWindows:         make(map[string][]time.Time),
 		roomWindows:            make(map[string][]time.Time),
@@ -287,10 +292,19 @@ func (s *Service) AuthRoomAccess(ctx context.Context, bearerToken, roomID, actio
 	if !roomScopedTokenAllows(scoped.Scope, action) {
 		return "", ErrForbidden
 	}
-	if err := s.store.TouchRoomScopedToken(ctx, scoped.TokenHash, s.now(), s.now().Add(roomScopedTokenTTL)); err != nil {
-		return "", err
+	if shouldRefreshRoomScopedToken(scoped.ExpiresAt, s.now()) {
+		if err := s.store.TouchRoomScopedToken(ctx, scoped.TokenHash, s.now(), s.now().Add(roomScopedTokenTTL)); err != nil {
+			return "", err
+		}
 	}
 	return scoped.AgentID, nil
+}
+
+func shouldRefreshRoomScopedToken(expiresAt, now time.Time) bool {
+	if expiresAt.IsZero() {
+		return true
+	}
+	return expiresAt.Sub(now) <= roomScopedTokenRefreshThreshold
 }
 
 func (s *Service) CreateRoomAccessToken(ctx context.Context, agentID, roomID string) (RoomAccessTokenResult, error) {
@@ -1309,10 +1323,14 @@ func (s *Service) buildBundleForRoom(ctx context.Context, rm repository.Room, ag
 			}
 		}
 	} else if !errors.Is(err, repository.ErrNotFound) {
-		return promptbuilder.Bundle{}, 0, err
+		s.appendAuditEventBestEffort(ctx, rm.ID, "room_context_read_failed", map[string]any{
+			"room_id": rm.ID,
+			"reason":  err.Error(),
+			"source":  "context_bundle",
+		}, 0)
 	}
 
-	recent, listErr := s.store.ListRoomMessages(ctx, rm.ID)
+	recent, listErr := s.listRecentRoomMessages(ctx, rm.ID, maxContextRecentMessages)
 	if listErr != nil {
 		return promptbuilder.Bundle{}, 0, listErr
 	}
@@ -1335,6 +1353,17 @@ func (s *Service) buildBundleForRoom(ctx context.Context, rm repository.Room, ag
 		TaskContext:    taskContext,
 		RecentMessages: recentForBundle,
 	}), len(recentForBundle), nil
+}
+
+type recentRoomMessagesLister interface {
+	ListRecentRoomMessages(ctx context.Context, roomID string, limit int) ([]repository.Message, error)
+}
+
+func (s *Service) listRecentRoomMessages(ctx context.Context, roomID string, limit int) ([]repository.Message, error) {
+	if lister, ok := s.store.(recentRoomMessagesLister); ok {
+		return lister.ListRecentRoomMessages(ctx, roomID, limit)
+	}
+	return s.store.ListRoomMessages(ctx, roomID)
 }
 
 type RoomStateResult struct {
@@ -1890,9 +1919,28 @@ func (s *Service) ViewerLeave(ctx context.Context, roomID, viewerToken string) (
 }
 
 func (s *Service) reconcileRoom(ctx context.Context, rm repository.Room) (repository.Room, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	lock := s.reconcileLockForRoom(rm.ID)
+	lock.Lock()
+	defer lock.Unlock()
 	return s.reconcileRoomLocked(ctx, rm)
+}
+
+func (s *Service) reconcileLockForRoom(roomID string) *sync.Mutex {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		roomID = "_"
+	}
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	if s.reconcileLocks == nil {
+		s.reconcileLocks = make(map[string]*sync.Mutex)
+	}
+	if lock, ok := s.reconcileLocks[roomID]; ok {
+		return lock
+	}
+	lock := &sync.Mutex{}
+	s.reconcileLocks[roomID] = lock
+	return lock
 }
 
 func (s *Service) reconcileRoomLocked(ctx context.Context, rm repository.Room) (repository.Room, error) {

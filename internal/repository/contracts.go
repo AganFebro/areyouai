@@ -246,6 +246,7 @@ type APIRequestLog struct {
 	RequestID    string    `json:"request_id"`
 	Method       string    `json:"method"`
 	Path         string    `json:"path"`
+	RouteName    string    `json:"route_name,omitempty"`
 	Query        string    `json:"query"`
 	StatusCode   int       `json:"status_code"`
 	DurationMS   int       `json:"duration_ms"`
@@ -422,6 +423,7 @@ type AppendAPIRequestLogInput struct {
 	RequestID    string
 	Method       string
 	Path         string
+	RouteName    string
 	Query        string
 	StatusCode   int
 	DurationMS   int

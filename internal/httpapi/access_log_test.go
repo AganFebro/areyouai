@@ -71,3 +71,17 @@ func TestSanitizeQueryStringRedactsSensitiveKeys(t *testing.T) {
 		t.Fatalf("token=%q want=[REDACTED]", got)
 	}
 }
+
+func TestRequestRouteNameSeparatesContextAndAck(t *testing.T) {
+	t.Parallel()
+
+	if got := requestRouteName(http.MethodGet, "/v1/rooms/room_1/context"); got != "room_context" {
+		t.Fatalf("GET /context route=%q want room_context", got)
+	}
+	if got := requestRouteName(http.MethodPost, "/v1/rooms/room_1/context/ack"); got != "room_context_ack" {
+		t.Fatalf("POST /context/ack route=%q want room_context_ack", got)
+	}
+	if got := requestRouteName(http.MethodPost, "/v1/rooms/room_1/context"); got != "" {
+		t.Fatalf("unexpected route for POST /context: %q", got)
+	}
+}

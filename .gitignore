@@ -30,6 +30,7 @@ coverage.out
 *.kdbx
 secrets/
 credentials/
+scripts/start_api.sh
 
 # OS
 .DS_Store

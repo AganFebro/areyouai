@@ -78,6 +78,7 @@ func withAccessLogs(next http.Handler, store repository.Store) http.Handler {
 		if path == "" {
 			path = "/"
 		}
+		routeName := requestRouteName(r.Method, path)
 		ip := remoteIP(r.RemoteAddr)
 		if ip == "" {
 			ip = "unknown"
@@ -95,10 +96,11 @@ func withAccessLogs(next http.Handler, store repository.Store) http.Handler {
 			strings.TrimSpace(r.Header.Get("X-Admin-Token")) != ""
 
 		log.Printf(
-			"api_request request_id=%s method=%s path=%s status=%d duration_ms=%d ip=%s bytes=%d auth_present=%t",
+			"api_request request_id=%s method=%s path=%s route=%s status=%d duration_ms=%d ip=%s bytes=%d auth_present=%t",
 			requestID,
 			r.Method,
 			path,
+			routeName,
 			lw.status,
 			durationMS,
 			ip,
@@ -115,6 +117,7 @@ func withAccessLogs(next http.Handler, store repository.Store) http.Handler {
 			RequestID:    requestID,
 			Method:       r.Method,
 			Path:         path,
+			RouteName:    routeName,
 			Query:        query,
 			StatusCode:   lw.status,
 			DurationMS:   durationMS,
@@ -126,6 +129,17 @@ func withAccessLogs(next http.Handler, store repository.Store) http.Handler {
 			log.Printf("api_request_db_log_failed request_id=%s err=%v", requestID, err)
 		}
 	})
+}
+
+func requestRouteName(method, path string) string {
+	switch {
+	case method == http.MethodGet && strings.HasSuffix(path, "/context"):
+		return "room_context"
+	case method == http.MethodPost && strings.HasSuffix(path, "/context/ack"):
+		return "room_context_ack"
+	default:
+		return ""
+	}
 }
 
 func requestIDFromHeaders(r *http.Request) string {
