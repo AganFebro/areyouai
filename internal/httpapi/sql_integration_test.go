@@ -1339,6 +1339,114 @@ func TestSQLModeLegacyListingConnectEmitsLifecycleEvents(t *testing.T) {
 	}
 }
 
+func TestSQLModeListingSearchHandlesNilAndLegacyNullTags(t *testing.T) {
+	t.Parallel()
+
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN (or POSTGRES_DSN) to run SQL integration test")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping db: %v", err)
+	}
+
+	applyMigrationsForTest(t, db)
+	store := postgres.NewStore(db)
+	ts := httptest.NewServer(NewRouterWithStore(store, 3*time.Second, 2*time.Minute, 24*time.Hour))
+	defer ts.Close()
+
+	resp, body := doJSON(t, ts, http.MethodPost, "/v1/agent/register", map[string]any{"name": "search-owner"}, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register owner status=%d body=%v", resp.StatusCode, body)
+	}
+	ownerAPIKey := mustString(t, body, "api_key")
+	ownerAgentID := mustString(t, body, "agent_id")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/agent/login", map[string]any{"api_key": ownerAPIKey}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login owner status=%d body=%v", resp.StatusCode, body)
+	}
+	ownerToken := mustString(t, body, "session_token")
+
+	resp, body = doJSON(t, ts, http.MethodPost, "/v1/listings", map[string]any{
+		"topic":       "fresh listing without tags",
+		"max_turns":   4,
+		"ttl_seconds": 300,
+	}, ownerToken)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create listing status=%d body=%v", resp.StatusCode, body)
+	}
+	listingID := mustString(t, body, "id")
+	tags, ok := body["tags"].([]any)
+	if !ok {
+		t.Fatalf("create listing tags=%T want []any body=%v", body["tags"], body)
+	}
+	if len(tags) != 0 {
+		t.Fatalf("create listing tags len=%d want=0 body=%v", len(tags), body)
+	}
+
+	var storedTags string
+	if err := db.QueryRow(`SELECT tags::text FROM chat_listings WHERE id = $1`, listingID).Scan(&storedTags); err != nil {
+		t.Fatalf("query stored tags: %v", err)
+	}
+	if storedTags != "[]" {
+		t.Fatalf("stored tags=%q want=[]", storedTags)
+	}
+
+	if _, err := db.Exec(
+		`INSERT INTO chat_listings (id, agent_id, topic, tags, max_turns, ttl_seconds, connected, room_id)
+		 VALUES ($1, $2, $3, 'null'::jsonb, $4, $5, FALSE, NULL)`,
+		"lst_legacy_null_tags",
+		ownerAgentID,
+		"legacy null tags listing",
+		4,
+		300,
+	); err != nil {
+		t.Fatalf("insert legacy null tags listing: %v", err)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/listings/search?q=fresh", nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("search fresh status=%d body=%v", resp.StatusCode, body)
+	}
+	items, ok := body["items"].([]any)
+	if !ok {
+		t.Fatalf("search items=%T want []any body=%v", body["items"], body)
+	}
+	if len(items) != 1 {
+		t.Fatalf("search items len=%d want=1 body=%v", len(items), body)
+	}
+	first, ok := items[0].(map[string]any)
+	if !ok {
+		t.Fatalf("search item type=%T body=%v", items[0], body)
+	}
+	if got := mustString(t, first, "id"); got != listingID {
+		t.Fatalf("search item id=%s want=%s body=%v", got, listingID, body)
+	}
+
+	resp, body = doJSON(t, ts, http.MethodGet, "/v1/listings/search?q=", nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("search empty status=%d body=%v", resp.StatusCode, body)
+	}
+	items, ok = body["items"].([]any)
+	if !ok {
+		t.Fatalf("search empty items=%T want []any body=%v", body["items"], body)
+	}
+	if len(items) != 2 {
+		t.Fatalf("search empty items len=%d want=2 body=%v", len(items), body)
+	}
+}
+
 func TestSQLModeTypingIndicatorViewerStream(t *testing.T) {
 	t.Parallel()
 

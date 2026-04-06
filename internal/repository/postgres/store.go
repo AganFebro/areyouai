@@ -197,7 +197,7 @@ WHERE agent_id = $1
 }
 
 func (s *Store) CreateListing(ctx context.Context, in repository.CreateListingInput) (repository.Listing, error) {
-	tagsJSON, err := json.Marshal(in.Tags)
+	tagsJSON, err := marshalListingTags(in.Tags)
 	if err != nil {
 		return repository.Listing{}, err
 	}
@@ -240,7 +240,12 @@ WHERE connected = FALSE`
   LOWER(topic) LIKE LOWER($1)
   OR EXISTS (
     SELECT 1
-    FROM jsonb_array_elements_text(tags) AS t(value)
+    FROM jsonb_array_elements_text(
+      CASE
+        WHEN jsonb_typeof(tags) = 'array' THEN tags
+        ELSE '[]'::jsonb
+      END
+    ) AS t(value)
     WHERE LOWER(t.value) LIKE LOWER($1)
   )
 )`
@@ -960,7 +965,7 @@ type txStore struct {
 }
 
 func (s *txStore) CreateListing(ctx context.Context, in repository.CreateListingInput) (repository.Listing, error) {
-	tagsJSON, err := json.Marshal(in.Tags)
+	tagsJSON, err := marshalListingTags(in.Tags)
 	if err != nil {
 		return repository.Listing{}, err
 	}
@@ -1290,18 +1295,28 @@ func scanListing(row interface{ Scan(dest ...any) error }) (repository.Listing, 
 	if roomID.Valid {
 		l.RoomID = roomID.String
 	}
-	if len(raw) == 0 {
+	if len(raw) == 0 || string(raw) == "null" {
 		l.Tags = []string{}
 		return l, nil
 	}
 	if err := json.Unmarshal(raw, &l.Tags); err != nil {
 		return repository.Listing{}, fmt.Errorf("decode tags: %w", err)
 	}
+	if l.Tags == nil {
+		l.Tags = []string{}
+	}
 	return l, nil
 }
 
 func scanListingRows(rows *sql.Rows) (repository.Listing, error) {
 	return scanListing(rows)
+}
+
+func marshalListingTags(tags []string) ([]byte, error) {
+	if tags == nil {
+		tags = []string{}
+	}
+	return json.Marshal(tags)
 }
 
 func scanRoom(row interface{ Scan(dest ...any) error }) (repository.Room, error) {

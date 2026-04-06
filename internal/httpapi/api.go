@@ -290,6 +290,10 @@ func (a *app) handleListings(w http.ResponseWriter, r *http.Request) {
 	if req.TTLSeconds <= 0 {
 		req.TTLSeconds = 900
 	}
+	tags := req.Tags
+	if tags == nil {
+		tags = []string{}
+	}
 
 	now := a.now()
 	roomID := newID("room")
@@ -298,7 +302,7 @@ func (a *app) handleListings(w http.ResponseWriter, r *http.Request) {
 		ID:        newID("lst"),
 		AgentID:   agentID,
 		Topic:     strings.TrimSpace(req.Topic),
-		Tags:      req.Tags,
+		Tags:      tags,
 		MaxTurns:  req.MaxTurns,
 		TTLSecond: req.TTLSeconds,
 		CreatedAt: now,
